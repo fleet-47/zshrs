@@ -1,0 +1,28 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -174 +174 @@
+-libloading = "0.8"
++libloading = "0.9"
+--- a/src/extensions/plugin_host.rs
++++ b/src/extensions/plugin_host.rs
+@@ -375,7 +375,19 @@
+     // tokens here.
+     let expanded = expand_tilde(path);
+     let lib = unsafe { libloading::Library::new(&expanded) }
+-        .map_err(|e| format!("cannot load `{}`: {}", path, e))?;
++        .map_err(|e| {
++            // Preserve libloading 0.8's Unix filename diagnostics on failure.
++            #[cfg(unix)]
++            if matches!(e, libloading::Error::InteriorZeroElements) {
++                let reason = if expanded.ends_with('\0') {
++                    "could not create a C string from bytes with trailing null"
++                } else {
++                    "could not create a C string from bytes"
++                };
++                return format!("cannot load `{}`: {}", path, reason);
++            }
++            format!("cannot load `{}`: {}", path, e)
++        })?;
+ 
+     // Resolve the mandatory init symbol.
+     let init: libloading::Symbol<InitFn> = unsafe {

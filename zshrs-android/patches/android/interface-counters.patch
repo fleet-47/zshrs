@@ -1,0 +1,20 @@
+--- a/src/extensions/p10k/segments_core.rs
++++ b/src/extensions/p10k/segments_core.rs
+@@ -716,7 +716,7 @@
+ /// Interface (rx_bytes, tx_bytes) — Linux `/sys/class/net/<if>/statistics`,
+ /// macOS/BSD via `getifaddrs` AF_LINK `if_data` (fork-free, unlike p10k's
+ /// `netstat -inbI`). None when unavailable.
+-#[cfg(target_os = "linux")]
++#[cfg(any(target_os = "linux", target_os = "android"))]
+ fn iface_bytes(iface: &str) -> Option<(u64, u64)> {
+     let rd = |kind: &str| -> Option<u64> {
+         std::fs::read_to_string(format!("/sys/class/net/{iface}/statistics/{kind}_bytes"))
+@@ -728,7 +728,7 @@
+     Some((rd("rx")?, rd("tx")?))
+ }
+ 
+-#[cfg(not(target_os = "linux"))]
++#[cfg(not(any(target_os = "linux", target_os = "android")))]
+ fn iface_bytes(iface: &str) -> Option<(u64, u64)> {
+     // getifaddrs → the AF_LINK entry for `iface` carries `if_data` with
+     // ifi_ibytes / ifi_obytes (the same counters `netstat -inb` prints).

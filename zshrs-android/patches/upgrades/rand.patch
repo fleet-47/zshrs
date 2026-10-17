@@ -1,0 +1,2663 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -198 +198 @@
+-rand = "0.8"
++rand = "0.10"
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -34 +34 @@
+-rand = "0.8"
++rand = "0.10"
+@@ -42 +42 @@
+-# verify_strict). Seeds come from rand::rngs::OsRng, so no rand_core feature.
++# verify_strict). Seeds come from rand::rngs::SysRng, so no rand_core feature.
+--- a/daemon/state.rs
++++ b/daemon/state.rs
+@@ -1080,9 +1080,7 @@
+ fn uuid_like() -> String {
+     // Tiny opaque random id without a uuid crate dep — 8 hex bytes is enough for
+     // session-uniqueness within a daemon process lifetime.
+-    use rand::Rng;
+-    let mut rng = rand::thread_rng();
+-    let bytes: [u8; 8] = rng.gen();
++    let bytes: [u8; 8] = rand::random();
+     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+ }
+ 
+--- a/src/extensions/ext_builtins.rs
++++ b/src/extensions/ext_builtins.rs
+@@ -404,7 +404,7 @@
+ use crate::ported::zsh_h::PM_UNDEFINED;
+ use chrono::{Datelike, TimeZone};
+ use rand::seq::SliceRandom;
+-use rand::Rng;
++use rand::RngExt;
+ use sha2::{Digest, Sha256};
+ use std::collections::BTreeMap;
+ use std::collections::VecDeque;
+@@ -5344,7 +5344,7 @@
+             // -R: coreutils random sort — each line sorts by a hash of
+             // (per-run random salt, line), so identical lines stay
+             // adjacent and the permutation changes per run.
+-            let salt = rand::thread_rng().gen::<u128>().to_ne_bytes();
++            let salt = rand::rng().random::<u128>().to_ne_bytes();
+             let mut keyed: Vec<([u8; 32], String)> = lines
+                 .drain(..)
+                 .map(|l| {
+@@ -6664,7 +6664,7 @@
+             };
+             reader.lines().map_while(Result::ok).collect()
+         };
+-        let mut rng = rand::thread_rng();
++        let mut rng = rand::rng();
+         items.shuffle(&mut rng);
+         if let Some(n) = count {
+             items.truncate(n);
+@@ -9824,9 +9824,9 @@
+         // 10 copies of the same letter).
+         let gen_suffix = |len: usize| -> String {
+             let alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+-            let mut rng = rand::thread_rng();
++            let mut rng = rand::rng();
+             (0..len)
+-                .map(|_| alphabet[rng.gen_range(0..alphabet.len())] as char)
++                .map(|_| alphabet[rng.random_range(0..alphabet.len())] as char)
+                 .collect()
+         };
+ 
+--- a/daemon/snapshot.rs
++++ b/daemon/snapshot.rs
+@@ -453 +453 @@
+-use rand::RngCore;
++use rand::TryRng;
+@@ -524 +524,3 @@
+-    rand::rngs::OsRng.fill_bytes(&mut seed);
++    rand::rngs::SysRng
++        .try_fill_bytes(&mut seed)
++        .map_err(std::io::Error::other)?;
+--- a/bins/parity-fuzz.rs
++++ b/bins/parity-fuzz.rs
+@@ -25,7 +25,7 @@
+ use std::time::{Duration, Instant};
+ 
+ use rand::rngs::StdRng;
+-use rand::{Rng, SeedableRng};
++use rand::{RngExt, SeedableRng};
+ 
+ // ---------------------------------------------------------------------------
+ // Shell locations / invocation (mirrors tests/parity/*.rs contract exactly)
+@@ -757,13 +757,13 @@
+ ];
+ 
+ fn pick<'a, T>(rng: &mut StdRng, xs: &'a [T]) -> &'a T {
+-    &xs[rng.gen_range(0..xs.len())]
++    &xs[rng.random_range(0..xs.len())]
+ }
+ 
+ /// A scalar parameter expansion, possibly with flags / modifiers.
+ fn gen_scalar_pe(rng: &mut StdRng) -> String {
+     let v = pick(rng, SCALARS);
+-    match rng.gen_range(0..13) {
++    match rng.random_range(0..13) {
+         0 => format!("${{{v}}}"),
+         1 => format!("${{#{v}}}"),
+         2 => format!("${{{v}:-fallback}}"),
+@@ -803,10 +803,10 @@
+                     "", "", "", ":h", ":t", ":r", ":u", ":l", ":h:t", ":3", ":Z", ":x",
+                 ],
+             );
+-            if !modtail.is_empty() && rng.gen_bool(0.5) {
++            if !modtail.is_empty() && rng.random_bool(0.5) {
+                 // OFFSET-only + modifier: `${v:OFF:h}` (no length).
+                 format!("${{{v}:{off}{modtail}}}")
+-            } else if rng.gen_bool(0.5) {
++            } else if rng.random_bool(0.5) {
+                 format!("${{{v}:{off}:{len}{modtail}}}")
+             } else {
+                 format!("${{{v}:{off}{modtail}}}")
+@@ -819,7 +819,7 @@
+         9 => format!("${{{v}:l}}"),
+         10 => {
+             // random flag combo
+-            let k = rng.gen_range(1..=3);
++            let k = rng.random_range(1..=3);
+             let mut flags = String::new();
+             for _ in 0..k {
+                 flags.push_str(pick(rng, PE_FLAGS));
+@@ -844,7 +844,7 @@
+             // (c:3029-3036) and quotes the JOINED string, which is a different
+             // path through the same block.
+             let f = pick(rng, &["D", "V", "DV", "VD"]);
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 format!("\"${{({f}){v}}}\"")
+             } else {
+                 format!("${{({f}){v}}}")
+@@ -857,9 +857,9 @@
+ /// Left/right padding and split/join flags — dense parse surface.
+ fn gen_padding(rng: &mut StdRng) -> String {
+     let v = pick(rng, SCALARS);
+-    let w = rng.gen_range(1..10);
+-    let w2 = rng.gen_range(1..10);
+-    match rng.gen_range(0..9) {
++    let w = rng.random_range(1..10);
++    let w2 = rng.random_range(1..10);
++    match rng.random_range(0..9) {
+         0 => format!("${{(l:{w}:){v}}}"),
+         1 => format!("${{(r:{w}:){v}}}"),
+         2 => format!("${{(l:{w}::0:){v}}}"),
+@@ -876,7 +876,7 @@
+ 
+ /// String splitting into words via (s), (f), (z), (@).
+ fn gen_split(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         0 => "${(s:,:)t}".to_string(),
+         1 => "${(s:_:)s}".to_string(),
+         2 => "\"${(@s:,:)t}\"".to_string(),
+@@ -888,8 +888,8 @@
+ 
+ /// History-modifier chains on a path-ish scalar (:h:t:r:e:gs...).
+ fn gen_modchain(rng: &mut StdRng) -> String {
+-    let base = if rng.gen_bool(0.6) { "path" } else { "s" };
+-    let k = rng.gen_range(1..=3);
++    let base = if rng.random_bool(0.6) { "path" } else { "s" };
++    let k = rng.random_range(1..=3);
+     let mut out = format!("${{{base}");
+     for _ in 0..k {
+         out.push(':');
+@@ -901,7 +901,7 @@
+ 
+ /// Nested / indirect expansion — subscript flags and $(P).
+ fn gen_nested(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..7) {
++    match rng.random_range(0..7) {
+         0 => "${a[(i)three]}".to_string(),
+         1 => "${a[(I)two]}".to_string(),
+         2 => "${a[(r)f*]}".to_string(),
+@@ -915,11 +915,11 @@
+ /// An array parameter expansion.
+ fn gen_array_pe(rng: &mut StdRng) -> String {
+     let v = pick(rng, ARRAYS);
+-    match rng.gen_range(0..11) {
++    match rng.random_range(0..11) {
+         0 => format!("${{{v}[1]}}"),
+         1 => {
+-            let i = rng.gen_range(1..4);
+-            let j = rng.gen_range(i..6);
++            let i = rng.random_range(1..4);
++            let j = rng.random_range(i..6);
+             format!("${{{v}[{i},{j}]}}")
+         }
+         2 => format!("${{#{v}}}"),
+@@ -936,7 +936,7 @@
+ 
+ /// An assoc expansion (always ordered so iteration is deterministic).
+ fn gen_assoc_pe(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..5) {
++    match rng.random_range(0..5) {
+         0 => "${(ko)m}".to_string(),
+         1 => "${(vo)m}".to_string(),
+         2 => "${(kvo)m}".to_string(),
+@@ -947,15 +947,15 @@
+ 
+ /// An arithmetic expression printed via $(( )). Recursive with a depth cap.
+ fn gen_arith(rng: &mut StdRng, depth: u32) -> String {
+-    if depth == 0 || rng.gen_bool(0.35) {
+-        return match rng.gen_range(0..7) {
+-            0 => rng.gen_range(-20..40).to_string(),
++    if depth == 0 || rng.random_bool(0.35) {
++        return match rng.random_range(0..7) {
++            0 => rng.random_range(-20..40).to_string(),
+             1 => pick(rng, INTVARS).to_string(),
+             2 => pick(rng, INTVARS).to_string(),
+-            3 => format!("16#{:x}", rng.gen_range(1..255)), // hex base
+-            4 => format!("2#{:b}", rng.gen_range(1..16)),   // binary base
+-            5 => format!("0x{:x}", rng.gen_range(1..255)),  // C-style hex
+-            _ => rng.gen_range(1..12).to_string(),
++            3 => format!("16#{:x}", rng.random_range(1..255)), // hex base
++            4 => format!("2#{:b}", rng.random_range(1..16)),   // binary base
++            5 => format!("0x{:x}", rng.random_range(1..255)),  // C-style hex
++            _ => rng.random_range(1..12).to_string(),
+         };
+     }
+     let l = gen_arith(rng, depth - 1);
+@@ -985,15 +985,15 @@
+     if *op == "&&" || *op == "||" {
+         return format!("(({l}) != 0) {op} (({r}) != 0)");
+     }
+-    match rng.gen_range(0..3) {
++    match rng.random_range(0..3) {
+         0 => format!("({l}) {op} ({r})"),
+         1 => format!(
+             "{l} {op} {r} {} {}",
+             pick(rng, &["+", "-", "*"]),
+-            rng.gen_range(1..5)
++            rng.random_range(1..5)
+         ),
+         // ternary — exercises precedence around ?:
+-        _ => format!("({l}) ? ({r}) : {}", rng.gen_range(0..9)),
++        _ => format!("({l}) ? ({r}) : {}", rng.random_range(0..9)),
+     }
+ }
+ 
+@@ -1002,7 +1002,7 @@
+ /// (intersection), `:#pat` / `(M):#pat` (element filter). Uses PREAMBLE arrays
+ /// `a` and `b` (which share `two`/`four`) so the results are non-trivial.
+ fn gen_setops(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..16) {
++    match rng.random_range(0..16) {
+         0 => "${a:|b}".to_string(), // elements of a not in b
+         1 => "${a:*b}".to_string(), // intersection of a and b
+         2 => "\"${(@)a:|b}\"".to_string(),
+@@ -1031,7 +1031,7 @@
+ /// `(f)` newline splitting and the quote-style flags (`qq`/`qqq`/`qqqq`/`q-`).
+ /// `lines` is a 3-line scalar; `spaces` has leading/trailing/embedded spaces.
+ fn gen_quoteflags(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..14) {
++    match rng.random_range(0..14) {
+         0 => "\"${(f)lines}\"".to_string(),
+         1 => "${#${(f)lines}}".to_string(), // element count after split
+         2 => "\"${(j:|:)${(f)lines}}\"".to_string(), // split then re-join
+@@ -1054,7 +1054,7 @@
+ /// Brace expansion — comma lists, numeric/alpha ranges, zero-pad, steps,
+ /// cross-products, empty elements, nesting. Deterministic (no glob chars).
+ fn gen_brace(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..14) {
++    match rng.random_range(0..14) {
+         0 => "{a,b,c}".to_string(),
+         1 => "pre{x,y,z}post".to_string(),
+         2 => "{1..5}".to_string(),
+@@ -1069,8 +1069,8 @@
+         11 => "x{a,b{1,2},c}y".to_string(), // nested
+         12 => "{-3..3}".to_string(),        // negative range
+         _ => {
+-            let lo = rng.gen_range(0..5);
+-            let hi = rng.gen_range(lo..lo + 6);
++            let lo = rng.random_range(0..5);
++            let hi = rng.random_range(lo..lo + 6);
+             format!("v{{{lo}..{hi}}}")
+         }
+     }
+@@ -1078,7 +1078,7 @@
+ 
+ /// Subscript search/reverse/flag combos — `(i)/(I)/(r)/(R)/(e)/(n)/(w)/(b)`.
+ fn gen_subflags(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..14) {
++    match rng.random_range(0..14) {
+         0 => "${a[(i)three]}".to_string(), // index of first match (name)
+         1 => "${a[(I)t*]}".to_string(),    // index of last match
+         2 => "${a[(r)f*]}".to_string(),    // first matching value
+@@ -1099,10 +1099,10 @@
+ /// Generate the raw expression list for a seed (before script assembly).
+ fn gen_parts(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+-    let n = rng.gen_range(1..=3);
++    let n = rng.random_range(1..=3);
+     let mut parts: Vec<String> = Vec::with_capacity(n);
+     for _ in 0..n {
+-        let expr = match rng.gen_range(0..15) {
++        let expr = match rng.random_range(0..15) {
+             0 => gen_scalar_pe(&mut rng),
+             1 => gen_array_pe(&mut rng),
+             2 => gen_assoc_pe(&mut rng),
+@@ -1164,9 +1164,9 @@
+ 
+ /// A state-mutating statement.
+ fn gen_mutation(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..17) {
++    match rng.random_range(0..17) {
+         0 => {
+-            let neg = if rng.gen_bool(0.35) { "un" } else { "" };
++            let neg = if rng.random_bool(0.35) { "un" } else { "" };
+             format!("{neg}setopt {}", pick(rng, OPTIONS))
+         }
+         // Quote the arithmetic RHS: unquoted it has spaces/parens and parses
+@@ -1178,8 +1178,8 @@
+         2 => format!("typeset -F 3 fv=$(( {} ))", gen_arith(rng, 2)),
+         3 => format!(
+             "typeset -Z {} zv={}",
+-            rng.gen_range(3..7),
+-            rng.gen_range(1..999)
++            rng.random_range(3..7),
++            rng.random_range(1..999)
+         ),
+         4 => format!(
+             "typeset -{} uv={}",
+@@ -1192,23 +1192,23 @@
+         }
+         6 => format!("IFS={}", pick(rng, &[":", ",", "-", "|", "."])),
+         7 => {
+-            let k = rng.gen_range(1..4);
++            let k = rng.random_range(1..4);
+             let ws: Vec<&str> = (0..k).map(|_| *pick(rng, WORDS)).collect();
+             format!("set -- {}", ws.join(" "))
+         }
+         8 => format!("arr+=({})", pick(rng, WORDS)),
+-        9 => format!("arr[{}]={}", rng.gen_range(1..5), pick(rng, WORDS)),
++        9 => format!("arr[{}]={}", rng.random_range(1..5), pick(rng, WORDS)),
+         10 => format!(
+             "as[{}]={}",
+             pick(rng, &["k1", "k2", "k3", "kx"]),
+             pick(rng, WORDS)
+         ),
+         11 => format!("unset {}", pick(rng, &["v", "iv", "arr", "uv", "zv"])),
+-        12 => format!("typeset -r rv={}", rng.gen_range(1..99)),
++        12 => format!("typeset -r rv={}", rng.random_range(1..99)),
+         13 => format!("v+={}", pick(rng, WORDS)),
+         14 => format!(
+             "f() {{ typeset -i lv=$1*2; print -r -- $lv }}; f {}",
+-            rng.gen_range(1..20)
++            rng.random_range(1..20)
+         ),
+         15 => format!("(( c {} ))", pick(rng, &["++", "--", "+= 3", "*= 2"])),
+         _ => format!("v={}", pick(rng, WORDS)),
+@@ -1222,7 +1222,7 @@
+ /// The extended-glob variants (`(abc)#`) only match when a prior mutation ran
+ /// `setopt EXTENDED_GLOB`, so they probe the option-dependent matcher path too.
+ fn gen_cond(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..17) {
++    match rng.random_range(0..17) {
+         // Case-mismatch matches: under `setopt nocaseglob` (a mutation option),
+         // conditional/case/`:#` pattern matching must stay case-SENSITIVE — only
+         // filename globbing goes case-insensitive. These pin that boundary.
+@@ -1236,8 +1236,8 @@
+         4 => "[[ -z ${arr[99]} ]]; print -r -- $?".to_string(),
+         5 => format!(
+             "[[ {} -gt {} ]]; print -r -- $?",
+-            rng.gen_range(0..10),
+-            rng.gen_range(0..10)
++            rng.random_range(0..10),
++            rng.random_range(0..10)
+         ),
+         6 => "case $v in (a*) print A;; (*) print B;; esac".to_string(),
+         7 => "case ${arr[1]} in (x[0-9]) print X;; (*) print O;; esac".to_string(),
+@@ -1256,15 +1256,15 @@
+ /// which is the most direct probe of whether typeset state was modelled right.
+ fn gen_observation(rng: &mut StdRng) -> String {
+     // 1-in-5: conditional / pattern-match probe (state-sensitive matcher path).
+-    if rng.gen_bool(0.20) {
++    if rng.random_bool(0.20) {
+         return gen_cond(rng);
+     }
+     // 1-in-4: unquoted list probe to exercise word-splitting under options.
+-    if rng.gen_bool(0.25) {
++    if rng.random_bool(0.25) {
+         let u = pick(rng, &["$v", "${arr[@]}", "$*", "$@", "$uv"]);
+         return format!("print -rl -- {u}");
+     }
+-    let probe = match rng.gen_range(0..18) {
++    let probe = match rng.random_range(0..18) {
+         0 => "\"$v\"",
+         1 => "\"${(t)v}\"",
+         2 => "\"${(t)arr}\"",
+@@ -1294,7 +1294,7 @@
+ /// created/modified a parameter. Every form prints deterministically so the
+ /// differential comparison is exact.
+ fn gen_nested_scope(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..16) {
++    match rng.random_range(0..16) {
+         // local shadows an outer scalar, restored on function return
+         0 => "sc=outer; f() { local sc=inner; print -r -- $sc }; f; print -r -- $sc".to_string(),
+         // nested functions: inner local must not leak to the middle frame
+@@ -1356,14 +1356,14 @@
+ fn gen_program(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = base_state();
+-    let steps = rng.gen_range(4..=12);
++    let steps = rng.random_range(4..=12);
+     for _ in 0..steps {
+         // 1-in-4 step is a self-contained nested-scope probe.
+-        if rng.gen_bool(0.25) {
++        if rng.random_bool(0.25) {
+             stmts.push(gen_nested_scope(&mut rng));
+             continue;
+         }
+-        if rng.gen_bool(0.6) {
++        if rng.random_bool(0.6) {
+             stmts.push(gen_mutation(&mut rng));
+         }
+         stmts.push(gen_observation(&mut rng));
+@@ -1616,7 +1616,7 @@
+ /// so `<->` numeric ranges and `^` negation parse.
+ fn gen_glob(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+-    let n = rng.gen_range(1..=2);
++    let n = rng.random_range(1..=2);
+     let mut stmts = vec!["setopt extendedglob".to_string()];
+     for _ in 0..n {
+         let base = pick(&mut rng, GLOB_BASE);
+@@ -1661,7 +1661,7 @@
+     // `printf 'x%n' a b` sets both to 1, not 1 and 2 — the recycling forms
+     // below are what pin that. The `.` / `%%` prefixes exercise byte counting
+     // over literal text and escaped percents.
+-    if rng.gen_bool(0.25) {
++    if rng.random_bool(0.25) {
+         let probe = pick(
+             &mut rng,
+             &[
+@@ -1692,7 +1692,7 @@
+     // fit-in-u64-but-not-i64 band (18-digit truncation) and the >u64 band
+     // (19-digit truncation with a negative signed wrap) — went uncompared. The
+     // `number truncated after N digits` warning is on stderr, so fold it in.
+-    if rng.gen_bool(0.2) {
++    if rng.random_bool(0.2) {
+         let n = pick(
+             &mut rng,
+             &[
+@@ -1710,38 +1710,38 @@
+         return vec![format!("printf '%{conv}\\n' {n} 2>&1")];
+     }
+ 
+-    let nspec = rng.gen_range(1..=3);
++    let nspec = rng.random_range(1..=3);
+     let mut fmt = String::new();
+     for _ in 0..nspec {
+-        if rng.gen_bool(0.4) {
++        if rng.random_bool(0.4) {
+             fmt.push_str(pick(&mut rng, &["x", "-", "[", "] ", ":", "->"]));
+         }
+         fmt.push('%');
+         fmt.push_str(pick(&mut rng, PF_FLAGS));
+         // width: literal or `*` (consumes an arg)
+-        if rng.gen_bool(0.5) {
+-            if rng.gen_bool(0.25) {
++        if rng.random_bool(0.5) {
++            if rng.random_bool(0.25) {
+                 fmt.push('*');
+             } else {
+-                fmt.push_str(&rng.gen_range(0..12).to_string());
++                fmt.push_str(&rng.random_range(0..12).to_string());
+             }
+         }
+         // precision
+-        if rng.gen_bool(0.4) {
++        if rng.random_bool(0.4) {
+             fmt.push('.');
+-            if rng.gen_bool(0.25) {
++            if rng.random_bool(0.25) {
+                 fmt.push('*');
+             } else {
+-                fmt.push_str(&rng.gen_range(0..8).to_string());
++                fmt.push_str(&rng.random_range(0..8).to_string());
+             }
+         }
+         fmt.push_str(pick(&mut rng, PF_CONV));
+     }
+-    let nargs = rng.gen_range(0..=5);
++    let nargs = rng.random_range(0..=5);
+     let mut args: Vec<String> = Vec::with_capacity(nargs);
+     for _ in 0..nargs {
+-        if rng.gen_bool(0.5) {
+-            args.push(rng.gen_range(-20..40).to_string());
++        if rng.random_bool(0.5) {
++            args.push(rng.random_range(-20..40).to_string());
+         } else {
+             // single-quote string args; the pool has no quotes to escape.
+             args.push(format!("'{}'", pick(&mut rng, PF_STR_ARGS)));
+@@ -1793,9 +1793,9 @@
+         .to_string();
+ 
+     // 1-in-4: a here-STRING (`<<< word`) instead of a here-doc.
+-    if rng.gen_bool(0.25) {
++    if rng.random_bool(0.25) {
+         let frag = pick(&mut rng, HD_FRAGS);
+-        let stmt = match rng.gen_range(0..3) {
++        let stmt = match rng.random_range(0..3) {
+             0 => format!("cat <<< \"{frag}\""),
+             1 => format!("cat <<< '{frag}'"),
+             _ => format!("cat <<< {}", frag.split_whitespace().next().unwrap_or(frag)),
+@@ -1804,17 +1804,17 @@
+     }
+ 
+     // here-doc: choose delimiter quoting and the `<<`/`<<-` operator.
+-    let (op, indent) = if rng.gen_bool(0.4) {
++    let (op, indent) = if rng.random_bool(0.4) {
+         ("<<-", "\t") // `<<-` strips leading TABS from body + terminator
+     } else {
+         ("<<", "")
+     };
+-    let delim = match rng.gen_range(0..3) {
++    let delim = match rng.random_range(0..3) {
+         0 => "EOF".to_string(),     // unquoted → body is expanded
+         1 => "'EOF'".to_string(),   // single-quoted → body is literal
+         _ => "\"EOF\"".to_string(), // double-quoted → body is literal
+     };
+-    let nlines = rng.gen_range(1..=3);
++    let nlines = rng.random_range(1..=3);
+     let mut lines = String::new();
+     for _ in 0..nlines {
+         let frag = pick(&mut rng, HD_FRAGS);
+@@ -2037,10 +2037,10 @@
+ fn gen_subscript(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec![SUB_STATE.trim_end().to_string()];
+-    let n = rng.gen_range(2..=5);
++    let n = rng.random_range(2..=5);
+     for _ in 0..n {
+         let arr = pick(&mut rng, &["a", "nums", "dup"]);
+-        let expr = match rng.gen_range(0..17) {
++        let expr = match rng.random_range(0..17) {
+             // Subscript SET-ness must agree with the value the same subscript
+             // yields — `${x[i]}` and `${+x[i]}` are decided by separate code,
+             // and they had drifted three ways (docs/BUGS.md #1043):
+@@ -2283,13 +2283,13 @@
+             }
+             // Plain element, including out-of-range and negative indices.
+             0 => {
+-                let i: i32 = rng.gen_range(-7..=7);
++                let i: i32 = rng.random_range(-7..=7);
+                 format!("${{{arr}[{i}]}}")
+             }
+             // Slice, with bounds that may invert or run off either end.
+             1 => {
+-                let i: i32 = rng.gen_range(-7..=7);
+-                let j: i32 = rng.gen_range(-7..=7);
++                let i: i32 = rng.random_range(-7..=7);
++                let j: i32 = rng.random_range(-7..=7);
+                 format!("${{{arr}[{i},{j}]}}")
+             }
+             // Search subscripts: (r) value, (R) reverse value, (i) index,
+@@ -2306,14 +2306,14 @@
+             }
+             // (n:N:) — the Nth match rather than the first.
+             4 => {
+-                let k = rng.gen_range(1..=3);
++                let k = rng.random_range(1..=3);
+                 let f = pick(&mut rng, &["r", "R", "i", "I"]);
+                 let p = pick(&mut rng, SUB_PATS);
+                 format!("${{{arr}[(n:{k}:{f}){p}]}}")
+             }
+             // (b:N:) — begin the search at offset N.
+             5 => {
+-                let k = rng.gen_range(1..=4);
++                let k = rng.random_range(1..=4);
+                 let p = pick(&mut rng, SUB_PATS);
+                 format!("${{{arr}[(b:{k}:i){p}]}}")
+             }
+@@ -2330,7 +2330,7 @@
+             }
+             // Assoc: key lookup, and the (k)/(v) reverse-lookup forms.
+             7 => {
+-                let which = rng.gen_range(0..4);
++                let which = rng.random_range(0..4);
+                 match which {
+                     0 => format!("${{m[{}]}}", pick(&mut rng, &["k1", "k2", "k3", "nokey"])),
+                     1 => format!(
+@@ -2357,7 +2357,7 @@
+             // including missing keys and no-match value searches.
+             9 => {
+                 let op = pick(&mut rng, DEF_OPS);
+-                match rng.gen_range(0..4) {
++                match rng.random_range(0..4) {
+                     0 => format!(
+                         "${{m[{}]{op}}}",
+                         pick(&mut rng, &["k1", "k2", "nokey", "zz"])
+@@ -2400,18 +2400,18 @@
+                 // NOT agree — forward-past-the-end is len+1 (c:1746) while
+                 // reverse-past-the-end, and either direction still-negative,
+                 // are 0. In-range begins alone cannot tell those apart.
+-                match rng.gen_range(0..9) {
++                match rng.random_range(0..9) {
+                     // (n) — nth match, forward and by index.
+-                    0 => format!("${{dup[(rn:{}:)x]}}", rng.gen_range(1..=4)),
+-                    1 => format!("${{dup[(in:{}:)x]}}", rng.gen_range(1..=4)),
++                    0 => format!("${{dup[(rn:{}:)x]}}", rng.random_range(1..=4)),
++                    1 => format!("${{dup[(in:{}:)x]}}", rng.random_range(1..=4)),
+                     // (b) — start the scan partway in.
+-                    2 => format!("${{dup[(ib:{}:)x]}}", rng.gen_range(-7..=7)),
++                    2 => format!("${{dup[(ib:{}:)x]}}", rng.random_range(-7..=7)),
+                     // (I) + (b) together: last match at or before N.
+-                    3 => format!("${{dup[(Ib:{}:)x]}}", rng.gen_range(-7..=7)),
++                    3 => format!("${{dup[(Ib:{}:)x]}}", rng.random_range(-7..=7)),
+                     // (w)/(s) — word index into a scalar.
+-                    4 => format!("${{ws[(ws.:.){}]}}", rng.gen_range(1..=5)),
++                    4 => format!("${{ws[(ws.:.){}]}}", rng.random_range(1..=5)),
+                     // (f) — line index into a scalar.
+-                    5 => format!("${{fs[(f){}]}}", rng.gen_range(1..=4)),
++                    5 => format!("${{fs[(f){}]}}", rng.random_range(1..=4)),
+                     // (K) — key lookup by pattern.
+                     6 => format!("${{m[(K){}]}}", pick(&mut rng, &["k1", "k*", "z*"])),
+                     // (p) — print escapes recognised in the separator. Note the
+@@ -2419,12 +2419,12 @@
+                     // delimiter, so `(psw.:.)` means "s with delimiter w" and is
+                     // malformed — zsh rejects it with `bad floating point
+                     // constant`. The correct spelling is `(pws.:.)`.
+-                    7 => format!("${{ws[(pws.:.){}]}}", rng.gen_range(1..=4)),
++                    7 => format!("${{ws[(pws.:.){}]}}", rng.random_range(1..=4)),
+                     // (e) exact — pattern metachars stay literal.
+                     _ => format!("${{a[(re){}]}}", pick(&mut rng, &["one", "o*", "five"])),
+                 }
+             }
+-            11 => match rng.gen_range(0..4) {
++            11 => match rng.random_range(0..4) {
+                 0 => format!("${{m[nokey]:=NEWVAL}}"),
+                 1 => format!("${{m[k1]:=NEWVAL}}"),
+                 2 => format!("${{{arr}[3]:=Z}}"),
+@@ -2439,8 +2439,8 @@
+             // the omitted bound and silently sliced instead of erroring
+             // (docs/BUGS.md #1035). Covers array (`a`) and scalar (`ws`) forms.
+             13 => {
+-                let n = rng.gen_range(-3..=5);
+-                match rng.gen_range(0..4) {
++                let n = rng.random_range(-3..=5);
++                match rng.random_range(0..4) {
+                     0 => format!("${{{arr}[,{n}]}}"),
+                     1 => format!("${{{arr}[{n},]}}"),
+                     2 => "${a[,]}".to_string(),
+@@ -2478,7 +2478,7 @@
+             // reached the same fallback all along, which is precisely why the
+             // divergence stayed invisible.
+             16 => {
+-                let n = rng.gen_range(1..=3);
++                let n = rng.random_range(1..=3);
+                 let bad = pick(
+                     &mut rng,
+                     &[
+@@ -2586,18 +2586,18 @@
+ fn gen_pattern(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["setopt extendedglob".to_string()];
+-    let n = rng.gen_range(2..=5);
++    let n = rng.random_range(2..=5);
+     for _ in 0..n {
+         let subj = pick(&mut rng, PAT_SUBJECTS);
+ 
+         // Build the pattern body from 1-3 atoms.
+-        let parts = rng.gen_range(1..=3);
++        let parts = rng.random_range(1..=3);
+         let mut pat = String::new();
+         for _ in 0..parts {
+             pat.push_str(pick(&mut rng, PAT_ATOMS));
+         }
+ 
+-        match rng.gen_range(0..11) {
++        match rng.random_range(0..11) {
+             // Plain match.
+             0 => stmts.push(format!(
+                 "[[ \"{subj}\" = {pat} ]] && print -r -- Y || print -r -- N"
+@@ -2789,10 +2789,10 @@
+ fn gen_typeset(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    let n = rng.gen_range(2..=4);
++    let n = rng.random_range(2..=4);
+     for i in 0..n {
+         let v = format!("v{i}");
+-        match rng.gen_range(0..11) {
++        match rng.random_range(0..11) {
+             // `typeset +a`/`+A` — REMOVE the array/hashed attribute. c:Src/
+             // builtin.c:2117-2131 — this is a type change (`chflags` picks up
+             // `off & PM_ARRAY`, tc=1); UNLIKE +i/+E/+l the value is NOT
+@@ -2801,7 +2801,7 @@
+             // PM_HASHED so `+a`/`+A` were silent no-ops. Bug #1029. Compares
+             // ${(t)} (must flip to scalar) + value (must be empty) + count.
+             10 => {
+-                let arr = rng.gen_bool(0.5);
++                let arr = rng.random_bool(0.5);
+                 let (decl, plus) = if arr { ("-a", "+a") } else { ("-A", "+A") };
+                 let init = if arr { "(1 2 3)" } else { "(k v)" };
+                 stmts.push(format!("typeset {decl} {v}={init}"));
+@@ -2832,7 +2832,7 @@
+             8 => {
+                 let base = pick(&mut rng, &["0", "1", "37", "40", "100"]);
+                 let val = pick(&mut rng, TS_INT_VALS);
+-                let attached = rng.gen_bool(0.5);
++                let attached = rng.random_bool(0.5);
+                 let decl = if attached {
+                     format!("typeset -i{base} {v}={val}")
+                 } else {
+@@ -2853,21 +2853,21 @@
+             }
+             // Fixed-point float with precision.
+             1 => {
+-                let prec = rng.gen_range(0..=6);
++                let prec = rng.random_range(0..=6);
+                 let val = pick(&mut rng, TS_FLT_VALS);
+                 stmts.push(format!("typeset -F {prec} {v}={val}"));
+                 stmts.push(format!("print -r -- \"[${v}]\""));
+             }
+             // Scientific float with precision.
+             2 => {
+-                let prec = rng.gen_range(0..=6);
++                let prec = rng.random_range(0..=6);
+                 let val = pick(&mut rng, TS_FLT_VALS);
+                 stmts.push(format!("typeset -E {prec} {v}={val}"));
+                 stmts.push(format!("print -r -- \"[${v}]\""));
+             }
+             // Zero-padded to a width.
+             3 => {
+-                let w = rng.gen_range(1..=8);
++                let w = rng.random_range(1..=8);
+                 let val = pick(&mut rng, TS_INT_VALS);
+                 stmts.push(format!("typeset -Z {w} {v}={val}"));
+                 stmts.push(format!("print -r -- \"[${v}]\""));
+@@ -2918,8 +2918,8 @@
+             // $PATH mid-program would change command lookup for the rest of it.
+             5 => {
+                 let vals = pick(&mut rng, &["/x /y /x", "a b a c b", "1 1 1", "p q", "z"]);
+-                let u = if rng.gen_bool(0.6) { "U" } else { "" };
+-                match rng.gen_range(0..3) {
++                let u = if rng.random_bool(0.6) { "U" } else { "" };
++                match rng.random_range(0..3) {
+                     // Plain unique array (no tie).
+                     0 => {
+                         stmts.push(format!("typeset -U {v}; {v}=({vals})"));
+@@ -3002,7 +3002,7 @@
+             _ => {
+                 let case = pick(&mut rng, &["l", "u"]);
+                 // Export forces the ASCII pool: see TS_CASE_ASCII_VALS.
+-                let exported = rng.gen_bool(0.4);
++                let exported = rng.random_bool(0.4);
+                 let pool = if exported {
+                     TS_CASE_ASCII_VALS
+                 } else {
+@@ -3087,11 +3087,11 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["zmodload zsh/zutil".to_string()];
+ 
+-    match rng.gen_range(0..3) {
++    match rng.random_range(0..3) {
+         // ---- zstyle: install N patterns, then look up. The answer depends
+         // entirely on setstypat's weight ordering (Src/Modules/zutil.c:344).
+         0 => {
+-            let n = rng.gen_range(1..=4);
++            let n = rng.random_range(1..=4);
+             for i in 0..n {
+                 let pat = pick(&mut rng, ZS_PATS);
+                 // c:Src/Modules/zutil.c:588 — `-e` defines a DYNAMIC style whose
+@@ -3100,7 +3100,7 @@
+                 // set STATIC styles, so the eval path — and its interaction with
+                 // the -s/-a/-t/-b/-g reads and with static-style priority — went
+                 // uncompared. The reply bodies are kept deterministic.
+-                if rng.gen_bool(0.35) {
++                if rng.random_bool(0.35) {
+                     let body = pick(
+                         &mut rng,
+                         &[
+@@ -3116,11 +3116,11 @@
+                     stmts.push(format!("zstyle '{pat}' sty v{i}"));
+                 }
+             }
+-            for _ in 0..rng.gen_range(1..=3) {
++            for _ in 0..rng.random_range(1..=3) {
+                 let ctx = pick(&mut rng, ZS_CTX);
+                 // -s (scalar), -a (array), -t (boolean test), -g (dump), and
+                 // the raw lookup status all read the same table differently.
+-                match rng.gen_range(0..8) {
++                match rng.random_range(0..8) {
+                     0 => stmts.push(format!(
+                         "zstyle -s '{ctx}' sty r; print -r -- \"s=[$r] rc=$?\""
+                     )),
+@@ -3157,7 +3157,7 @@
+                 }
+             }
+             // -d deletes; a later lookup must miss.
+-            if rng.gen_bool(0.3) {
++            if rng.random_bool(0.3) {
+                 let pat = pick(&mut rng, ZS_PATS);
+                 stmts.push(format!("zstyle -d '{pat}' sty"));
+                 let ctx = pick(&mut rng, ZS_CTX);
+@@ -3179,7 +3179,7 @@
+             // {a A v D E F G K M}: a spec starting with one of those is eaten by
+             // the matching zparseopts flag (`-verbose` -> the fork-only `-v` argv
+             // flag = a false divergence; `-all` -> `-a`), not a long option.
+-            if rng.gen_bool(0.3) {
++            if rng.random_bool(0.3) {
+                 let probe = pick(
+                     &mut rng,
+                     &[
+@@ -3196,7 +3196,7 @@
+                 stmts.push(probe.to_string());
+                 return stmts;
+             }
+-            let args: Vec<&str> = (0..rng.gen_range(1..=5))
++            let args: Vec<&str> = (0..rng.random_range(1..=5))
+                 .map(|_| {
+                     *pick(
+                         &mut rng,
+@@ -3228,16 +3228,16 @@
+             // for a feature zshrs gets RIGHT. Same fork-ahead-of-oracle split
+             // as `zstyle -q`, the `:S` modifier and `typeset -n`.
+             let mut flags = String::new();
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 flags.push_str("-D ");
+             }
+-            if rng.gen_bool(0.4) {
++            if rng.random_bool(0.4) {
+                 flags.push_str("-E ");
+             }
+-            if rng.gen_bool(0.25) {
++            if rng.random_bool(0.25) {
+                 flags.push_str("-F ");
+             }
+-            if rng.gen_bool(0.25) {
++            if rng.random_bool(0.25) {
+                 // -K only shows a difference when the destination already has
+                 // something in it, so seed one.
+                 stmts.push("A=(seeded)".to_string());
+@@ -3256,7 +3256,7 @@
+             // `zparseopts` returns non-zero on an unrecognised option; print it.
+             // The `-a`/`-A` destinations collect every match in one place
+             // instead of per-option arrays, so they read back differently.
+-            match rng.gen_range(0..4) {
++            match rng.random_range(0..4) {
+                 0 => {
+                     stmts.push(format!(
+                         "zparseopts {flags}-a all {spec}; print -r -- \"rc=$?\""
+@@ -3326,7 +3326,7 @@
+     // introspection (`typeset -p` correctly reports "no such variable" while
+     // the stale environ entry survives), so only a child process can see it.
+     let mut export_check: Option<String> = None;
+-    let body = match rng.gen_range(0..11) {
++    let body = match rng.random_range(0..11) {
+         // Localizing a SPECIAL parameter. c:Src/builtin.c:2087-2089 sets
+         // `newspecial = NS_NORMAL` so the local keeps the special struct (and
+         // its gsu setter), and c:Src/params.c:5900-5933 scanendscope re-fires
+@@ -3350,7 +3350,7 @@
+         // specials (path, `local -T`) remain broken (#1039 A/B/C) and are
+         // likewise excluded so the mode stays green.
+         10 => {
+-            let (decl, probe) = match rng.gen_range(0..11) {
++            let (decl, probe) = match rng.random_range(0..11) {
+                 0 => ("local IFS=:", r#"s="a:b:c"; print -r -- "n=${#${=s}}""#),
+                 1 => ("local IFS=,", r#"s="x,y"; print -r -- "n=${#${=s}}""#),
+                 2 => ("local IFS=", r#"s="a b"; print -r -- "n=${#${=s}}""#),
+@@ -3403,7 +3403,7 @@
+             // `environ`, so the local's assignment republished over it and a
+             // CHILD saw the local value — invisible to `${(t)}`, which already
+             // read `scalar-local`, so only a child process can catch it.
+-            let (setup, decl, check) = match rng.gen_range(0..6) {
++            let (setup, decl, check) = match rng.random_range(0..6) {
+                 0 => ("", "local -x XP=inner", "XP"),
+                 1 => ("export XP=outer; ", "local -x XP=inner", "XP"),
+                 2 => ("XP=plain; ", "local -x XP=inner", "XP"),
+@@ -3478,7 +3478,7 @@
+                     "unsetopt typesettounset; typeset u; setopt typesettounset; typeset u",
+                 ],
+             );
+-            match rng.gen_range(0..2) {
++            match rng.random_range(0..2) {
+                 0 => format!(
+                     "{o}; typeset u; print -r -- \"[${{u-UNSET}}]\"; typeset u=1; typeset u"
+                 ),
+@@ -3502,7 +3502,7 @@
+     //   function -- f { }  explicit end-of-options (c:1693)
+     // `-T` prints an xtrace line to stderr, which the harness compares only
+     // under 2>&1, so it stays a plain stdout-parity case here.
+-    let def = match rng.gen_range(0..6) {
++    let def = match rng.random_range(0..6) {
+         0 => format!("f() {{ {body} }}"),
+         1 => format!("f () {{ {body} }}"),
+         2 => format!("function f {{ {body} }}"),
+@@ -3535,7 +3535,7 @@
+     // apart. Anonymous-function bodies are deliberately NOT generated — zsh
+     // emits an extra trace line for the `(anon)` invocation that zshrs does
+     // not (docs/BUGS.md #1058, that leg still open). Bug #1058.
+-    if rng.gen_bool(0.5) {
++    if rng.random_bool(0.5) {
+         let traced = pick(
+             &mut rng,
+             &[
+@@ -3575,7 +3575,7 @@
+     // the callee a FRESH one (c:Src/exec.c:5572-5585), so the caller's `cursh`
+     // / `then` / `for` / `case` context must not show through. Probed on its
+     // own because it needs no stderr folding, unlike the xtrace rows. Bug #1059.
+-    if rng.gen_bool(0.5) {
++    if rng.random_bool(0.5) {
+         let ctx = pick(
+             &mut rng,
+             &[
+@@ -3719,7 +3719,7 @@
+     // captured by par_funcdef/parse_inline_funcdef; before that capture the
+     // short form listed as `f () { }` (empty). The nested-anon body `() print
+     // anon` exercises the canonicalizer's recursive re-brace + indent.
+-    if rng.gen_bool(0.4) {
++    if rng.random_bool(0.4) {
+         let short = pick(
+             &mut rng,
+             &[
+@@ -3735,7 +3735,7 @@
+                 "() print anon",
+             ],
+         );
+-        let kw = if rng.gen_bool(0.5) { "function " } else { "" };
++        let kw = if rng.random_bool(0.5) { "function " } else { "" };
+         return vec![format!("{kw}f () {short}; {verb}")];
+     }
+ 
+@@ -3771,7 +3771,7 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+ 
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         // c:4253 — a failing command reports; a succeeding one does not.
+         0 => {
+             let opt = pick(&mut rng, &["setopt", "unsetopt"]);
+@@ -3792,7 +3792,7 @@
+         }
+         // c:5442 — a shell function's non-zero return reports.
+         2 => {
+-            let n = rng.gen_range(0..=5);
++            let n = rng.random_range(0..=5);
+             stmts.push(format!(
+                 "setopt printexitvalue; f() {{ return {n} }}; f 2>&1; print -r -- done"
+             ));
+@@ -3860,7 +3860,7 @@
+          command mkdir -p -- \"$d\"; cd -- \"$d\" || exit 0"
+     )];
+ 
+-    match rng.gen_range(0..9) {
++    match rng.random_range(0..9) {
+         // NAMED-FD open FAILURE: `{var}<file` (missing file) / `{var}>file`
+         // (missing parent dir). The open must fail with "no such file or
+         // directory: PATH", set $?=1 and SKIP the command (c:Src/exec.c:
+@@ -3969,7 +3969,7 @@
+         // one exclusive ownership of the fd and silently drops the outer,
+         // which is invisible unless a case reads BOTH targets back.
+         _ => {
+-            let mio = if rng.gen_bool(0.5) {
++            let mio = if rng.random_bool(0.5) {
+                 "setopt multios"
+             } else {
+                 "unsetopt multios"
+@@ -4055,7 +4055,7 @@
+ /// Outer operators applied to an already-built inner expansion. Each is a
+ /// (prefix, suffix) pair spliced around the inner text.
+ fn nest_wrap(rng: &mut StdRng, inner: &str) -> String {
+-    match rng.gen_range(0..14) {
++    match rng.random_range(0..14) {
+         // Flag-only wrappers — these are the ones whose array/scalar contract
+         // is easy to get wrong one level down.
+         0 => format!("${{(U){inner}}}"),
+@@ -4076,7 +4076,7 @@
+         12 => format!("${{{inner}#*_}}"),
+         // Subscript the inner result.
+         _ => {
+-            let i = rng.gen_range(1..=3);
++            let i = rng.random_range(1..=3);
+             format!("${{{inner}[{i}]}}")
+         }
+     }
+@@ -4101,13 +4101,13 @@
+ fn gen_nest(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec![NEST_BASE.trim_end().to_string()];
+-    for _ in 0..rng.gen_range(2..=5) {
+-        let depth = rng.gen_range(1..=3);
++    for _ in 0..rng.random_range(2..=5) {
++        let depth = rng.random_range(1..=3);
+         let e = nest_build(&mut rng, depth);
+         // Print both quoted (one word, joins with $IFS) and `-l` (one element
+         // per line) — the two disagree exactly when the array/scalar contract
+         // of a nested flag is wrong, which is the bug class this mode hunts.
+-        if rng.gen_bool(0.5) {
++        if rng.random_bool(0.5) {
+             stmts.push(format!("print -r -- \"[{e}]\""));
+         } else {
+             stmts.push(format!("print -rl -- {e}"));
+@@ -4136,15 +4136,15 @@
+ 
+ /// A leaf operand: literal, variable, or a based/hex literal.
+ fn ar_leaf(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..9) {
+-        0 => rng.gen_range(-20..40).to_string(),
++    match rng.random_range(0..9) {
++        0 => rng.random_range(-20..40).to_string(),
+         1 => "i".to_string(),
+         2 => "j".to_string(),
+         3 => "big".to_string(),
+-        4 => format!("16#{:x}", rng.gen_range(1..255)),
+-        5 => format!("2#{:b}", rng.gen_range(1..64)),
+-        6 => format!("8#{:o}", rng.gen_range(1..64)),
+-        7 => format!("0x{:x}", rng.gen_range(1..255)),
++        4 => format!("16#{:x}", rng.random_range(1..255)),
++        5 => format!("2#{:b}", rng.random_range(1..64)),
++        6 => format!("8#{:o}", rng.random_range(1..64)),
++        7 => format!("0x{:x}", rng.random_range(1..255)),
+         // 36#zz — the top of the supported input-base range.
+         _ => format!("36#{}", pick(rng, &["z", "zz", "10", "a9"])),
+     }
+@@ -4153,23 +4153,23 @@
+ /// A float-typed leaf — forces the whole expression into float arithmetic,
+ /// which has its own division/printing rules.
+ fn ar_fleaf(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..5) {
++    match rng.random_range(0..5) {
+         0 => "f".to_string(),
+         1 => "g".to_string(),
+-        2 => format!("{}.{}", rng.gen_range(0..9), rng.gen_range(1..99)),
+-        3 => format!("{}e{}", rng.gen_range(1..9), rng.gen_range(1..4)),
+-        _ => format!("{}.0", rng.gen_range(1..20)),
++        2 => format!("{}.{}", rng.random_range(0..9), rng.random_range(1..99)),
++        3 => format!("{}e{}", rng.random_range(1..9), rng.random_range(1..4)),
++        _ => format!("{}.0", rng.random_range(1..20)),
+     }
+ }
+ 
+ /// An integer arithmetic expression, recursive with a depth cap.
+ fn ar_expr(rng: &mut StdRng, depth: u32) -> String {
+-    if depth == 0 || rng.gen_bool(0.3) {
++    if depth == 0 || rng.random_bool(0.3) {
+         return ar_leaf(rng);
+     }
+     let l = ar_expr(rng, depth - 1);
+     let r = ar_expr(rng, depth - 1);
+-    match rng.gen_range(0..10) {
++    match rng.random_range(0..10) {
+         // Divide / modulo: force a nonzero divisor via `| 1`.
+         0 => {
+             let op = pick(rng, &["/", "%"]);
+@@ -4186,7 +4186,7 @@
+         // Unary forms: negation, bitwise complement, logical not.
+         3 => format!("{}({l})", pick(rng, &["-", "~", "!"])),
+         // Ternary, including a nested one in the true-branch.
+-        4 => format!("(({l})) ? ({r}) : {}", rng.gen_range(0..9)),
++        4 => format!("(({l})) ? ({r}) : {}", rng.random_range(0..9)),
+         // Comparison — the result is a 0/1 int.
+         5 => {
+             let op = pick(rng, &["<", ">", "<=", ">=", "==", "!="]);
+@@ -4218,8 +4218,8 @@
+ fn gen_arith_mode(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec![AR_STATE.to_string()];
+-    for _ in 0..rng.gen_range(2..=5) {
+-        match rng.gen_range(0..10) {
++    for _ in 0..rng.random_range(2..=5) {
++        match rng.random_range(0..10) {
+             // Plain integer expression.
+             0 => {
+                 let e = ar_expr(&mut rng, 3);
+@@ -4295,11 +4295,11 @@
+             // The radix applies to the whole expression's printed form.
+             1 => {
+                 let base = pick(&mut rng, &["2", "8", "16", "36", "10"]);
+-                let hashes = if rng.gen_bool(0.5) { "#" } else { "##" };
++                let hashes = if rng.random_bool(0.5) { "#" } else { "##" };
+                 // Optional digit grouping `_G` (math.c:820 underscore field):
+                 // an `_` is inserted every G output digits from the right, and
+                 // it applies even to base 10 (`[#10_3] 1000000` -> `1_000_000`).
+-                let grp = match rng.gen_range(0..3) {
++                let grp = match rng.random_range(0..3) {
+                     0 => format!("_{}", pick(&mut rng, &["2", "3", "4"])),
+                     _ => String::new(),
+                 };
+@@ -4307,7 +4307,7 @@
+                 // Sometimes force the operand negative: the minus sign is
+                 // emitted BEFORE the `B#` prefix (`-16#FF`, math.c convertbase),
+                 // a distinct output path from the positive form.
+-                let operand = if rng.gen_bool(0.4) {
++                let operand = if rng.random_bool(0.4) {
+                     format!("-(({e}))")
+                 } else {
+                     e
+@@ -4327,7 +4327,7 @@
+             // `Inf`/`-Inf`/`NaN` PRINT forms — went uncompared. All hand-
+             // verified equal on both shells before generating.
+             2 => {
+-                if rng.gen_bool(0.3) {
++                if rng.random_bool(0.3) {
+                     // Dedicated IEEE-754 special-value probe.
+                     let e = pick(
+                         &mut rng,
+@@ -4349,7 +4349,7 @@
+                     let l = ar_fleaf(&mut rng);
+                     // Sometimes force a 0.0 divisor so `/` reaches the defined
+                     // ±Inf/NaN result instead of always a finite quotient.
+-                    let r = if rng.gen_bool(0.25) {
++                    let r = if rng.random_bool(0.25) {
+                         "0.0".to_string()
+                     } else {
+                         ar_fleaf(&mut rng)
+@@ -4386,7 +4386,7 @@
+             5 => {
+                 let v = pick(&mut rng, &["i", "j"]);
+                 let form = pick(&mut rng, &["++", "--"]);
+-                let e = if rng.gen_bool(0.5) {
++                let e = if rng.random_bool(0.5) {
+                     format!("{v}{form}") // post: yields the OLD value
+                 } else {
+                     format!("{form}{v}") // pre: yields the NEW value
+@@ -4471,9 +4471,9 @@
+ fn gen_match(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["setopt extendedglob".to_string(), MT_STATE.to_string()];
+-    for _ in 0..rng.gen_range(2..=5) {
++    for _ in 0..rng.random_range(2..=5) {
+         let (v, pat) = *pick(&mut rng, MT_SUBJ);
+-        let expr = match rng.gen_range(0..10) {
++        let expr = match rng.random_range(0..10) {
+             // Anchored strip with a report flag: (M) matched text, (B)/(E)
+             // offsets, (N) match length. Reported instead of the remainder.
+             0 => {
+@@ -4494,7 +4494,7 @@
+             }
+             // (I:n:) — select the n'th match rather than the first.
+             3 => {
+-                let k = rng.gen_range(1..=3);
++                let k = rng.random_range(1..=3);
+                 let f = pick(&mut rng, &["", "M", "B", "E"]);
+                 format!("${{(SI:{k}:{f}){v}#{pat}}}")
+             }
+@@ -4514,7 +4514,7 @@
+             // Replacement referencing the match length, and an empty
+             // replacement (deletion).
+             _ => {
+-                if rng.gen_bool(0.5) {
++                if rng.random_bool(0.5) {
+                     format!("${{{v}//{pat}/}}")
+                 } else {
+                     format!("${{(M){v}//{pat}/X}}")
+@@ -4571,11 +4571,11 @@
+     let mut stmts: Vec<String> = Vec::new();
+     // BASH_REMATCH re-routes the capture output into a different array with a
+     // different indexing convention ([0] = whole match) — both paths matter.
+-    let bash_rematch = rng.gen_bool(0.3);
++    let bash_rematch = rng.random_bool(0.3);
+     if bash_rematch {
+         stmts.push("setopt BASH_REMATCH".to_string());
+     }
+-    for _ in 0..rng.gen_range(2..=4) {
++    for _ in 0..rng.random_range(2..=4) {
+         let subj = pick(&mut rng, RX_SUBJ);
+         let pat = pick(&mut rng, RX_PAT);
+         stmts.push(format!(
+@@ -4615,7 +4615,7 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+ 
+-    match rng.gen_range(0..8) {
++    match rng.random_range(0..8) {
+         // ---- print: the flag matrix, over a fixed word list.
+         // `builtin NAME` diagnostics. The prefix is the point: zsh emits
+         // `zsh:LINE: no such builtin: NAME` via zwarn (c:Src/exec.c:3436), and
+@@ -4658,7 +4658,7 @@
+             stmts.push(probe.to_string());
+         }
+         0 => {
+-            let n = rng.gen_range(1..=4);
++            let n = rng.random_range(1..=4);
+             let words: Vec<String> = (0..n)
+                 .map(|_| format!("'{}'", pick(&mut rng, BI_WORDS)))
+                 .collect();
+@@ -4708,7 +4708,7 @@
+                     "single",
+                 ],
+             );
+-            match rng.gen_range(0..5) {
++            match rng.random_range(0..5) {
+                 // Plain read: splits on IFS, last var gets the remainder.
+                 0 => {
+                     stmts.push(format!("read a b c <<< '{input}'"));
+@@ -4733,7 +4733,7 @@
+                 }
+                 // -k: read exactly N characters.
+                 _ => {
+-                    let k = rng.gen_range(1..=4);
++                    let k = rng.random_range(1..=4);
+                     stmts.push(format!("read -k {k} x <<< '{input}'; print -r -- \"[$x]\""));
+                 }
+             }
+@@ -4744,7 +4744,7 @@
+         // ---- getopts: the option-parsing loop, including a bad option and a
+         // missing required argument (both have defined, distinct behaviour).
+         4 => {
+-            let args: Vec<&str> = (0..rng.gen_range(1..=4))
++            let args: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| {
+                     *pick(
+                         &mut rng,
+@@ -4792,7 +4792,7 @@
+                     "aliases",
+                 ],
+             );
+-            let set = rng.gen_bool(0.5);
++            let set = rng.random_bool(0.5);
+             stmts.push(format!("{}setopt {opt}", if set { "" } else { "un" }));
+             stmts.push(format!("[[ -o {opt} ]]; print -r -- \"o=$?\""));
+             stmts.push(format!("[[ -o no{opt} ]]; print -r -- \"no=$?\""));
+@@ -4832,8 +4832,8 @@
+         "printf 'l1\\nl2\\nl3\\n' > f; printf 'trail\\n\\n\\n' > g; printf 'noeol' > h".to_string(),
+         "IFS=$' \\t\\n'".to_string(),
+     ];
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..13) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..13) {
+             // ZSH_EVAL_CONTEXT inside a command substitution. execode
+             // (c:Src/exec.c:1245-1266) APPENDS its `context` argument for the
+             // duration of the body, and getoutput passes "cmdsubst"
+@@ -4989,8 +4989,8 @@
+ fn gen_loop(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["items=(p q r); nums=(1 2 3 4)".to_string()];
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..12) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..12) {
+             // Cross-chunk `break`/`continue`: the keyword runs in a
+             // DIFFERENT compiled chunk from the loop it must end — a
+             // called function, a function calling that function, `eval`,
+@@ -5008,7 +5008,7 @@
+             //     `f`'s own loop consumes the break, and `f` runs on.
+             11 => {
+                 let body = *pick(&mut rng, &["break", "continue", "break 2", "continue 2"]);
+-                let shape = rng.gen_range(0..9);
++                let shape = rng.random_range(0..9);
+                 match shape {
+                     0 => format!(
+                         "f(){{ {body}; print inner; }}; for i in 1 2; do print $i; f; print after; done; print -r -- \"rc=$?\""
+@@ -5045,21 +5045,21 @@
+             }
+             // Nested loops with a multi-level break: `break 2` leaves BOTH.
+             0 => {
+-                let lvl = rng.gen_range(1..=2);
++                let lvl = rng.random_range(1..=2);
+                 format!(
+                     "for x in $items; do for y in $nums; do (( y == 2 )) && break {lvl}; print -r -- \"$x$y\"; done; done; print -r -- END"
+                 )
+             }
+             // Multi-level continue.
+             1 => {
+-                let lvl = rng.gen_range(1..=2);
++                let lvl = rng.random_range(1..=2);
+                 format!(
+                     "for x in $items; do for y in $nums; do (( y == 2 )) && continue {lvl}; print -r -- \"$x$y\"; done; done; print -r -- END"
+                 )
+             }
+             // C-style for.
+             2 => {
+-                let n = rng.gen_range(0..=4);
++                let n = rng.random_range(0..=4);
+                 format!("for (( k = 0; k < {n}; k++ )); do print -r -- \"k=$k\"; done; print -r -- \"after=$k\"")
+             }
+             // while with an arithmetic condition.
+@@ -5068,7 +5068,7 @@
+             4 => "i=0; until (( i >= 3 )); do print -r -- \"u=$i\"; (( i++ )); done".to_string(),
+             // repeat N — a fixed count with no loop variable.
+             5 => {
+-                let n = rng.gen_range(0..=4);
++                let n = rng.random_range(0..=4);
+                 format!("repeat {n}; do print -r -- rep; done; print -r -- END")
+             }
+             // `;&` — unconditional fallthrough into the NEXT branch's body.
+@@ -5186,7 +5186,7 @@
+     // hand-verified equal on both shells (interior empty-run collapse for
+     // unquoted `(0)`/`(s)`, `(ps)` empty-preservation, trailing-separator
+     // handling). NUL bytes come from `$'…\0…'`.
+-    if rng.gen_bool(0.18) {
++    if rng.random_bool(0.18) {
+         let probe = pick(
+             &mut rng,
+             &[
+@@ -5231,16 +5231,16 @@
+     );
+     stmts.push(format!("v=$'{val}'"));
+     stmts.push("arr=(p q r); e=(); empty=''".to_string());
+-    if rng.gen_bool(0.7) {
++    if rng.random_bool(0.7) {
+         stmts.push(format!("IFS={}", pick(&mut rng, IFS_VALS)));
+     }
+-    if rng.gen_bool(0.6) {
+-        let neg = if rng.gen_bool(0.3) { "un" } else { "" };
++    if rng.random_bool(0.6) {
++        let neg = if rng.random_bool(0.3) { "un" } else { "" };
+         stmts.push(format!("{neg}setopt {}", pick(&mut rng, SPLIT_OPTS)));
+     }
+ 
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let probe = match rng.gen_range(0..16) {
++    for _ in 0..rng.random_range(2..=4) {
++        let probe = match rng.random_range(0..16) {
+             // Unquoted scalar: splits only under SH_WORD_SPLIT.
+             0 => "print -rl -- $v; print -r -- END",
+             // Quoted: never splits, whatever the options.
+@@ -5306,15 +5306,15 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+ 
+-    for _ in 0..rng.gen_range(1..=2) {
+-        let stmt = match rng.gen_range(0..18) {
++    for _ in 0..rng.random_range(1..=2) {
++        let stmt = match rng.random_range(0..18) {
+             // EXIT trap fires at shell exit, and sees the exit status in $?.
+             0 => "trap 'print -r -- \"exit-trap rc=$?\"' EXIT; print -r -- body; exit 3".to_string(),
+             // EXIT trap in a subshell fires when the SUBSHELL exits, not later.
+             1 => "trap 'print -r -- outer' EXIT; ( trap 'print -r -- inner' EXIT; print -r -- sub ); print -r -- after".to_string(),
+             // A trap set inside a function is GLOBAL unless LOCAL_TRAPS is set.
+             2 => {
+-                let lt = if rng.gen_bool(0.5) { "setopt local_traps; " } else { "" };
++                let lt = if rng.random_bool(0.5) { "setopt local_traps; " } else { "" };
+                 format!("trap 'print -r -- outer-usr1' USR1; f() {{ {lt}trap 'print -r -- inner-usr1' USR1; kill -USR1 $$ }}; f; kill -USR1 $$")
+             }
+             // ERR trap fires on every failing command (not inside a condition).
+@@ -5336,7 +5336,7 @@
+             // TRY_BLOCK_ERROR: set inside `always` when the try block was
+             // aborted by an error; zeroing it swallows the error.
+             8 => {
+-                let clear = if rng.gen_bool(0.5) { "TRY_BLOCK_ERROR=0; " } else { "" };
++                let clear = if rng.random_bool(0.5) { "TRY_BLOCK_ERROR=0; " } else { "" };
+                 format!("f() {{ {{ typeset -r ro=1; ro=2 }} always {{ print -r -- \"tbe=$TRY_BLOCK_ERROR\"; {clear}}} ; print -r -- reached }}; f; print -r -- \"rc=$?\"")
+             }
+             // The function form of a signal trap runs in its own frame: a
+@@ -5501,16 +5501,16 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+ 
+-    if rng.gen_bool(0.4) {
+-        let neg = if rng.gen_bool(0.3) { "un" } else { "" };
++    if rng.random_bool(0.4) {
++        let neg = if rng.random_bool(0.3) { "un" } else { "" };
+         stmts.push(format!(
+             "{neg}setopt {}",
+             pick(&mut rng, &["pipe_fail", "err_exit", "err_return"])
+         ));
+     }
+ 
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..14) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..14) {
+             // $? of a pipeline is the LAST stage's status (unless PIPE_FAIL).
+             0 => {
+                 let a = pick(&mut rng, &["true", "false", "(exit 3)"]);
+@@ -5659,19 +5659,19 @@
+ fn gen_prompt(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
++    for _ in 0..rng.random_range(1..=3) {
+         // A prior command fixes $? so the %(?..) ternaries are deterministic.
+-        if rng.gen_bool(0.4) {
+-            stmts.push(if rng.gen_bool(0.5) {
++        if rng.random_bool(0.4) {
++            stmts.push(if rng.random_bool(0.5) {
+                 "true".into()
+             } else {
+                 "false".into()
+             });
+         }
+-        let n = rng.gen_range(1..=3);
++        let n = rng.random_range(1..=3);
+         let body: Vec<&str> = (0..n).map(|_| *pick(&mut rng, PROMPT_ATOMS)).collect();
+         let s = body.join("|");
+-        match rng.gen_range(0..4) {
++        match rng.random_range(0..4) {
+             // print -P: the prompt expander on an explicit string.
+             0 => stmts.push(format!("print -P -- '{s}'")),
+             // -n: no trailing newline, so trailing-escape handling is visible.
+@@ -5790,10 +5790,10 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+ 
+-    match rng.gen_range(0..8) {
++    match rng.random_range(0..8) {
+         // Scalar + a modifier chain.
+         0 | 1 => {
+-            for _ in 0..rng.gen_range(1..=3) {
++            for _ in 0..rng.random_range(1..=3) {
+                 let p = pick(&mut rng, MOD_PATHS);
+                 let m = pick(&mut rng, MODS);
+                 stmts.push(format!("f='{p}'; print -r -- \"[${{f{m}}}]\""));
+@@ -5812,7 +5812,7 @@
+                 .iter()
+                 .filter(|m| !m.contains('&') && !m.contains('|'))
+                 .collect();
+-            for _ in 0..rng.gen_range(1..=3) {
++            for _ in 0..rng.random_range(1..=3) {
+                 let p = pick(&mut rng, MOD_PATHS);
+                 let m = **pick(&mut rng, &safe);
+                 stmts.push(format!("f='{p}'; print -r -- $f{m}"));
+@@ -5935,10 +5935,10 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["zmodload zsh/mathfunc".to_string()];
+ 
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         // Bare calls, printed raw: the float formatter is part of the parity.
+         0 | 1 => {
+-            for _ in 0..rng.gen_range(1..=3) {
++            for _ in 0..rng.random_range(1..=3) {
+                 let e = pick(&mut rng, MF_1ARG);
+                 stmts.push(format!("print -r -- \"$(( {e} ))\""));
+             }
+@@ -5982,7 +5982,7 @@
+         3 => {
+             stmts.push("_cube() { (( REPLY = $1 * $1 * $1 )) }".to_string());
+             stmts.push("functions -M cube 1 1 _cube".to_string());
+-            let n = rng.gen_range(0..6);
++            let n = rng.random_range(0..6);
+             stmts.push(format!("print -r -- \"$(( cube({n}) ))\""));
+             stmts.push(format!("print -r -- \"$(( cube({n}) + cube(2) ))\""));
+             // Wrong arity is an error, and must be reported the same way.
+@@ -6034,7 +6034,7 @@
+     let emu = pick(&mut rng, &["sh", "ksh", "zsh"]);
+     let mut stmts: Vec<String> = Vec::new();
+ 
+-    match rng.gen_range(0..8) {
++    match rng.random_range(0..8) {
+         // What the emulation actually SET: probe the options it is defined to
+         // flip. This catches a wrong entry in the emulation table directly.
+         0 => {
+@@ -6228,8 +6228,8 @@
+         "p() { print -r -- \"${PWD#$base}|${OLDPWD#$base}\" }".to_string(),
+     ];
+ 
+-    if rng.gen_bool(0.5) {
+-        let neg = if rng.gen_bool(0.3) { "un" } else { "" };
++    if rng.random_bool(0.5) {
++        let neg = if rng.random_bool(0.3) { "un" } else { "" };
+         stmts.push(format!(
+             "{neg}setopt {}",
+             pick(
+@@ -6246,8 +6246,8 @@
+         ));
+     }
+ 
+-    for _ in 0..rng.gen_range(2..=5) {
+-        let stmt = match rng.gen_range(0..16) {
++    for _ in 0..rng.random_range(2..=5) {
++        let stmt = match rng.random_range(0..16) {
+             // cd + the $OLDPWD bookkeeping, and `cd -` to return.
+             0 => "cd a; p; cd -; p".to_string(),
+             1 => "cd a/b; cd ../..; p".to_string(),
+@@ -6364,12 +6364,12 @@
+     let mut stmts = vec![UNI_STATE.trim_end().to_string()];
+     // MULTIBYTE is default-on; flipping it off switches every length/index
+     // operation to raw bytes — the same probe must then agree byte-for-byte.
+-    if rng.gen_bool(0.2) {
++    if rng.random_bool(0.2) {
+         stmts.push("unsetopt multibyte".to_string());
+     }
+-    for _ in 0..rng.gen_range(2..=4) {
++    for _ in 0..rng.random_range(2..=4) {
+         let v = *pick(&mut rng, &vars);
+-        let stmt = match rng.gen_range(0..16) {
++        let stmt = match rng.random_range(0..16) {
+             // Character count vs byte count: ${#v} is chars, $#v under
+             // nomultibyte is bytes.
+             0 => format!("print -r -- \"len=${{#{v}}}\""),
+@@ -6468,8 +6468,8 @@
+ fn gen_quote(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..10) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..10) {
+             // $'…' decoding, byte-exact (piped through od so an invalid-UTF-8
+             // result is still a comparable, printable byte sequence — and the
+             // raw form is printed too, since the harness compares bytes).
+@@ -6598,10 +6598,10 @@
+         "zmodload zsh/datetime".to_string(),
+         "export TZ=UTC".to_string(),
+     ];
+-    for _ in 0..rng.gen_range(2..=4) {
++    for _ in 0..rng.random_range(2..=4) {
+         let f = pick(&mut rng, STRF_FMTS);
+         let e = pick(&mut rng, EPOCHS);
+-        let stmt = match rng.gen_range(0..6) {
++        let stmt = match rng.random_range(0..6) {
+             // Plain: format an epoch to stdout.
+             0 => format!("strftime '{f}' {e}"),
+             // -s: assign instead of printing.
+@@ -6717,7 +6717,7 @@
+     //     the fix the lexer misread `日=x` as a command → "command not found".
+     // The READ is always braced (the bare `$日` read leg is still ASCII-only in
+     // the lexer — see #1021 — so it is NOT generated here).
+-    let assign = if rng.gen_bool(0.5) {
++    let assign = if rng.random_bool(0.5) {
+         format!("typeset {name}=\"{val}\"")
+     } else {
+         format!("{name}=\"{val}\"")
+@@ -6855,8 +6855,8 @@
+ fn gen_paramod(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["zmodload zsh/parameter".to_string()];
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..14) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..14) {
+             // $functions[f] is the function body, re-rendered from the parse
+             // tree — indentation, `;` placement and keyword spelling must match.
+             0 => "f() { print -r -- hi }; print -r -- \"$functions[f]\"".to_string(),
+@@ -6922,8 +6922,8 @@
+ fn gen_procsub(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..12) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..12) {
+             0 => "cat <(print -l a b c)".to_string(),
+             1 => "cat <(print -l a b) <(print -l c d)".to_string(),
+             // Nested process substitution.
+@@ -6966,8 +6966,8 @@
+ fn gen_alias(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..14) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..14) {
+             0 => "alias hi='print -r -- HI'; hi".to_string(),
+             // Alias body ending in a space makes the next word alias-eligible.
+             1 => "alias e='print -r -- '; alias w=WORD; e w".to_string(),
+@@ -7013,8 +7013,8 @@
+ fn gen_autoload(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["fpath=(./fns)".to_string()];
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..13) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..13) {
+             // Two error paths that were both silently wrong.
+             //
+             // `autoload -X` outside a function is `zerrnam(name, "bad
+@@ -7097,10 +7097,10 @@
+ fn gen_stat(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["zmodload zsh/stat".to_string(), "export TZ=UTC".to_string()];
+-    for _ in 0..rng.gen_range(1..=3) {
++    for _ in 0..rng.random_range(1..=3) {
+         let f = pick(&mut rng, STAT_FILES);
+         let fld = pick(&mut rng, STAT_FIELDS);
+-        let stmt = match rng.gen_range(0..11) {
++        let stmt = match rng.random_range(0..11) {
+             // Single field, raw.
+             0 => format!("zstat {fld} {f}"),
+             // -s: string-ify (mode becomes -rw-r--r--, uid becomes a name).
+@@ -7160,20 +7160,20 @@
+     let mut stmts: Vec<String> = Vec::new();
+     // Roughly half the cases arm one or more of the propagation options.
+     let mut opts: Vec<&str> = Vec::new();
+-    if rng.gen_bool(0.5) {
++    if rng.random_bool(0.5) {
+         opts.push("errexit");
+     }
+-    if rng.gen_bool(0.3) {
++    if rng.random_bool(0.3) {
+         opts.push("pipefail");
+     }
+-    if rng.gen_bool(0.3) {
++    if rng.random_bool(0.3) {
+         opts.push("errreturn");
+     }
+     if !opts.is_empty() {
+         stmts.push(format!("setopt {}", opts.join(" ")));
+     }
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..16) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..16) {
+             // Bare failure — under errexit the shell dies here and the trailing
+             // print never runs, so the script's exit code is the observable.
+             0 => "false; print -r -- after".to_string(),
+@@ -7225,8 +7225,8 @@
+ fn gen_posparam(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["set -- alpha beta gamma delta".to_string()];
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..16) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..16) {
+             0 => "print -r -- \"n=$# 1=$1 last=${@[-1]} all=$*\"".to_string(),
+             // "$*" joins on IFS[1]; "$@" never joins.
+             1 => "print -rl -- \"$*\"; print -r -- --; print -rl -- \"$@\"; print -r -- END".to_string(),
+@@ -7235,10 +7235,10 @@
+             3 => "set -- a '' b; print -r -- \"n=$#\"; for x in \"$@\"; do print -r -- \"<$x>\"; done".to_string(),
+             4 => "set -- a '' b; for x in $@; do print -r -- \"<$x>\"; done; print -r -- END".to_string(),
+             // Slices are 1-based.
+-            5 => format!("print -r -- \"[${{@:{}:{}}}]\"", rng.gen_range(1..4), rng.gen_range(1..4)),
++            5 => format!("print -r -- \"[${{@:{}:{}}}]\"", rng.random_range(1..4), rng.random_range(1..4)),
+             6 => "print -r -- \"[${@:2}]\" \"[${*:2:2}]\"".to_string(),
+             // shift with a count, and past the end.
+-            7 => format!("shift {}; print -r -- \"n=$# rest=$*\"", rng.gen_range(1..3)),
++            7 => format!("shift {}; print -r -- \"n=$# rest=$*\"", rng.random_range(1..3)),
+             8 => "shift 9 2>/dev/null; print -r -- \"rc=$? n=$#\"".to_string(),
+             // `argv` aliases the whole list, in both directions.
+             9 => "print -r -- \"argv=(${(j:,:)argv}) count=${#argv}\"".to_string(),
+@@ -7270,24 +7270,24 @@
+ fn gen_numfmt(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..14) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..14) {
+             // Integer with an output base: the value re-renders as `base#digits`.
+             0 => {
+                 let b = pick(&mut rng, &[2, 8, 16, 36]);
+-                format!("typeset -i {b} v={}; print -r -- $v", rng.gen_range(0..300))
++                format!("typeset -i {b} v={}; print -r -- $v", rng.random_range(0..300))
+             }
+             // A negative value in a non-decimal base.
+-            1 => format!("typeset -i 16 v=-{}; print -r -- $v", rng.gen_range(1..300)),
++            1 => format!("typeset -i 16 v=-{}; print -r -- $v", rng.random_range(1..300)),
+             // Bases are a RENDER property: arithmetic on it stays numeric.
+             2 => "typeset -i 16 v=255; print -r -- $v; print -r -- $(( v + 1 ))".to_string(),
+             // Float precision, fixed vs scientific.
+             3 => {
+-                let p = rng.gen_range(0..8);
++                let p = rng.random_range(0..8);
+                 format!("typeset -F {p} f=3.14159265358979; print -r -- $f")
+             }
+             4 => {
+-                let p = rng.gen_range(0..8);
++                let p = rng.random_range(0..8);
+                 format!("typeset -E {p} f=3.14159265358979; print -r -- $f")
+             }
+             5 => "typeset -F f=0.1; print -r -- $f; typeset -E e=0.1; print -r -- $e".to_string(),
+@@ -7300,14 +7300,14 @@
+             8 => "print -r -- $(( 1 / 3 )); print -r -- $(( 1.0 / 3.0 * 3 ))".to_string(),
+             // Zero / left / right padding.
+             9 => {
+-                let w = rng.gen_range(2..8);
++                let w = rng.random_range(2..8);
+                 format!(
+                     "typeset -Z {w} z={}; print -r -- \"[$z]\"",
+-                    rng.gen_range(1..9999)
++                    rng.random_range(1..9999)
+                 )
+             }
+             10 => {
+-                let w = rng.gen_range(2..8);
++                let w = rng.random_range(2..8);
+                 format!("typeset -L {w} l=abc; typeset -R {w} r=abc; print -r -- \"[$l][$r]\"")
+             }
+             // -Z on a value LONGER than the width truncates, it does not grow.
+@@ -7338,8 +7338,8 @@
+     // each fully rewrites it before reading.
+     let f = format!("mf_{seed}");
+     let mut stmts = vec!["zmodload zsh/mapfile".to_string()];
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..10) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..10) {
+             // Write then read back — mapfile keeps the trailing newline that
+             // `$(<f)` strips.
+             0 => format!("mapfile[{f}]=$'a\\nb\\n'; print -r -- \"[${{mapfile[{f}]}}]\""),
+@@ -7405,10 +7405,10 @@
+ fn gen_pcre(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec!["zmodload zsh/pcre".to_string()];
+-    for _ in 0..rng.gen_range(1..=3) {
++    for _ in 0..rng.random_range(1..=3) {
+         let p = pick(&mut rng, PCRE_PATS);
+         let s = pick(&mut rng, PCRE_SUBJ);
+-        let stmt = match rng.gen_range(0..8) {
++        let stmt = match rng.random_range(0..8) {
+             // Plain compile + match, reporting only the status.
+             0 => format!("pcre_compile '{p}'; pcre_match '{s}'; print -r -- \"rc=$?\""),
+             // $MATCH / $match capture side effects.
+@@ -7464,8 +7464,8 @@
+         "print -r -- 'print -r -- \"zw args=$* n=$#\"' > $d/fns/zw_fn".to_string(),
+         "print -r -- 'print -r -- second' > $d/fns/zw_two".to_string(),
+     ];
+-    for _ in 0..rng.gen_range(1..=2) {
+-        let stmt = match rng.gen_range(0..8) {
++    for _ in 0..rng.random_range(1..=2) {
++        let stmt = match rng.random_range(0..8) {
+             // Compile a function file, then autoload it — the .zwc must be used
+             // and must produce the same result as the source would.
+             0 => "zcompile $d/fns/zw_fn; fpath=($d/fns); autoload -Uz zw_fn; zw_fn a b".to_string(),
+@@ -7523,8 +7523,8 @@
+     // that machine. Env-collidable names make a mode's meaning depend on who
+     // runs it; the export case is now probed on purpose below.
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..17) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..17) {
+             // LOCALIZING a colon-tied special. c:Src/params.c:3434 —
+             // `setarrvalue` runs the array's setfn, which republishes the
+             // joined value to the paired scalar; that must hold for a local
+@@ -7686,8 +7686,8 @@
+ fn gen_readb(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..17) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..17) {
+             // The last name absorbs the remaining words.
+             0 => "read a b <<< 'one two three'; print -r -- \"[$a][$b]\"".to_string(),
+             1 => "read a b c d <<< 'one two'; print -r -- \"[$a][$b][$c][$d]\"".to_string(),
+@@ -7745,8 +7745,8 @@
+     // scratch cwd; both shells run the same seed, so both use the same names.
+     let f = format!("fd_{seed}");
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=2) {
+-        let stmt = match rng.gen_range(0..12) {
++    for _ in 0..rng.random_range(1..=2) {
++        let stmt = match rng.random_range(0..12) {
+             // exec-opened fd, written across several commands, then closed.
+             0 => format!("exec 3> {f}; print -u 3 -r -- one; print -u 3 -r -- two; exec 3>&-; cat {f}"),
+             // Read side.
+@@ -7788,8 +7788,8 @@
+ fn gen_special(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..15) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..15) {
+             // `${(t)}` must agree with `${+}`. c:Src/subst.c:2812 gates the
+             // type tag on `(flags & PM_DECLARED) || !(flags & PM_UNSET)` — a
+             // FLAG test, not "does a paramtab entry exist". zshrs used the
+@@ -7863,8 +7863,8 @@
+ fn gen_brace_mode(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..18) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..18) {
+             0 => "print -r -- {a,b,c}".to_string(),
+             1 => "print -r -- x{a,b}y".to_string(),
+             // Adjacent braces multiply.
+@@ -7957,7 +7957,7 @@
+     // trailing ARGS instead of $@. A distinct path from the $@ form the DRIVE
+     // line uses, and one the vocabulary never exercised. The args here mirror
+     // what `set --` put in $@, so the two forms are directly comparable.
+-    if rng.gen_bool(0.3) {
++    if rng.random_bool(0.3) {
+         let explicit = setup.strip_prefix("set -- ").unwrap_or("");
+         stmts.push(format!(
+             "while getopts \"{optstr}\" o {explicit}; do print -r -- \"o=$o arg=[$OPTARG] ind=$OPTIND\"; done; print -r -- \"ind=$OPTIND\""
+@@ -7968,7 +7968,7 @@
+     stmts.push(DRIVE.replace("{OPTSTR}", optstr));
+     // Half the cases re-run the loop after resetting OPTIND, which is the
+     // documented way to parse a second argument list.
+-    if rng.gen_bool(0.4) {
++    if rng.random_bool(0.4) {
+         stmts.push("OPTIND=1".to_string());
+         stmts.push(DRIVE.replace("{OPTSTR}", optstr));
+     }
+@@ -7990,8 +7990,8 @@
+ fn gen_assoc(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec![ASSOC_STATE.to_string()];
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..19) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..19) {
+             // Ordered dumps — never an unordered one.
+             0 => "print -r -- \"${(ok)h}\"".to_string(),
+             1 => "print -r -- \"${(Ok)h}\"".to_string(),
+@@ -8064,8 +8064,8 @@
+     let subjects = ["abc", "a", "xyz", "", "a b", "A", "123"];
+     let s = pick(&mut rng, &subjects);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=2) {
+-        let stmt = match rng.gen_range(0..12) {
++    for _ in 0..rng.random_range(1..=2) {
++        let stmt = match rng.random_range(0..12) {
+             0 => format!("case '{s}' in a*) print -r -- STAR;; a) print -r -- EXACT;; *) print -r -- OTHER;; esac"),
+             // Alternation.
+             1 => format!("case '{s}' in a|b|abc) print -r -- ALT;; *) print -r -- NO;; esac"),
+@@ -8112,14 +8112,14 @@
+ fn gen_default(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     // Three starting states for the tested parameter.
+-    let state = match rng.gen_range(0..3) {
++    let state = match rng.random_range(0..3) {
+         0 => "unset x", // unset
+         1 => "x=''",    // empty
+         _ => "x=set",   // non-empty
+     };
+     let mut stmts = vec![state.to_string()];
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..17) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..17) {
+             // `-` vs `:-`.
+             0 => "print -r -- \"[${x-DEF}]\"".to_string(),
+             1 => "print -r -- \"[${x:-DEF}]\"".to_string(),
+@@ -8202,8 +8202,8 @@
+ fn gen_anonfn(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=2) {
+-        let stmt = match rng.gen_range(0..19) {
++    for _ in 0..rng.random_range(1..=2) {
++        let stmt = match rng.random_range(0..19) {
+             0 => "() { print -r -- \"n=$# 1=$1 2=$2\" } a b c".to_string(),
+             // $@ / $* inside.
+             1 => "() { print -rl -- \"$@\"; print -r -- END } x y z".to_string(),
+@@ -8272,8 +8272,8 @@
+ fn gen_printv(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(2..=4) {
+-        let stmt = match rng.gen_range(0..21) {
++    for _ in 0..rng.random_range(2..=4) {
++        let stmt = match rng.random_range(0..21) {
+             // ECHO builtin escape processing (c:Src/builtin.c bin_echo → c:5030
+             // getkeystring): in zsh, `echo` interprets backslash escapes BY
+             // DEFAULT (unlike POSIX echo). The whole escape set went uncompared:
+@@ -8433,8 +8433,8 @@
+     let subj = ["abc", "aaa", "abab", "xyz", "a1b2", "AbC", "", "hello"];
+     let s = pick(&mut rng, &subj);
+     let mut stmts = vec!["setopt extendedglob".to_string()];
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..16) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..16) {
+             // (#s) start anchor inside a larger pattern.
+             0 => format!("[[ '{s}' = (#s)a* ]] && print -r -- Y || print -r -- N"),
+             1 => format!("[[ '{s}' = *(#e) ]] && print -r -- Y || print -r -- N"),
+@@ -8496,9 +8496,9 @@
+         "nosuchname",
+         "[[",
+     ];
+-    for _ in 0..rng.gen_range(2..=4) {
++    for _ in 0..rng.random_range(2..=4) {
+         let n = pick(&mut rng, &names);
+-        let stmt = match rng.gen_range(0..15) {
++        let stmt = match rng.random_range(0..15) {
+             // -w: the KIND (function/alias/builtin/reserved/command/none).
+             0 => format!("whence -w {n}"),
+             // Verbose sentence form.
+@@ -8587,8 +8587,8 @@
+ fn gen_zstyle(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
+-        let stmt = match rng.gen_range(0..14) {
++    for _ in 0..rng.random_range(1..=3) {
++        let stmt = match rng.random_range(0..14) {
+             // Define + get.
+             0 => "zstyle ':x:y' color blue; zstyle -g v ':x:y' color; print -r -- \"[$v] rc=$?\"".to_string(),
+             // Pattern context — most-specific wins.
+@@ -8649,7 +8649,7 @@
+     // WITH-A-NAME because zsh's message echoes the raw input tail (a trailing
+     // `"` under quotes) and strips the parens for the empty-name `${(X)}` form —
+     // both separate, still-divergent paths this probe deliberately avoids.
+-    if rng.gen_bool(0.18) {
++    if rng.random_bool(0.18) {
+         let bad = pick(
+             &mut rng,
+             &[
+@@ -8711,7 +8711,7 @@
+ 
+     // Outer operator wrapping the `${flags name sub}` expansion.
+     let inner = format!("${{{flags}{name}{sub}}}");
+-    let expr = match rng.gen_range(0..8) {
++    let expr = match rng.random_range(0..8) {
+         0 => format!("${{#{inner}}}"), // length (elements vs chars)
+         1 => format!("${{#{}}}", nested_at(&inner)), // nested ${#${(@)…}}
+         2 => inner.clone(),            // bare splat
+@@ -8724,7 +8724,7 @@
+ 
+     // Emit both an unquoted (word-split) and a double-quoted read so the
+     // isarr/LF_ARRAY shape is checked in both contexts.
+-    let quoted = rng.gen_bool(0.5);
++    let quoted = rng.random_bool(0.5);
+     let read = if quoted {
+         format!("print -rl -- \"{expr}\"")
+     } else {
+@@ -8762,7 +8762,7 @@
+     // forms are generated: the `${#…}` length and UNQUOTED subscript forms of the
+     // same expression collapse earlier (PREFORK_SINGLE) and stay divergent —
+     // BUGS.md #1018 — so they are deliberately excluded here.
+-    if rng.gen_bool(0.2) {
++    if rng.random_bool(0.2) {
+         let probe = pick(
+             &mut rng,
+             &[
+@@ -8806,7 +8806,7 @@
+     // The inner expansion referencing `refname`, either directly (`${arr}`)
+     // or via the (P) indirect flag through a name-holding scalar `n`. Flags
+     // combine into ONE group: `${(@P)n}`, not `${(@)(P)n}`.
+-    let use_p = rng.gen_bool(0.6);
++    let use_p = rng.random_bool(0.6);
+     let (pre_setup, inner2) = if use_p {
+         let grp = format!("{inner_flag}P");
+         (format!("{setup}; n={refname}"), format!("${{({grp})n}}"))
+@@ -8832,7 +8832,7 @@
+     // distinct subsystems (key-enumeration, type-report) with their own gap
+     // classes — excluded so this mode pins the VALUE of `${${…}[…]}`.
+     let body = format!("{inner2}{sub}");
+-    let expr = match rng.gen_range(0..6) {
++    let expr = match rng.random_range(0..6) {
+         0 => format!("${{{body}}}"),       // plain
+         1 => format!("${{#{body}}}"),      // length
+         2 => format!("${{(@){body}}}"),    // array splat
+@@ -8944,7 +8944,7 @@
+     // reproduce the engine's nth zero-width / anchored match bookkeeping) and
+     // would flood the gate. `(S)` shortest is kept (works except when combined
+     // with a `#`/`%` char-anchor + a zero-or-more body — filtered below).
+-    let slash = if rng.gen_bool(0.6) { "//" } else { "/" };
++    let slash = if rng.random_bool(0.6) { "//" } else { "/" };
+     let flag = pick(&mut rng, &["", "", "", "(S)", "(M)"]);
+ 
+     // Compose `${flag name slash anchor pat / repl}`. The anchor is either a
+@@ -8965,7 +8965,7 @@
+         *flag
+     };
+     let expr = format!("${{{flag}s{slash}{a_char}{a_op}{pat}/{repl}}}");
+-    let quoted = rng.gen_bool(0.5);
++    let quoted = rng.random_bool(0.5);
+     let read = if quoted {
+         format!("print -rl -- \"{expr}\"")
+     } else {
+@@ -9006,7 +9006,7 @@
+     );
+     // Deliver the RHS via a variable (so the `=` flag word-splits $v) or
+     // literally in the expansion.
+-    let via_var = rng.gen_bool(0.6);
++    let via_var = rng.random_bool(0.6);
+     let (pre, word) = if via_var {
+         (format!("v={:?}; ", rhs), "$v".to_string())
+     } else {
+@@ -9173,7 +9173,7 @@
+     let opts = pick(&mut rng, GFLAG_OPTS);
+     let esc = pick(&mut rng, GFLAG_ESCAPES);
+ 
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         // Byte-exact decode. The core case.
+         0 | 1 => vec![format!(
+             "v=\"{esc}\"; print -rn -- \"${{(g:{opts}:)v}}\" | od -An -tx1 | tr -s ' '"
+@@ -9295,7 +9295,7 @@
+         ],
+     );
+ 
+-    match rng.gen_range(0..4) {
++    match rng.random_range(0..4) {
+         // `select … in <words>` with the replies piped in. stderr is folded in
+         // so the MENU and PS3 prompt are compared, not just the body's stdout.
+         0 | 1 => vec![format!(
+@@ -9437,7 +9437,7 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let widget = pick(&mut rng, BINDKEY_WIDGETS);
+ 
+-    match rng.gen_range(0..7) {
++    match rng.random_range(0..7) {
+         // Bind, then read the binding back through the SAME spec. Exercises
+         // decode AND the display path (c:zle_keymap.c printbind → nicechar).
+         0 | 1 => {
+@@ -9560,7 +9560,7 @@
+     // zmv:149-151 selects them anyway.
+     let action = "zmv";
+ 
+-    match rng.gen_range(0..7) {
++    match rng.random_range(0..7) {
+         // GLOBBING-FLAG source patterns against REAL fixture files, so the
+         // capture BINDING (not just arg parsing) is exercised. The native zmv
+         // (ext_builtins.rs) globbed without EXTENDED_GLOB and bound captures to
+@@ -9745,12 +9745,12 @@
+ fn gen_testcond(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts: Vec<String> = Vec::new();
+-    for _ in 0..rng.gen_range(1..=3) {
++    for _ in 0..rng.random_range(1..=3) {
+         // `test` and `[` are the same builtin under two funcids
+         // (BIN_TEST=20 / BIN_BRACKET=21, c:Src/builtin.c:7231-7247); `[`
+         // additionally requires its closing `]`.
+-        let bracket = rng.gen_bool(0.5);
+-        let expr = match rng.gen_range(0..9) {
++        let bracket = rng.random_bool(0.5);
++        let expr = match rng.random_range(0..9) {
+             // Double/triple negation of a unary test: `! ! -n x` =
+             // not(not(-n x)) (c:builtin.c:7270 + par_cond's `!` rule). The
+             // pre-flight heuristic rejected a leading-`!` chain over a unary
+@@ -9795,13 +9795,13 @@
+             // are read as "[string] [and] ..." rather than a negation
+             // (c:2521-2531).
+             6 => {
+-                let pool = [COND_UNARY, COND_BARE, COND_BINOP][rng.gen_range(0..3)];
++                let pool = [COND_UNARY, COND_BARE, COND_BINOP][rng.random_range(0..3)];
+                 format!("! {}", pick(&mut rng, pool))
+             }
+             // Parenthesised groups — an extension, and c:7264 prefers a
+             // three-argument binary operator over stripping the parens.
+             _ => {
+-                let pool = [COND_UNARY, COND_BINOP][rng.gen_range(0..2)];
++                let pool = [COND_UNARY, COND_BINOP][rng.random_range(0..2)];
+                 format!("( {} )", pick(&mut rng, pool))
+             }
+         };
+@@ -9821,7 +9821,7 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let e = pick(&mut rng, ZCALC_EXPRS);
+ 
+-    match rng.gen_range(0..4) {
++    match rng.random_range(0..4) {
+         // Plain `-e EXPR`.
+         0 | 1 => vec![format!(
+             "autoload -Uz zcalc; zcalc -e '{e}'; print -r -- \"rc=$?\""
+@@ -9934,7 +9934,7 @@
+         &["", "", "setopt rcexpandparam; ", "unsetopt rcexpandparam; "],
+     );
+ 
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         // Unquoted — the distributing case. `print -rl` makes the word COUNT
+         // visible, which is the whole point.
+         0 | 1 => vec![format!("{opt}a={arr}; print -rl -- {word}")],
+@@ -10047,7 +10047,7 @@
+     let a = format!("{pe}{wh}");
+     let b = format!("{wh}{pe}");
+ 
+-    match rng.gen_range(0..7) {
++    match rng.random_range(0..7) {
+         // Double-quoted: the array is one word, so the join result is visible
+         // verbatim and the quote stage takes the scalar arm (c:4115).
+         0 | 1 => vec![
+@@ -10180,7 +10180,7 @@
+     let ifs = pick(&mut rng, QJOIN_IFS);
+     let op = pick(&mut rng, QJOIN_OPS);
+ 
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         // The collapsed case: double quotes join first (c:3916), so the match
+         // runs once over the whole joined string (c:3462).
+         0 | 1 => vec![format!(
+@@ -10292,7 +10292,7 @@
+     );
+     let pre = format!("{sw}{ifs}s={val}; ");
+ 
+-    match rng.gen_range(0..6) {
++    match rng.random_range(0..6) {
+         // Join the fields with a character that appears in none of them: every
+         // field, empty ones included, is then one visible `|`-delimited slot.
+         0 | 1 => vec![format!("{pre}print -r -- \"[${{(j:|:){inner}}}]\"")],
+@@ -10439,7 +10439,7 @@
+     let mut rng = StdRng::seed_from_u64(seed);
+     let stmt = pick(&mut rng, REJECT_STMTS);
+ 
+-    match rng.gen_range(0..4) {
++    match rng.random_range(0..4) {
+         // The bare decision: `after` on stdout means the shell accepted it.
+         0 | 1 => vec![format!("{stmt}; print -r -- after")],
+         // Inside a function: the error has to propagate out of the call the
+@@ -10565,7 +10565,7 @@
+     let ints = ["0", "1", "2", "3", "5", "7", "10", "42", "-1", "-3"];
+     let strs = ["abc", "hello", "a.b.c", "xxyy", "", "foobar", "a1b2"];
+     let words = ["one", "two", "three", "four"];
+-    match rng.gen_range(0..27) {
++    match rng.random_range(0..27) {
+         // Integer arithmetic (guard div/mod by zero).
+         0 => {
+             let a = *pick(rng, &ints);
+@@ -10599,7 +10599,7 @@
+         }
+         // Positional parameters.
+         4 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(0..=4))
++            let ws: Vec<&str> = (0..rng.random_range(0..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+             let sel = *pick(rng, &["$#", "$1", "$2", "$*", "$@"]);
+@@ -10607,7 +10607,7 @@
+         }
+         // for loop accumulator.
+         5 => {
+-            let nums: Vec<&str> = (0..rng.gen_range(1..=5))
++            let nums: Vec<&str> = (0..rng.random_range(1..=5))
+                 .map(|_| *pick(rng, &["1", "2", "3", "4"]))
+                 .collect();
+             format!(
+@@ -10646,10 +10646,10 @@
+         }
+         // ksh array: set -A, index, count.
+         11 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(1..=4))
++            let ws: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+-            let idx = rng.gen_range(0..ws.len());
++            let idx = rng.random_range(0..ws.len());
+             format!(
+                 "set -A a {}; printf '%s\\n' \"${{a[{idx}]}}\"; printf '%d\\n' \"${{#a[@]}}\"",
+                 ws.join(" ")
+@@ -10693,8 +10693,8 @@
+         // substring `${v:off:len}`.
+         18 => {
+             let v = *pick(rng, &["abcdef", "hello", "0123456", "xy"]);
+-            let off = rng.gen_range(0..4);
+-            let len = rng.gen_range(1..4);
++            let off = rng.random_range(0..4);
++            let len = rng.random_range(1..4);
+             format!("v={v}; printf '%s\\n' \"${{v:{off}:{len}}}\"")
+         }
+         // pattern replace `${v/pat/rep}` / `${v//pat/rep}`.
+@@ -10738,7 +10738,7 @@
+         }
+         // `${!arr[@]}` / `[*]` array indices.
+         25 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(1..=4))
++            let ws: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+             let sub = *pick(rng, &["@", "*"]);
+@@ -10789,7 +10789,7 @@
+ /// is a zshrs gap and never an unsupported-syntax artifact.
+ fn ksh_wide_one(rng: &mut StdRng) -> String {
+     let words = ["one", "two", "three", "four"];
+-    match rng.gen_range(0..28) {
++    match rng.random_range(0..28) {
+         // typeset attribute matrix: case mapping, zero-fill, left/right justify.
+         // ksh(1) "typeset": -u uppercase, -l lowercase, -Zn zero-fill to width
+         // n, -Ln left-justify+strip, -Rn right-justify.
+@@ -10837,7 +10837,7 @@
+         }
+         // `set -A` (replace) vs `set +A` (overlay, keeping the tail).
+         5 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(1..=4))
++            let ws: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+             let op = *pick(rng, &["-A", "+A"]);
+@@ -10855,15 +10855,15 @@
+         }
+         // `unset a[i]` punches the same hole from the other direction.
+         7 => {
+-            let idx = rng.gen_range(0..3);
++            let idx = rng.random_range(0..3);
+             let sel = *pick(rng, &["${!a[@]}", "${#a[@]}", "${a[*]}"]);
+             format!("set -A a x y z; unset 'a[{idx}]'; print -r -- \"{sel}\"")
+         }
+         // `read -A` splits a line into an array; `read -r a b` into scalars.
+         8 => {
+             let line = *pick(rng, &["a b c", "one two", "x  y", "p q r s"]);
+-            if rng.gen_bool(0.5) {
+-                let i = rng.gen_range(0..2);
++            if rng.random_bool(0.5) {
++                let i = rng.random_range(0..2);
+                 format!("print -r -- '{line}' | read -A arr; print -r -- \"${{arr[{i}]}}\"")
+             } else {
+                 format!("print -r -- '{line}' | read -r a b; print -r -- \"[$a][$b]\"")
+@@ -10944,7 +10944,7 @@
+         // `(( … ))` and `let` exit status: 0 when the value is non-zero.
+         16 => {
+             let e = *pick(rng, &["0", "1", "3-3", "2>1", "0||0", "1&&1"]);
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 format!("(( {e} )); print -r -- \"$?\"")
+             } else {
+                 format!("let '{e}'; print -r -- \"$?\"")
+@@ -11023,7 +11023,7 @@
+         // `$*` joins on the first IFS byte; field splitting splits on all of it.
+         24 => {
+             let ifs = *pick(rng, &[":", "-", ",", " "]);
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 format!("set -- a b c; IFS='{ifs}'; print -r -- \"$*\"")
+             } else {
+                 format!("IFS='{ifs}'; v='a{ifs}b{ifs}c'; set -- $v; print -r -- \"$#|$1|$3\"")
+@@ -11031,7 +11031,7 @@
+         }
+         // printf directive matrix (POSIX XCU printf + the ksh `'c` char form).
+         25 => {
+-            let case = rng.gen_range(0..6);
++            let case = rng.random_range(0..6);
+             match case {
+                 0 => "printf '%o|%x|%X\\n' 8 255 255".to_string(),
+                 1 => "printf '%d\\n' \"'A\"".to_string(),
+@@ -11072,7 +11072,7 @@
+ /// mksh/pdksh legs: each construct below was checked to FAIL on mksh R59, so
+ /// including it there would fuzz the syntax gap, not the emulation.
+ fn ksh93_one(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..10) {
++    match rng.random_range(0..10) {
+         // `~(…)` pattern modifiers — ksh(1) "File Name Generation": ~(E) ERE,
+         // ~(i) case-insensitive, ~(N) treat as a plain string.
+         0 => {
+@@ -11091,8 +11091,8 @@
+         }
+         // Array slice `${a[@]:off:len}` (mksh has no array slice).
+         1 => {
+-            let off = rng.gen_range(0..3);
+-            let len = rng.gen_range(1..3);
++            let off = rng.random_range(0..3);
++            let len = rng.random_range(1..3);
+             let sub = *pick(rng, &["@", "*"]);
+             format!("a=(v w x y z); print -r -- \"${{a[{sub}]:{off}:{len}}}\"")
+         }
+@@ -11100,7 +11100,7 @@
+         2 => {
+             let a = *pick(rng, &["2", "3", "10"]);
+             let b = *pick(rng, &["0", "2", "3", "10"]);
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 format!("print -r -- \"$(( {a} ** {b} ))\"")
+             } else {
+                 format!("let 'x = {a} ** {b}'; print -r -- \"$x\"")
+@@ -11136,11 +11136,11 @@
+         }
+         // The `.sh.*` compound: `.sh.version`, `.sh.fun` inside a function,
+         // `.sh.match` after a `[[ … =~ … ]]`.
+-        6 => match rng.gen_range(0..3) {
++        6 => match rng.random_range(0..3) {
+             0 => "[[ -n ${.sh.version} ]]; print -r -- \"$?\"".to_string(),
+             1 => "f() { print -r -- \"${.sh.fun}\"; }; f".to_string(),
+             _ => {
+-                let i = rng.gen_range(0..2);
++                let i = rng.random_range(0..2);
+                 format!("[[ abc =~ a(b)c ]]; print -r -- \"${{.sh.match[{i}]}}\"")
+             }
+         },
+@@ -11157,7 +11157,7 @@
+         // `typeset -n` namerefs and associative arrays (sorted, so the
+         // iteration order can never be the thing that differs).
+         _ => {
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 let v = *pick(rng, &["hi", "1", "a b"]);
+                 format!("typeset -n nr=v; v='{v}'; print -r -- \"$nr\"")
+             } else {
+@@ -11174,7 +11174,7 @@
+ /// construct here was checked to be mksh(1) R59 syntax that ksh93 does NOT
+ /// accept (or does not define), so it never leaks into the ksh93 leg.
+ fn mksh_one(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..7) {
++    match rng.random_range(0..7) {
+         // `${|cmd;}` — mksh's valsub that returns `$REPLY`.
+         0 => {
+             let body = *pick(
+@@ -11247,8 +11247,8 @@
+ fn gen_ksh(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let ksh93 = shell_target() == ShellTarget::Ksh;
+-    (0..rng.gen_range(2..=5))
+-        .map(|_| match rng.gen_range(0..10) {
++    (0..rng.random_range(2..=5))
++        .map(|_| match rng.random_range(0..10) {
+             0..=3 => ksh_core_one(&mut rng),
+             4..=7 => ksh_wide_one(&mut rng),
+             _ if ksh93 => ksh93_one(&mut rng),
+@@ -11286,7 +11286,7 @@
+ /// never an unsupported-syntax artifact. Nothing bash-only appears here — this
+ /// grammar is shared by `--sh`, `--dash` and `--ash`.
+ fn posix_wide_one(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..24) {
++    match rng.random_range(0..24) {
+         // `set -o NAME` / `set +o NAME` acceptance, restored immediately so the
+         // option cannot truncate the rest of the case.
+         0 => {
+@@ -11377,7 +11377,7 @@
+         }
+         // Here-documents: expanded, quoted-delimiter (literal), and `<<-`
+         // (leading TABS stripped). The tabs below are real tabs.
+-        8 => match rng.gen_range(0..3) {
++        8 => match rng.random_range(0..3) {
+             0 => "v=1; cat <<EOF\n$v $((1+1))\nEOF".to_string(),
+             1 => "cat <<'EOF'\n$novar `nocmd` $((1+1))\nEOF".to_string(),
+             _ => "cat <<-EOF\n\tstripped\n\t\tkept-one\n\tEOF".to_string(),
+@@ -11398,14 +11398,14 @@
+         }
+         // A `while read` loop consuming a multi-line pipe.
+         10 => {
+-            let n = rng.gen_range(1..=3);
++            let n = rng.random_range(1..=3);
+             let lines: String = (1..=n).map(|i| format!("l{i}\\n")).collect();
+             format!("printf '{lines}' | while read l; do printf '<%s>' \"$l\"; done; printf '\\n'")
+         }
+         // `$*` joins on the first IFS byte; unquoted expansion splits on all.
+         11 => {
+             let ifs = *pick(rng, &[":", "-", ",", " ", ""]);
+-            match rng.gen_range(0..3) {
++            match rng.random_range(0..3) {
+                 0 => format!("set -- a b c; IFS='{ifs}'; printf '%s\\n' \"$*\""),
+                 1 => format!("IFS='{ifs}'; v='a{ifs}b{ifs}c'; set -- $v; printf '%d\\n' $#"),
+                 _ => format!("set -- a b c; IFS='{ifs}'; printf '%s\\n' \"$@\""),
+@@ -11433,7 +11433,7 @@
+         // The POSIX printf directive matrix (XCU printf), including the XSI
+         // `'c` character form, `%b`, field width from an argument, and format
+         // recycling when arguments remain.
+-        15 => match rng.gen_range(0..7) {
++        15 => match rng.random_range(0..7) {
+             0 => "printf '%o|%x|%X\\n' 8 255 255".to_string(),
+             1 => "printf '%d\\n' \"'A\"".to_string(),
+             2 => "printf '%c%c\\n' abc def".to_string(),
+@@ -11511,7 +11511,7 @@
+         // newline stripping.
+         21 => {
+             let body = *pick(rng, &["printf 'a\\n\\n'", "printf b", "printf 'c\\n'"]);
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 format!("v=$({body}); printf '[%s]\\n' \"$v\"")
+             } else {
+                 format!("v=`{body}`; printf '[%s]\\n' \"$v\"")
+@@ -11527,7 +11527,7 @@
+         }
+         // `shift` past the end, and `$#` / `$@` after it.
+         _ => {
+-            let n = rng.gen_range(0..4);
++            let n = rng.random_range(0..4);
+             format!("set -- a b c; shift {n} 2>/dev/null; printf '%d|%s|%d\\n' $# \"$*\" $?")
+         }
+     }
+@@ -11543,7 +11543,7 @@
+     let ints = ["0", "1", "2", "3", "5", "7", "10", "42", "-1", "-3"];
+     let strs = ["abc", "hello", "a.b.c", "xxyy", "", "foobar", "a1b2"];
+     let words = ["one", "two", "three", "four"];
+-    match rng.gen_range(0..15) {
++    match rng.random_range(0..15) {
+         0 => {
+             let a = *pick(rng, &ints);
+             let b = *pick(rng, &ints);
+@@ -11572,14 +11572,14 @@
+             format!("v={v}; printf '%d\\n' \"${{#v}}\"")
+         }
+         4 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(0..=4))
++            let ws: Vec<&str> = (0..rng.random_range(0..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+             let sel = *pick(rng, &["$#", "$1", "$2", "$*", "$@"]);
+             format!("set -- {}; printf '%s\\n' \"{sel}\"", ws.join(" "))
+         }
+         5 => {
+-            let nums: Vec<&str> = (0..rng.gen_range(1..=5))
++            let nums: Vec<&str> = (0..rng.random_range(1..=5))
+                 .map(|_| *pick(rng, &["1", "2", "3", "4"]))
+                 .collect();
+             format!(
+@@ -11639,7 +11639,7 @@
+ 
+ /// One strict-POSIX statement: 40% core grammar, 60% the wider surface.
+ fn posix_one(rng: &mut StdRng) -> String {
+-    if rng.gen_range(0..10) < 4 {
++    if rng.random_range(0..10) < 4 {
+         posix_core_one(rng)
+     } else {
+         posix_wide_one(rng)
+@@ -11649,7 +11649,7 @@
+ /// strict-POSIX program generator (sh / dash / ash).
+ fn gen_posix(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+-    (0..rng.gen_range(2..=5))
++    (0..rng.random_range(2..=5))
+         .map(|_| posix_one(&mut rng))
+         .collect()
+ }
+@@ -11732,7 +11732,7 @@
+ /// section is named in each arm's comment. Nothing here is emitted for the
+ /// dash/ash/sh legs — this function is only reachable from `gen_bash`.
+ fn bash_wide_one(rng: &mut StdRng) -> String {
+-    match rng.gen_range(0..34) {
++    match rng.random_range(0..34) {
+         // `set -o NAME` acceptance, restored immediately.
+         0 => {
+             let opt = *pick(rng, &BASH_SET_OPTS);
+@@ -11782,7 +11782,7 @@
+         // nocasematch changes `[[ … == … ]]` and `case` alike (bash(1) shopt).
+         6 => {
+             let set = *pick(rng, &["shopt -s nocasematch", "shopt -u nocasematch"]);
+-            if rng.gen_bool(0.5) {
++            if rng.random_bool(0.5) {
+                 format!("{set}; [[ ABC == abc ]]; printf '%d\\n' $?")
+             } else {
+                 format!("{set}; case ABC in abc) printf 'y\\n';; *) printf 'n\\n';; esac")
+@@ -11869,7 +11869,7 @@
+         // FUNCNEST — bash(1): "if set to a numeric value greater than 0,
+         // defines a maximum function nesting level".
+         13 => {
+-            let n = rng.gen_range(2..=4);
++            let n = rng.random_range(2..=4);
+             format!(
+                 "FUNCNEST={n}; d=0; f() {{ d=$((d+1)); f; }}; f 2>/dev/null; \
+                  printf '%d\\n' $?"
+@@ -12148,7 +12148,7 @@
+         }
+         // `printf` extensions over POSIX — bash(1) printf: %q shell-quoted,
+         // %b escapes, -v assigns instead of printing.
+-        _ => match rng.gen_range(0..6) {
++        _ => match rng.random_range(0..6) {
+             0 => {
+                 // Double-quoted: one value is an apostrophe test.
+                 let v = *pick(rng, &["a b", "it's", "a*b", "x", ""]);
+@@ -12176,30 +12176,30 @@
+ fn bash_core_one(rng: &mut StdRng) -> String {
+     let words = ["one", "two", "three", "four"];
+     let strs = ["abcdef", "hello", "0123456", "a.b.c", "foobar"];
+-    match rng.gen_range(0..8) {
++    match rng.random_range(0..8) {
+         0 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(1..=4))
++            let ws: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+-            let idx = rng.gen_range(0..ws.len());
++            let idx = rng.random_range(0..ws.len());
+             format!("a=({}); printf '%s\\n' \"${{a[{idx}]}}\"", ws.join(" "))
+         }
+         1 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(1..=4))
++            let ws: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+             format!("a=({}); printf '%d\\n' \"${{#a[@]}}\"", ws.join(" "))
+         }
+         2 => {
+-            let ws: Vec<&str> = (0..rng.gen_range(1..=4))
++            let ws: Vec<&str> = (0..rng.random_range(1..=4))
+                 .map(|_| *pick(rng, &words))
+                 .collect();
+             format!("a=({}); printf '%s\\n' \"${{!a[@]}}\"", ws.join(" "))
+         }
+         3 => {
+             let v = *pick(rng, &strs);
+-            let off = rng.gen_range(0..4);
+-            let len = rng.gen_range(1..4);
++            let off = rng.random_range(0..4);
++            let len = rng.random_range(1..4);
+             format!("v={v}; printf '%s\\n' \"${{v:{off}:{len}}}\"")
+         }
+         4 => {
+@@ -12235,8 +12235,8 @@
+ /// core never reached.
+ fn gen_bash(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+-    (0..rng.gen_range(2..=5))
+-        .map(|_| match rng.gen_range(0..10) {
++    (0..rng.random_range(2..=5))
++        .map(|_| match rng.random_range(0..10) {
+             0..=2 => posix_one(&mut rng),
+             3..=4 => bash_core_one(&mut rng),
+             _ => bash_wide_one(&mut rng),
+@@ -12263,13 +12263,13 @@
+     let scalar = *pick(rng, &["s", "n", "p", "E"]);
+     let arr = *pick(rng, &["t", "e"]);
+     let idx = *pick(rng, &["1", "2", "4", "$#t", "1-2", "2-", "*"]);
+-    let num = rng.gen_range(0..20);
+-    let num2 = rng.gen_range(1..9);
++    let num = rng.random_range(0..20);
++    let num2 = rng.random_range(1..9);
+     let cmp = *pick(rng, &["==", "!=", "<", ">", "<=", ">="]);
+     let arith = *pick(rng, &["+", "-", "*", "/", "%"]);
+     let word = *pick(rng, &["a", "b", "Hello_World", "42", "x y", ""]);
+     let modi = *pick(rng, &["h", "t", "r", "e", "u", "l", "q", "gh", "gt"]);
+-    match rng.gen_range(0..28) {
++    match rng.random_range(0..28) {
+         0 => format!("echo ${scalar} $#{arr} ${arr}"),
+         1 => format!("echo ${arr}[{idx}]"),
+         2 => format!("echo ${{?{}}} ${{?nope}}", scalar),
+@@ -12281,8 +12281,8 @@
+         8 => format!("if (\"${scalar}\" {} \"{word}\") then\n  echo eq\nelse\n  echo ne\nendif", *pick(rng, &["==", "!=", "=~", "!~"])),
+         9 => format!("if ({num} > {num2}) then\n  echo big\nelse if ({num} == {num2}) then\n  echo same\nelse\n  echo small\nendif"),
+         10 => "foreach i ($t)\n  echo item $i\nend".to_string(),
+-        11 => format!("foreach i (1 2 3)\n  if ($i == {}) continue\n  echo $i\nend", rng.gen_range(1..4)),
+-        12 => format!("set i = 0\nwhile ($i < {})\n  @ i++\n  echo $i\nend", rng.gen_range(1..5)),
++        11 => format!("foreach i (1 2 3)\n  if ($i == {}) continue\n  echo $i\nend", rng.random_range(1..4)),
++        12 => format!("set i = 0\nwhile ($i < {})\n  @ i++\n  echo $i\nend", rng.random_range(1..5)),
+         13 => format!("switch (${scalar})\ncase Hello*:\n  echo hello\n  breaksw\ncase 4?:\n  echo fortyish\n  breaksw\ndefault:\n  echo other\nendsw"),
+         14 => format!("set x = ({word} b c)\necho $#x $x"),
+         15 => "set x = (a b c d)\nshift x\necho $#x $x".to_string(),
+@@ -12305,7 +12305,7 @@
+ fn gen_csh(seed: u64) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec![CSH_PREAMBLE.to_string()];
+-    stmts.extend((0..rng.gen_range(2..=5)).map(|_| csh_one(&mut rng)));
++    stmts.extend((0..rng.random_range(2..=5)).map(|_| csh_one(&mut rng)));
+     stmts
+ }
+ 
+@@ -12380,7 +12380,7 @@
+     let pat = *pick(rng, &EXPAND_PATTERNS);
+     let word = *pick(rng, &EXPAND_WORDS);
+     let ifs = sq_value(pick(rng, &EXPAND_IFS));
+-    let args = (0..rng.gen_range(0..=4))
++    let args = (0..rng.random_range(0..=4))
+         .map(|_| sq_value(pick(rng, &EXPAND_VALUES)))
+         .collect::<Vec<_>>()
+         .join(" ");
+@@ -12390,7 +12390,7 @@
+         ExpandDialect::Bash => 27,
+     };
+     // `set -A` is ksh/zsh syntax; bash spells the same probe `a=(…)` (arm 21).
+-    let arm = match rng.gen_range(0..top) {
++    let arm = match rng.random_range(0..top) {
+         19 if d == ExpandDialect::Bash => 21,
+         n => n,
+     };
+@@ -12423,8 +12423,8 @@
+         8 => format!("v={v}; p={}; s \"${{v#$p}}\" \"${{v#\"$p\"}}\" \"${{v%%$p}}\" \"${{v%%\"$p\"}}\"", sq_value(pat)),
+         // Arithmetic expansion: operators, base prefixes, nesting, unset operands.
+         9 => {
+-            let a = rng.gen_range(0..40);
+-            let b = rng.gen_range(1..9);
++            let a = rng.random_range(0..40);
++            let b = rng.random_range(1..9);
+             let op = *pick(rng, &["+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^", "<", ">", "==", "!=", "&&", "||"]);
+             format!("n={a}; m={b}; s $((n {op} m)) $((n{op}m)) \"$((m {op} n))\" $((-n)) $((~m)) $((n>m?n:m)) $((n+${{u:-1}}))")
+         }
+@@ -12471,7 +12471,7 @@
+ fn gen_expand(seed: u64, d: ExpandDialect) -> Vec<String> {
+     let mut rng = StdRng::seed_from_u64(seed);
+     let mut stmts = vec![EXPAND_PRELUDE.to_string()];
+-    stmts.extend((0..rng.gen_range(2..=5)).map(|_| expand_one(&mut rng, d)));
++    stmts.extend((0..rng.random_range(2..=5)).map(|_| expand_one(&mut rng, d)));
+     stmts
+ }
+ 
+@@ -12512,7 +12512,7 @@
+     Some(match mode {
+         Mode::Glob => {
+             let g = *pick(rng, DIALECT_GLOBS);
+-            match rng.gen_range(0..4) {
++            match rng.random_range(0..4) {
+                 0 => format!("for f in {g}; do printf '<%s>' \"$f\"; done; printf '\\n'"),
+                 1 => format!("set -- {g}; printf '%s\\n' \"$#\""),
+                 2 => format!("set -f; set -- {g}; printf '%s\\n' \"$#\" \"$1\"; set +f"),
+@@ -12522,7 +12522,7 @@
+         Mode::Arith => {
+             let op = *pick(rng, &["+", "-", "*", "&", "|", "^", "<<", ">>", "<", ">", "<=", ">=", "==", "!=", "&&", "||"]);
+             let (a, b) = if matches!(op, "<<" | ">>") { (n.trim_start_matches('-'), "2") } else { (n, m) };
+-            match rng.gen_range(0..6) {
++            match rng.random_range(0..6) {
+                 0 => format!("printf '%s\\n' \"$(( {a} {op} {b} ))\""),
+                 1 => format!("x={a}; printf '%s\\n' \"$(( x {op} {b} ))\""),
+                 2 if b != "0" => format!("printf '%s %s\\n' \"$(( {a} / {b} ))\" \"$(( {a} % {b} ))\""),
+@@ -12533,16 +12533,16 @@
+             }
+         }
+         Mode::Heredoc => {
+-            let q = if rng.gen_bool(0.5) { "EOT" } else { "'EOT'" };
++            let q = if rng.random_bool(0.5) { "EOT" } else { "'EOT'" };
+             let body = ["plain text", "v=$v and $((1+2))", "tab\there", "back\\\\slash \\$esc", "`printf sub`"];
+             let line = *pick(rng, &body);
+-            if rng.gen_bool(0.3) {
++            if rng.random_bool(0.3) {
+                 format!("v=val; cat <<-{q}\n\t{line}\n\tEOT")
+             } else {
+                 format!("v=val; cat <<{q}\n{line}\nEOT")
+             }
+         }
+-        Mode::Loop => match rng.gen_range(0..6) {
++        Mode::Loop => match rng.random_range(0..6) {
+             0 => format!("for i in 1 2 3 4; do [ $i = {} ] && continue; printf '%s' $i; done; printf '\\n'", 1 + (n.len() % 3)),
+             1 => "i=0; while [ $i -lt 4 ]; do i=$((i+1)); [ $i = 3 ] && break; printf '%s' $i; done; printf ' %s\\n' $i".to_string(),
+             2 => "i=5; until [ $i -le 2 ]; do printf '%s' $i; i=$((i-1)); done; printf '\\n'".to_string(),
+@@ -12550,7 +12550,7 @@
+             4 => "for i in a b c; do for j in 1 2; do [ $i = b ] && break 2; printf '%s%s ' $i $j; done; done; printf '\\n'".to_string(),
+             _ => "set -- p q r; for i; do printf '[%s]' \"$i\"; done; printf '\\n'; for i in; do printf never; done; printf 'ok\\n'".to_string(),
+         },
+-        Mode::Func => match rng.gen_range(0..6) {
++        Mode::Func => match rng.random_range(0..6) {
+             0 => "f() { printf '%s:%s\\n' \"$#\" \"$1\"; shift; printf '%s\\n' \"$#\"; }; f a b c".to_string(),
+             1 => format!("f() {{ return {}; }}; f; printf '%s\\n' $?", n.trim_start_matches('-')),
+             2 => "x=out; f() { x=in; }; f; printf '%s\\n' $x".to_string(),
+@@ -12558,14 +12558,14 @@
+             4 => "f() { g() { printf inner; }; g; printf '\\n'; }; f; g".to_string(),
+             _ => "f() { printf '<%s>' \"$@\"; printf '\\n'; }; f 'a b' '' c; f".to_string(),
+         },
+-        Mode::Trap => match rng.gen_range(0..5) {
++        Mode::Trap => match rng.random_range(0..5) {
+             0 => "trap 'printf bye\\n' EXIT; printf main\\n".to_string(),
+             1 => "(trap 'printf sub\\n' EXIT; printf in\\n); printf out\\n".to_string(),
+             2 => "trap 'printf usr1\\n' USR1; kill -USR1 $$; printf after\\n".to_string(),
+             3 => "trap '' USR1; kill -USR1 $$; printf ignored\\n".to_string(),
+             _ => "trap 'printf a\\n' EXIT; trap - EXIT; printf none\\n".to_string(),
+         },
+-        Mode::Redir => match rng.gen_range(0..6) {
++        Mode::Redir => match rng.random_range(0..6) {
+             0 => "{ printf out; printf err >&2; } 2>&1 | cat; printf '\\n'".to_string(),
+             1 => "printf one > /dev/null; printf '%s\\n' $?".to_string(),
+             2 => "exec 3>&1; printf fd3 >&3; exec 3>&-; printf '\\n'".to_string(),
+@@ -12573,7 +12573,7 @@
+             4 => "cat /nonexistent_zz 2>/dev/null; printf '%s\\n' $?".to_string(),
+             _ => "{ printf a; printf b; } > /dev/null 2>&1; printf '%s\\n' $?".to_string(),
+         },
+-        Mode::Cmdsub => match rng.gen_range(0..6) {
++        Mode::Cmdsub => match rng.random_range(0..6) {
+             0 => format!("x=$(printf '%s\\n\\n' '{w}'); printf '[%s]\\n' \"$x\""),
+             1 => "printf '%s\\n' \"$(printf a; printf b)\" `printf bq`".to_string(),
+             2 => "x=$(exit 4); printf '%s\\n' $?".to_string(),
+@@ -12586,7 +12586,7 @@
+             let text = *pick(rng, &["a:b::c", "  a  b  ", "a:,b", "banana", "x"]);
+             format!("IFS='{ifs}'; v='{text}'; set -- $v; printf '%s' $#; for i in \"$@\"; do printf '<%s>' \"$i\"; done; printf '\\n'; unset IFS")
+         }
+-        Mode::Cond => match rng.gen_range(0..6) {
++        Mode::Cond => match rng.random_range(0..6) {
+             0 => format!("[ '{w}' = '{w}' ] && printf eq || printf ne; printf '\\n'"),
+             1 => format!("[ {n} -lt {m} ] && printf lt; [ {n} -ge {m} ] && printf ge; printf '\\n'"),
+             2 => format!("[ -n '{w}' ] && printf n; [ -z '{w}' ] && printf z; printf '\\n'"),
+@@ -12605,7 +12605,7 @@
+             let subj = *pick(rng, &["abc", "xyz", "a", "", "bcd", "A1b2"]);
+             format!("case '{subj}' in {pat}) printf 'M '; ;; *) printf 'N '; ;; esac; v='{subj}'; printf '%s %s\\n' \"${{v#{pat}}}\" \"${{v%%{pat}}}\"")
+         }
+-        Mode::Quote => match rng.gen_range(0..5) {
++        Mode::Quote => match rng.random_range(0..5) {
+             0 => "printf '%s\\n' 'single $x \"q\"' \"double \\$x \\\" \\\\ \\`\"".to_string(),
+             1 => "x='a  b'; printf '<%s>' $x \"$x\" '$x'; printf '\\n'".to_string(),
+             2 => "printf '%s\\n' a\\ b 'a''b' \"a\"\"b\" a\"b\"'c'".to_string(),
+@@ -12620,7 +12620,7 @@
+ /// dialect form.
+ fn gen_dialect(seed: u64, mode: Mode, d: ExpandDialect) -> Option<Vec<String>> {
+     let mut rng = StdRng::seed_from_u64(seed);
+-    let count = rng.gen_range(1..=3);
++    let count = rng.random_range(1..=3);
+     let mut out = Vec::with_capacity(count);
+     for _ in 0..count {
+         out.push(dialect_one(&mut rng, mode, d)?);
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -285,6 +285,8 @@
+ prometheus = ["metrics", "metrics-exporter-prometheus"]
+ 
+ [dev-dependencies]
++# Preserve the startup parity corpus across production RNG upgrades.
++rand08 = { package = "rand", version = "0.8" }
+ tempfile = "3"
+ # `ureq` is a plain (non-optional) dep above now that the `ai` builtin
+ # needs it, so it is NOT re-listed here. `base64` is still gated by the
+--- a/tests/startup_file_parity.rs
++++ b/tests/startup_file_parity.rs
+@@ -37,8 +37,8 @@
+ //! Its corpus is restricted to bare `echo WORD`, which csh and zsh agree
+ //! on, and that is enough to assert file selection and ordering.
+ 
+-use rand::rngs::StdRng;
+-use rand::{Rng, SeedableRng};
++use rand08::rngs::StdRng;
++use rand08::{Rng, SeedableRng};
+ use std::path::Path;
+ use std::process::{Command, Stdio};
+ 

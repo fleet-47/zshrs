@@ -1,0 +1,181 @@
+# Dependency upgrades retire independently after main supplies the target dependency versions.
+# Android compatibility remains separate and is never retired by dependency versions.
+
+[[patch]]
+id = "libloading"
+group = "upgrades"
+file = "upgrades/libloading.patch"
+dependency = "libloading"
+version = "0.9.0"
+manifests = ["Cargo.toml"]
+
+[[patch]]
+id = "fancy-regex"
+hold = "Keep upstream fancy-regex 0.18 until shell matching parity is demonstrated."
+group = "upgrades"
+file = "upgrades/fancy-regex.patch"
+dependency = "fancy-regex"
+version = "0.19.2"
+manifests = ["Cargo.toml"]
+
+[[patch]]
+id = "nix"
+group = "upgrades"
+file = "upgrades/nix.patch"
+dependency = "nix"
+version = "0.31.3"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "rusqlite"
+hold = "Keep upstream rusqlite 0.32/SQLite: stored-text conversion errors change in dependent daemon and cache functions."
+group = "upgrades"
+file = "upgrades/rusqlite.patch"
+dependency = "rusqlite"
+version = "0.40.2"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "dirs"
+group = "upgrades"
+file = "upgrades/dirs.patch"
+dependency = "dirs"
+version = "7.0.0"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "rand"
+hold = "Keep upstream rand 0.8: preserve fork recovery and seeded fuzzer replay."
+group = "upgrades"
+file = "upgrades/rand.patch"
+dependency = "rand"
+version = "0.10.3"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "metrics-exporter-prometheus"
+group = "upgrades"
+file = "upgrades/metrics-exporter-prometheus.patch"
+dependency = "metrics-exporter-prometheus"
+version = "0.18.3"
+manifests = ["Cargo.toml"]
+
+[[patch]]
+id = "sha2"
+group = "upgrades"
+file = "upgrades/sha2.patch"
+dependency = "sha2"
+version = "0.11.1"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "notify"
+hold = "Keep upstream notify 6 with its debouncer: reads must not create change events or extra wakeups."
+group = "upgrades"
+file = "upgrades/notify.patch"
+dependency = "notify"
+version = "8.2.0"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "notify-debouncer-mini"
+hold = "Keep upstream debouncer 0.4 paired with notify 6."
+group = "upgrades"
+file = "upgrades/notify-debouncer-mini.patch"
+dependency = "notify-debouncer-mini"
+version = "0.7.0"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "crossterm"
+group = "upgrades"
+file = "upgrades/crossterm.patch"
+dependency = "crossterm"
+version = "0.29.0"
+manifests = ["Cargo.toml"]
+
+[[patch]]
+id = "zstd"
+group = "upgrades"
+file = "upgrades/zstd.patch"
+dependency = "zstd"
+version = "0.14.3"
+manifests = ["Cargo.toml"]
+
+[[patch]]
+id = "ureq"
+group = "upgrades"
+file = "upgrades/ureq.patch"
+dependency = "ureq"
+version = "3.4.2"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "base64"
+group = "upgrades"
+file = "upgrades/base64.patch"
+dependency = "base64"
+version = "0.23.1"
+manifests = ["Cargo.toml", "daemon/Cargo.toml"]
+
+[[patch]]
+id = "ed25519-dalek"
+group = "upgrades"
+file = "upgrades/ed25519-dalek.patch"
+dependency = "ed25519-dalek"
+version = "3.0.0"
+manifests = ["daemon/Cargo.toml"]
+
+[[patch]]
+id = "printpdf"
+hold = "Keep upstream printpdf 0.7: preserve text rendering and document structure."
+group = "upgrades"
+file = "upgrades/printpdf.patch"
+dependency = "printpdf"
+version = "0.12.8"
+manifests = ["daemon/Cargo.toml"]
+
+[[patch]]
+id = "cron"
+group = "upgrades"
+file = "upgrades/cron.patch"
+dependency = "cron"
+version = "0.17.0"
+manifests = ["daemon/Cargo.toml"]
+
+[[patch]]
+id = "axum"
+group = "upgrades"
+file = "upgrades/axum.patch"
+dependency = "axum"
+version = "0.8.9"
+manifests = ["daemon/Cargo.toml"]
+
+[[patch]]
+id = "tower"
+group = "upgrades"
+file = "upgrades/tower.patch"
+dependency = "tower"
+version = "0.5.3"
+manifests = ["daemon/Cargo.toml"]
+
+[[patch]]
+id = "native-tool-path"
+group = "android"
+file = "android/native-tool-path.patch"
+
+[[patch]]
+id = "libc-bindings"
+group = "android"
+file = "android/libc-bindings.patch"
+
+[[patch]]
+id = "interface-counters"
+group = "android"
+file = "android/interface-counters.patch"
+
+[[patch]]
+id = "random-source"
+group = "android"
+file = "android/random-source.patch"
+

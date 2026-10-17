@@ -1,0 +1,10 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -223 +223 @@
+-notify-debouncer-mini = "0.4"
++notify-debouncer-mini = "0.7"
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -32 +32 @@
+-notify-debouncer-mini = "0.4"
++notify-debouncer-mini = "0.7"

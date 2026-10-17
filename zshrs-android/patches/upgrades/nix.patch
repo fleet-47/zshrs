@@ -1,0 +1,21 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -188 +188 @@
+-nix = { version = "0.29", features = ["signal", "process", "term", "fs"] }
++nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -30 +30 @@
+-nix = { version = "0.29", features = ["signal", "process", "term", "fs", "user"] }
++nix = { version = "0.31", features = ["signal", "process", "term", "fs", "user"] }
+--- a/src/extensions/fds.rs
++++ b/src/extensions/fds.rs
+@@ -65,7 +65,7 @@
+     }
+ 
+     // Dup to high range with CLOEXEC
+-    let new_fd = nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(FIRST_HIGH_FD))
++    let new_fd = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(FIRST_HIGH_FD))
+         .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+ 
+     Ok(unsafe { OwnedFd::from_raw_fd(new_fd) })

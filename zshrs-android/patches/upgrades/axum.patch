@@ -1,0 +1,41 @@
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -67,7 +67,7 @@
+ # axum is the tokio team's framework on top of hyper + tower; all three
+ # crates live in the foundational layer of the Rust async stack and meet
+ # the "still builds in 2035" durability bar in CLAUDE.md.
++axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
+ tower = { version = "0.4", default-features = false }
+ tracing = "0.1"
+ tracing-appender = "0.2"
+--- a/daemon/http.rs
++++ b/daemon/http.rs
+@@ -112,7 +112,7 @@
+         .route("/openapi", get(handler_openapi))
+         .route("/openapi.json", get(handler_openapi))
+         .route("/metrics", get(handler_metrics))
++        .route("/op/{name}", post(handler_op))
+-        .route("/op/:name", post(handler_op))
+         // Server-Sent Events streams for push-style ops. Each connection
+         // registers a synthetic session on the daemon's broadcast bus,
+         // filters frames by `event` kind, and forwards them as
+@@ -672,7 +672,7 @@
+     State(s): State<AppState>,
+     Path(name): Path<String>,
+     headers: HeaderMap,
++    body: std::result::Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+-    body: Option<Json<Value>>,
+ ) -> impl IntoResponse {
+     let token = match authorize(&headers, &s.tokens) {
+         Ok(t) => t,
+@@ -707,7 +707,8 @@
+             );
+         }
+     }
++    // axum 0.7 treated every optional JSON extraction failure as absent.
++    let args = body.ok().map(|Json(v)| v).unwrap_or_else(|| json!({}));
+-    let args = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+ 
+     // Register a short-lived session for this request so session-aware
+     // ops (publish/send/tag/notify/...) can find an `origin_scope` to

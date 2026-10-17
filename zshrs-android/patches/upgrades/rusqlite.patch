@@ -1,0 +1,25 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -189 +189 @@
+-rusqlite = { version = "0.32", features = ["bundled"] }
++rusqlite = { version = "0.40", features = ["bundled"] }
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -37 +37 @@
+-rusqlite = "0.32"
++rusqlite = "0.40"
+--- a/src/extensions/completion.rs
++++ b/src/extensions/completion.rs
+@@ -273,8 +273,10 @@
+     }
+     /// `count` — see implementation.
+     pub fn count(&self) -> rusqlite::Result<usize> {
+-        self.conn
+-            .query_row("SELECT COUNT(*) FROM completions", [], |row| row.get(0))
++        self.conn.query_row("SELECT COUNT(*) FROM completions", [], |row| {
++            let count: i64 = row.get(0)?;
++            usize::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
++        })
+     }
+     /// `index_system_commands` — see implementation.
+     pub fn index_system_commands(&self) -> rusqlite::Result<usize> {

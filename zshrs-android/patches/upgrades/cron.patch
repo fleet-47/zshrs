@@ -1,0 +1,5 @@
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -65 +65 @@
+-cron = "0.12"
++cron = "0.17"

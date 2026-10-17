@@ -1,0 +1,10 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -222 +222 @@
+-notify = "6"
++notify = "8"
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -31 +31 @@
+-notify = "6"
++notify = "8"

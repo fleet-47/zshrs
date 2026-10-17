@@ -1,0 +1,1121 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -228 +228 @@
+-# `tls` feature has to be on unconditionally. `tls` resolves to
++# `rustls` feature has to be on unconditionally. It resolves to
+@@ -235 +235 @@
+-ureq = { version = "2", default-features = false, features = ["json", "tls"] }
++ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+--- a/bins/zd.rs
++++ b/bins/zd.rs
+@@ -43,44 +43,73 @@
+     }
+ }
+ 
++fn http_agent() -> ureq::Agent {
++    ureq::Agent::config_builder()
++        // Preserve upstream's default wire header; the transport is ureq 3.
++        .user_agent("ureq/2.12.1")
++        .proxy(None)
++        .timeout_connect(Some(std::time::Duration::from_secs(30)))
++        // ureq 2's five-attempt policy follows at most four redirects.
++        .max_redirects(4)
++        .build()
++        .into()
++}
++
++// Preserve ureq 2's byte cap and MIME-independent lossy UTF-8 decoding.
++fn response_text(body: &mut ureq::Body) -> std::io::Result<String> {
++    use std::io::Read;
++
++    const LIMIT: u64 = 10 * 1024 * 1024;
++    let mut bytes = Vec::new();
++    body.as_reader().take(LIMIT + 1).read_to_end(&mut bytes)?;
++    if bytes.len() as u64 > LIMIT {
++        return Err(std::io::Error::other("response too big for into_string"));
++    }
++    Ok(String::from_utf8_lossy(&bytes).into_owned())
++}
++
+ impl Transport for HttpTransport {
+     fn post(&mut self, op: &str, body: Value) -> Result<String, String> {
+         let url = format!("{}/op/{}", self.url, op);
++        let req = http_agent().post(&url)
++            .config()
++            .http_status_as_error(false)
++            .build()
++            .header("Content-Type", "application/json");
+-        let req = ureq::post(&url).set("Content-Type", "application/json");
+         let req = if self.token.is_empty() {
+             req
+         } else {
++            req.header("Authorization", &format!("Bearer {}", self.token))
+-            req.set("Authorization", &format!("Bearer {}", self.token))
+         };
++        match req.send(&body.to_string()) {
++            Ok(mut resp) if resp.status().is_client_error() || resp.status().is_server_error() => {
++                let code = resp.status().as_u16();
++                let body = response_text(resp.body_mut()).unwrap_or_default();
+-        match req.send_string(&body.to_string()) {
+-            Ok(resp) => resp
+-                .into_string()
+-                .map_err(|e| format!("read response body: {e}")),
+-            Err(ureq::Error::Status(code, resp)) => {
+-                let body = resp.into_string().unwrap_or_default();
+                 Err(format!("HTTP {code}: {body}"))
+             }
++            Ok(mut resp) => response_text(resp.body_mut())
++                .map_err(|e| format!("read response body: {e}")),
++            Err(t) => Err(format!("transport: {t}")),
+-            Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+         }
+     }
+ 
+     fn get(&mut self, path: &str) -> Result<String, String> {
+         let url = format!("{}{}", self.url, path);
++        let req = http_agent().get(&url).config().http_status_as_error(false).build();
+-        let req = ureq::get(&url);
+         let req = if self.token.is_empty() {
+             req
+         } else {
++            req.header("Authorization", &format!("Bearer {}", self.token))
+-            req.set("Authorization", &format!("Bearer {}", self.token))
+         };
+         match req.call() {
++            Ok(mut resp) if resp.status().is_client_error() || resp.status().is_server_error() => {
++                let code = resp.status().as_u16();
++                let body = response_text(resp.body_mut()).unwrap_or_default();
+-            Ok(resp) => resp
+-                .into_string()
+-                .map_err(|e| format!("read response body: {e}")),
+-            Err(ureq::Error::Status(code, resp)) => {
+-                let body = resp.into_string().unwrap_or_default();
+                 Err(format!("HTTP {code}: {body}"))
+             }
++            Ok(mut resp) => response_text(resp.body_mut())
++                .map_err(|e| format!("read response body: {e}")),
++            Err(t) => Err(format!("transport: {t}")),
+-            Err(ureq::Error::Transport(t)) => Err(format!("transport: {t}")),
+         }
+     }
+ 
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -42,7 +42,7 @@
+ # verify_strict). Seeds come from rand::rngs::OsRng, so no rand_core feature.
+ ed25519-dalek = "=2.2.0"
+ # Snapshot registry PUT/GET over http(s); same dep + features as the root crate.
++ureq = { version = "3", default-features = false, features = ["rustls"] }
+-ureq = { version = "2", default-features = false, features = ["tls"] }
+ thiserror = "2"
+ tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "signal", "time", "sync", "macros", "process"] }
+ # tokio-stream wraps tokio channels as `futures::Stream` impls. Used by
+--- a/daemon/snapshot.rs
++++ b/daemon/snapshot.rs
+@@ -673,17 +673,24 @@
+ }
+ 
+ fn http_agent() -> ureq::Agent {
++    ureq::Agent::config_builder()
++        // Preserve upstream's default wire header; the transport is ureq 3.
++        .user_agent("ureq/2.12.1")
++        .proxy(None)
++        .timeout_connect(Some(std::time::Duration::from_secs(30)))
++        // ureq 2's five-attempt policy follows at most four redirects.
++        .max_redirects(4)
++        .timeout_global(Some(std::time::Duration::from_secs(60)))
+-    ureq::AgentBuilder::new()
+-        .timeout(std::time::Duration::from_secs(60))
+         .build()
++        .into()
+ }
+ 
+ fn http_put(url: &str, token: Option<&str>, body: &[u8], ctype: &str) -> Result<(), String> {
++    let mut req = http_agent().put(url).header("Content-Type", ctype);
+-    let mut req = http_agent().put(url).set("Content-Type", ctype);
+     if let Some(t) = token {
++        req = req.header("Authorization", &format!("Bearer {t}"));
+-        req = req.set("Authorization", &format!("Bearer {t}"));
+     }
++    req.send(body)
+-    req.send_bytes(body)
+         .map(|_| ())
+         .map_err(|e| format!("PUT {url}: {e}"))
+ }
+@@ -691,11 +698,12 @@
+ fn http_get(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
+     let mut req = http_agent().get(url);
+     if let Some(t) = token {
++        req = req.header("Authorization", &format!("Bearer {t}"));
+-        req = req.set("Authorization", &format!("Bearer {t}"));
+     }
++    let mut resp = req.call().map_err(|e| format!("GET {url}: {e}"))?;
+-    let resp = req.call().map_err(|e| format!("GET {url}: {e}"))?;
+     let mut buf = Vec::new();
++    resp.body_mut()
++        .as_reader()
+-    resp.into_reader()
+         .take(MAX_REMOTE_BYTES)
+         .read_to_end(&mut buf)
+         .map_err(|e| format!("GET {url}: {e}"))?;
+--- a/src/extensions/ai.rs
++++ b/src/extensions/ai.rs
+@@ -745,11 +745,31 @@
+ }
+ 
+ fn agent(timeout: i64) -> ureq::Agent {
++    ureq::Agent::config_builder()
++        // Preserve upstream's default wire header; the transport is ureq 3.
++        .user_agent("ureq/2.12.1")
++        .proxy(None)
++        .timeout_connect(Some(std::time::Duration::from_secs(30)))
++        // ureq 2's five-attempt policy follows at most four redirects.
++        .max_redirects(4)
++        .timeout_global(Some(Duration::from_secs(timeout.max(1) as u64)))
+-    ureq::AgentBuilder::new()
+-        .timeout(Duration::from_secs(timeout.max(1) as u64))
+         .build()
++        .into()
+ }
+ 
++// Preserve ureq 2's byte cap and MIME-independent lossy UTF-8 decoding.
++fn response_text(body: &mut ureq::Body) -> std::io::Result<String> {
++    use std::io::Read;
++
++    const LIMIT: u64 = 10 * 1024 * 1024;
++    let mut bytes = Vec::new();
++    body.as_reader().take(LIMIT + 1).read_to_end(&mut bytes)?;
++    if bytes.len() as u64 > LIMIT {
++        return Err(std::io::Error::other("response too big for into_string"));
++    }
++    Ok(String::from_utf8_lossy(&bytes).into_owned())
++}
++
+ // ── Provider: Anthropic (stryke ai.rs:994-1106) ────────────────────────
+ 
+ const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1/messages";
+@@ -812,24 +832,22 @@
+     for attempt in 0..MAX_ATTEMPTS {
+         match agent
+             .post(ANTHROPIC_URL)
++            // Preserve provider error bodies for diagnostics and retry decisions.
++            .config()
++            .http_status_as_error(false)
++            .build()
++            .header("x-api-key", &key)
++            .header("anthropic-version", ANTHROPIC_VERSION)
++            .header("content-type", "application/json")
+-            .set("x-api-key", &key)
+-            .set("anthropic-version", ANTHROPIC_VERSION)
+-            .set("content-type", "application/json")
+             .send_json(body.clone())
+         {
++            Ok(mut resp) if resp.status().is_client_error() || resp.status().is_server_error() => {
++                let code = resp.status().as_u16();
+-            Ok(resp) => match resp.into_json::<serde_json::Value>() {
+-                Ok(v) => {
+-                    json = Some(v);
+-                    break;
+-                }
+-                Err(e) => return failed(format!("anthropic decode: {}", e)),
+-            },
+-            Err(ureq::Error::Status(code, resp)) => {
+                 if attempt + 1 < MAX_ATTEMPTS && should_retry(code) {
+                     std::thread::sleep(retry_delay(attempt));
+                     continue;
+                 }
++                let text = response_text(resp.body_mut()).unwrap_or_default();
+-                let text = resp.into_string().unwrap_or_default();
+                 last = Some(AiError::Failed(format!(
+                     "anthropic {}: {}",
+                     code,
+@@ -837,7 +855,16 @@
+                 )));
+                 break;
+             }
++            Ok(mut resp) => {
++                match serde_json::from_reader::<_, serde_json::Value>(resp.body_mut().as_reader()) {
++                    Ok(v) => {
++                        json = Some(v);
++                        break;
++                    }
++                    Err(e) => return failed(format!("anthropic decode: {}", e)),
++                }
++            }
++            Err(t) => {
+-            Err(ureq::Error::Transport(t)) => {
+                 if attempt + 1 < MAX_ATTEMPTS {
+                     std::thread::sleep(retry_delay(attempt));
+                     continue;
+@@ -894,22 +921,22 @@
+     let key = anthropic_key(call)?;
+     let resp = agent(call.timeout)
+         .post(ANTHROPIC_URL)
++        // Preserve provider error bodies for diagnostics and retry decisions.
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("x-api-key", &key)
++        .header("anthropic-version", ANTHROPIC_VERSION)
++        .header("content-type", "application/json")
++        .header("accept", "text/event-stream")
+-        .set("x-api-key", &key)
+-        .set("anthropic-version", ANTHROPIC_VERSION)
+-        .set("content-type", "application/json")
+-        .set("accept", "text/event-stream")
+         .send_json(anthropic_body(call, true));
++    let mut resp = resp.map_err(|t| AiError::Failed(format!("anthropic transport: {}", t)))?;
++    if resp.status().is_client_error() || resp.status().is_server_error() {
++        let code = resp.status().as_u16();
++        let text = response_text(resp.body_mut()).unwrap_or_default();
++        return failed(format!("anthropic {}: {}", code, truncate(&text, 200)));
++    }
++    let reader = std::io::BufReader::new(resp.into_body().into_reader());
+-    let resp = match resp {
+-        Ok(r) => r,
+-        Err(ureq::Error::Status(code, r)) => {
+-            let text = r.into_string().unwrap_or_default();
+-            return failed(format!("anthropic {}: {}", code, truncate(&text, 200)));
+-        }
+-        Err(ureq::Error::Transport(t)) => {
+-            return failed(format!("anthropic transport: {}", t));
+-        }
+-    };
+-    let reader = std::io::BufReader::new(resp.into_reader());
+     decode_sse(&call.model, reader, sink)
+ }
+ 
+@@ -1015,14 +1042,14 @@
+ 
+     let mut req = agent(call.timeout)
+         .post(url)
++        .header("content-type", "application/json");
+-        .set("content-type", "application/json");
+     if !api_key.is_empty() {
++        req = req.header("authorization", &format!("Bearer {}", api_key));
+-        req = req.set("authorization", &format!("Bearer {}", api_key));
+     }
++    let resp = req
+-    let json: serde_json::Value = req
+         .send_json(body)
++        .map_err(|e| AiError::Failed(format!("openai request: {}", e)))?;
++    let json: serde_json::Value = serde_json::from_reader(resp.into_body().into_reader())
+-        .map_err(|e| AiError::Failed(format!("openai request: {}", e)))?
+-        .into_json()
+         .map_err(|e| AiError::Failed(format!("openai decode: {}", e)))?;
+ 
+     let usage = &json["usage"];
+@@ -1093,12 +1120,12 @@
+         body["options"]["temperature"] = serde_json::Value::from(call.temperature);
+     }
+ 
++    let resp = agent(call.timeout)
+-    let json: serde_json::Value = agent(call.timeout)
+         .post(&url)
++        .header("content-type", "application/json")
+-        .set("content-type", "application/json")
+         .send_json(body)
++        .map_err(|e| AiError::Failed(format!("ollama request: {}", e)))?;
++    let json: serde_json::Value = serde_json::from_reader(resp.into_body().into_reader())
+-        .map_err(|e| AiError::Failed(format!("ollama request: {}", e)))?
+-        .into_json()
+         .map_err(|e| AiError::Failed(format!("ollama decode: {}", e)))?;
+ 
+     // Tokens are tracked, cost is not: the model ran on this machine.
+@@ -1147,12 +1174,12 @@
+         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": call.system }] });
+     }
+ 
++    let resp = agent(call.timeout)
+-    let json: serde_json::Value = agent(call.timeout)
+         .post(&url)
++        .header("content-type", "application/json")
+-        .set("content-type", "application/json")
+         .send_json(body)
++        .map_err(|e| AiError::Failed(format!("gemini request: {}", e)))?;
++    let json: serde_json::Value = serde_json::from_reader(resp.into_body().into_reader())
+-        .map_err(|e| AiError::Failed(format!("gemini request: {}", e)))?
+-        .into_json()
+         .map_err(|e| AiError::Failed(format!("gemini decode: {}", e)))?;
+ 
+     let usage = &json["usageMetadata"];
+--- a/tests/daemon_http.rs
++++ b/tests/daemon_http.rs
+@@ -22,6 +22,18 @@
+ const SPAWN_GRACE: Duration = Duration::from_secs(8);
+ const POLL_INTERVAL: Duration = Duration::from_millis(50);
+ 
++fn http_agent() -> ureq::Agent {
++    ureq::Agent::config_builder()
++        // Preserve upstream's default wire header; the transport is ureq 3.
++        .user_agent("ureq/2.12.1")
++        .proxy(None)
++        .timeout_connect(Some(std::time::Duration::from_secs(30)))
++        // ureq 2's five-attempt policy follows at most four redirects.
++        .max_redirects(4)
++        .build()
++        .into()
++}
++
+ fn zshrs_daemon_binary() -> PathBuf {
+     if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs-daemon") {
+         return PathBuf::from(p);
+@@ -120,8 +132,10 @@
+     fn wait_ready(&self) {
+         let start = Instant::now();
+         while start.elapsed() < SPAWN_GRACE {
++            if let Ok(resp) = http_agent().get(&self.url("/health"))
++                .config()
++                .timeout_global(Some(Duration::from_millis(200)))
++                .build()
+-            if let Ok(resp) = ureq::get(&self.url("/health"))
+-                .timeout(Duration::from_millis(200))
+                 .call()
+             {
+                 if resp.status() == 200 {
+@@ -149,9 +163,10 @@
+ #[test]
+ fn health_endpoint_returns_version_and_uptime() {
+     let d = DaemonHttp::spawn(None);
++    let resp = http_agent().get(&d.url("/health")).call().expect("GET /health");
+-    let resp = ureq::get(&d.url("/health")).call().expect("GET /health");
+     assert_eq!(resp.status(), 200);
++    let body: serde_json::Value =
++        serde_json::from_reader(resp.into_body().into_reader()).expect("json");
+-    let body: serde_json::Value = resp.into_json().expect("json");
+     assert_eq!(body["ok"], serde_json::json!(true));
+     assert!(
+         body["version"].as_str().is_some(),
+@@ -166,9 +181,10 @@
+ #[test]
+ fn ops_endpoint_lists_known_ops() {
+     let d = DaemonHttp::spawn(None);
++    let resp = http_agent().get(&d.url("/ops")).call().expect("GET /ops");
+-    let resp = ureq::get(&d.url("/ops")).call().expect("GET /ops");
+     assert_eq!(resp.status(), 200);
++    let body: serde_json::Value =
++        serde_json::from_reader(resp.into_body().into_reader()).expect("json");
+-    let body: serde_json::Value = resp.into_json().expect("json");
+     let ops = body["ops"]
+         .as_array()
+         .expect("ops array")
+@@ -183,29 +199,50 @@
+ #[test]
+ fn op_ping_returns_pong() {
+     let d = DaemonHttp::spawn(None);
++    let resp = http_agent().post(&d.url("/op/ping"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let resp = ureq::post(&d.url("/op/ping"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("POST /op/ping");
+     assert_eq!(resp.status(), 200);
++    let body: serde_json::Value =
++        serde_json::from_reader(resp.into_body().into_reader()).expect("json");
+-    let body: serde_json::Value = resp.into_json().expect("json");
+     assert_eq!(body["ok"], serde_json::json!(true));
+     assert_eq!(body["pong"], serde_json::json!(true));
+ }
+ 
+ #[test]
++fn invalid_optional_json_keeps_upstream_ping_dispatch() {
++    let d = DaemonHttp::spawn(None);
++    for (content_type, payload) in [
++        ("application/json", "{"),
++        ("text/plain", "{\"echo\": \"must not be parsed\"}"),
++    ] {
++        let resp = http_agent().post(&d.url("/op/ping"))
++            .header("Content-Type", content_type)
++            .send(payload)
++            .expect("invalid optional JSON still dispatches ping");
++        assert_eq!(resp.status(), 200, "{content_type}");
++        let body: serde_json::Value =
++            serde_json::from_reader(resp.into_body().into_reader()).expect("json");
++        assert_eq!(body["ok"], serde_json::json!(true));
++        assert_eq!(body["pong"], serde_json::json!(true));
++        assert_eq!(body["echo"], serde_json::Value::Null);
++    }
++}
++
++#[test]
+ fn unknown_op_returns_404() {
+     let d = DaemonHttp::spawn(None);
++    let resp = http_agent().post(&d.url("/op/this_op_does_not_exist"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Content-Type", "application/json")
++        .send("{}");
++    let resp = resp.unwrap_or_else(|e| panic!("unexpected ureq error: {e}"));
+-    let resp = ureq::post(&d.url("/op/this_op_does_not_exist"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}");
+-    let resp = match resp {
+-        Ok(r) => r,
+-        Err(ureq::Error::Status(_, r)) => r,
+-        Err(e) => panic!("unexpected ureq error: {e}"),
+-    };
+     assert_eq!(resp.status(), 404);
++    let body: serde_json::Value =
++        serde_json::from_reader(resp.into_body().into_reader()).expect("json");
+-    let body: serde_json::Value = resp.into_json().expect("json");
+     assert_eq!(body["ok"], serde_json::json!(false));
+     assert_eq!(body["code"], serde_json::json!("unknown_op"));
+ }
+@@ -215,36 +252,35 @@
+     let d = DaemonHttp::spawn(Some("test-secret-456"));
+ 
+     // No token → 401.
++    let r = http_agent().post(&d.url("/op/ping"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Content-Type", "application/json")
++        .send("{}");
++    let r = r.unwrap_or_else(|e| panic!("unexpected ureq error: {e}"));
+-    let r = ureq::post(&d.url("/op/ping"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}");
+-    let r = match r {
+-        Ok(r) => r,
+-        Err(ureq::Error::Status(_, r)) => r,
+-        Err(e) => panic!("unexpected ureq error: {e}"),
+-    };
+     assert_eq!(r.status(), 401, "expected 401 without bearer token");
+ 
+     // Wrong token → 401.
++    let r = http_agent().post(&d.url("/op/ping"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Authorization", "Bearer wrong")
++        .header("Content-Type", "application/json")
++        .send("{}");
++    let r = r.unwrap_or_else(|e| panic!("unexpected ureq error: {e}"));
+-    let r = ureq::post(&d.url("/op/ping"))
+-        .set("Authorization", "Bearer wrong")
+-        .set("Content-Type", "application/json")
+-        .send_string("{}");
+-    let r = match r {
+-        Ok(r) => r,
+-        Err(ureq::Error::Status(_, r)) => r,
+-        Err(e) => panic!("unexpected ureq error: {e}"),
+-    };
+     assert_eq!(r.status(), 401, "expected 401 with wrong bearer token");
+ 
+     // Right token → 200.
++    let r = http_agent().post(&d.url("/op/ping"))
++        .header("Authorization", "Bearer test-secret-456")
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/ping"))
+-        .set("Authorization", "Bearer test-secret-456")
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("authorized POST should succeed");
+     assert_eq!(r.status(), 200);
++    let body: serde_json::Value =
++        serde_json::from_reader(r.into_body().into_reader()).expect("json");
+-    let body: serde_json::Value = r.into_json().expect("json");
+     assert_eq!(body["pong"], serde_json::json!(true));
+ }
+ 
+@@ -252,48 +288,47 @@
+ fn cache_round_trip() {
+     let d = DaemonHttp::spawn(None);
+     // put
++    let r = http_agent().post(&d.url("/op/cache_put"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"ns":"t","key":"k1","value":"hello"}"#)
+-    let r = ureq::post(&d.url("/op/cache_put"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"ns":"t","key":"k1","value":"hello"}"#)
+         .expect("cache_put");
+     assert_eq!(r.status(), 200);
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["bytes"], serde_json::json!(5));
+ 
+     // get
++    let r = http_agent().post(&d.url("/op/cache_get"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"ns":"t","key":"k1"}"#)
+-    let r = ureq::post(&d.url("/op/cache_get"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"ns":"t","key":"k1"}"#)
+         .expect("cache_get");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["value"], serde_json::json!("hello"));
+ 
+     // list
++    let r = http_agent().post(&d.url("/op/cache_list"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"ns":"t"}"#)
+-    let r = ureq::post(&d.url("/op/cache_list"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"ns":"t"}"#)
+         .expect("cache_list");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     let keys = body["keys"].as_array().unwrap();
+     assert!(keys.iter().any(|v| v.as_str() == Some("k1")));
+ 
+     // delete
++    let r = http_agent().post(&d.url("/op/cache_del"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"ns":"t","key":"k1"}"#)
+-    let r = ureq::post(&d.url("/op/cache_del"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"ns":"t","key":"k1"}"#)
+         .expect("cache_del");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["deleted"], serde_json::json!(true));
+ 
+     // get after delete → 404
++    let r = http_agent().post(&d.url("/op/cache_get"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Content-Type", "application/json")
++        .send(r#"{"ns":"t","key":"k1"}"#);
++    let r = r.unwrap_or_else(|e| panic!("ureq error: {e}"));
+-    let r = ureq::post(&d.url("/op/cache_get"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"ns":"t","key":"k1"}"#);
+-    let r = match r {
+-        Ok(r) => r,
+-        Err(ureq::Error::Status(_, r)) => r,
+-        Err(e) => panic!("ureq error: {e}"),
+-    };
+     assert_eq!(r.status(), 404);
+ }
+ 
+@@ -303,41 +338,40 @@
+     let pid = std::process::id();
+ 
+     // try_acquire returns a token
++    let r = http_agent().post(&d.url("/op/lock_try_acquire"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"name":"L","pid":{pid}}}"#))
+-    let r = ureq::post(&d.url("/op/lock_try_acquire"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"name":"L","pid":{pid}}}"#))
+         .expect("lock_try_acquire");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     let token = body["token"].as_str().expect("token").to_string();
+ 
+     // second try → busy (409 in our HTTP mapping, status code = 500 here
+     // since `busy` isn't in the http.rs whitelist; check ok=false instead)
++    let r = http_agent().post(&d.url("/op/lock_try_acquire"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"name":"L","pid":{pid}}}"#));
++    let r = r.unwrap_or_else(|e| panic!("ureq error: {e}"));
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let r = ureq::post(&d.url("/op/lock_try_acquire"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"name":"L","pid":{pid}}}"#));
+-    let r = match r {
+-        Ok(r) => r,
+-        Err(ureq::Error::Status(_, r)) => r,
+-        Err(e) => panic!("ureq error: {e}"),
+-    };
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["ok"], serde_json::json!(false));
+     assert_eq!(body["code"], serde_json::json!("busy"));
+ 
+     // release
++    let r = http_agent().post(&d.url("/op/lock_release"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"name":"L","token":"{token}"}}"#))
+-    let r = ureq::post(&d.url("/op/lock_release"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"name":"L","token":"{token}"}}"#))
+         .expect("lock_release");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["released"], serde_json::json!(true));
+ 
+     // re-acquire after release works
++    let r = http_agent().post(&d.url("/op/lock_try_acquire"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"name":"L","pid":{pid}}}"#))
+-    let r = ureq::post(&d.url("/op/lock_try_acquire"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"name":"L","pid":{pid}}}"#))
+         .expect("re-acquire");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert!(body["token"].as_str().is_some());
+ }
+ 
+@@ -345,20 +379,20 @@
+ fn artifact_round_trip() {
+     let d = DaemonHttp::spawn(None);
+     // put with literal value (UTF-8 string) — exercises the non-base64 path
++    let r = http_agent().post(&d.url("/op/artifact_put"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"name":"art-x","value":"some bytes"}"#)
+-    let r = ureq::post(&d.url("/op/artifact_put"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"name":"art-x","value":"some bytes"}"#)
+         .expect("artifact_put");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     let digest = body["digest"].as_str().expect("digest").to_string();
+     assert_eq!(digest.len(), 64); // sha256 hex
+ 
+     // get by name → returns the bytes base64-encoded
++    let r = http_agent().post(&d.url("/op/artifact_get"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"name":"art-x"}"#)
+-    let r = ureq::post(&d.url("/op/artifact_get"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"name":"art-x"}"#)
+         .expect("artifact_get");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     use base64::Engine as _;
+     let bytes = base64::engine::general_purpose::STANDARD
+         .decode(body["value_base64"].as_str().unwrap())
+@@ -366,11 +400,11 @@
+     assert_eq!(&bytes, b"some bytes");
+ 
+     // get by digest works too
++    let r = http_agent().post(&d.url("/op/artifact_get_by_digest"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"digest":"{digest}"}}"#))
+-    let r = ureq::post(&d.url("/op/artifact_get_by_digest"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"digest":"{digest}"}}"#))
+         .expect("artifact_get_by_digest");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["digest"], serde_json::json!(digest));
+ }
+ 
+@@ -378,19 +412,19 @@
+ fn snapshot_save_list_diff() {
+     let d = DaemonHttp::spawn(None);
+     // save baseline
++    let r = http_agent().post(&d.url("/op/snapshot_save"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"tag":"sn-base"}"#)
+-    let r = ureq::post(&d.url("/op/snapshot_save"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"tag":"sn-base"}"#)
+         .expect("snapshot_save");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert!(body["bytes"].as_u64().unwrap() > 0);
+ 
+     // list contains the tag
++    let r = http_agent().post(&d.url("/op/snapshot_list"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/snapshot_list"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("snapshot_list");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     let tags: Vec<&str> = body["snapshots"]
+         .as_array()
+         .unwrap()
+@@ -400,11 +434,11 @@
+     assert!(tags.contains(&"sn-base"));
+ 
+     // self-diff → all empty
++    let r = http_agent().post(&d.url("/op/snapshot_diff"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"a":"sn-base","b":"sn-base"}"#)
+-    let r = ureq::post(&d.url("/op/snapshot_diff"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"a":"sn-base","b":"sn-base"}"#)
+         .expect("snapshot_diff");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert!(body["added"].as_array().unwrap().is_empty());
+     assert!(body["removed"].as_array().unwrap().is_empty());
+     assert!(body["changed"].as_array().unwrap().is_empty());
+@@ -415,9 +449,10 @@
+     // Health is intentionally always-open for monitoring, even with
+     // tokens enabled. /op/<name> still requires auth (covered above).
+     let d = DaemonHttp::spawn(Some("any-tok"));
++    let resp = http_agent().get(&d.url("/health")).call().expect("GET /health");
+-    let resp = ureq::get(&d.url("/health")).call().expect("GET /health");
+     assert_eq!(resp.status(), 200);
++    let body: serde_json::Value =
++        serde_json::from_reader(resp.into_body().into_reader()).expect("json");
+-    let body: serde_json::Value = resp.into_json().expect("json");
+     assert_eq!(body["ok"], serde_json::json!(true));
+ }
+ 
+@@ -430,27 +465,27 @@
+     let d = DaemonHttp::spawn(None);
+ 
+     // bash: ll = ls -al
++    http_agent().post(&d.url("/op/definitions_emit"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"shell_id":"bash","kind":"alias","name":"ll","value":"ls -al"}"#)
+-    ureq::post(&d.url("/op/definitions_emit"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"shell_id":"bash","kind":"alias","name":"ll","value":"ls -al"}"#)
+         .expect("emit bash ll");
+     // zshrs: ll = ls -alh
++    http_agent().post(&d.url("/op/definitions_emit"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"shell_id":"zshrs","kind":"alias","name":"ll","value":"ls -alh"}"#)
+-    ureq::post(&d.url("/op/definitions_emit"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"shell_id":"zshrs","kind":"alias","name":"ll","value":"ls -alh"}"#)
+         .expect("emit zshrs ll");
+     // bash-only env to test diff `removed`
++    http_agent().post(&d.url("/op/definitions_emit"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"shell_id":"bash","kind":"env","name":"PAGER","value":"less"}"#)
+-    ureq::post(&d.url("/op/definitions_emit"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"shell_id":"bash","kind":"env","name":"PAGER","value":"less"}"#)
+         .expect("emit bash PAGER");
+ 
+     // Query without filter: both alias rows present.
++    let r = http_agent().post(&d.url("/op/definitions_query"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"kind":"alias"}"#)
+-    let r = ureq::post(&d.url("/op/definitions_query"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"kind":"alias"}"#)
+         .expect("query all");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     let recs = body["records"].as_array().unwrap();
+     assert_eq!(recs.len(), 2, "expected both shells' ll rows: {body}");
+     let shells: std::collections::HashSet<&str> =
+@@ -459,21 +494,21 @@
+     assert!(shells.contains("zshrs"), "missing zshrs row: {body}");
+ 
+     // Filter to bash only.
++    let r = http_agent().post(&d.url("/op/definitions_query"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"kind":"alias","shell_id":"bash"}"#)
+-    let r = ureq::post(&d.url("/op/definitions_query"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"kind":"alias","shell_id":"bash"}"#)
+         .expect("query bash");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["count"], serde_json::json!(1));
+     assert_eq!(body["records"][0]["shell_id"], serde_json::json!("bash"));
+     assert_eq!(body["records"][0]["value"], serde_json::json!("ls -al"));
+ 
+     // Diff bash vs zshrs: ll is `changed`, PAGER is `removed`.
++    let r = http_agent().post(&d.url("/op/definitions_diff"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"shell_a":"bash","shell_b":"zshrs"}"#)
+-    let r = ureq::post(&d.url("/op/definitions_diff"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"shell_a":"bash","shell_b":"zshrs"}"#)
+         .expect("diff");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     let changed = body["changed"].as_array().unwrap();
+     assert!(
+         changed
+@@ -491,13 +526,13 @@
+ #[test]
+ fn definitions_emit_rejects_missing_shell_id() {
+     let d = DaemonHttp::spawn(None);
++    let resp = http_agent().post(&d.url("/op/definitions_emit"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"kind":"alias","name":"ll","value":"ls"}"#);
+-    let resp = ureq::post(&d.url("/op/definitions_emit"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"kind":"alias","name":"ll","value":"ls"}"#);
+     let err = resp.expect_err("expected 400 missing shell_id");
+     let status = match err {
++        ureq::Error::StatusCode(s) => s,
++        t => panic!("transport error: {t}"),
+-        ureq::Error::Status(s, _) => s,
+-        ureq::Error::Transport(t) => panic!("transport error: {t}"),
+     };
+     assert_eq!(status, 400);
+ }
+@@ -505,13 +540,13 @@
+ #[test]
+ fn definitions_emit_rejects_unknown_kind() {
+     let d = DaemonHttp::spawn(None);
++    let resp = http_agent().post(&d.url("/op/definitions_emit"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"shell_id":"bash","kind":"banana","name":"x"}"#);
+-    let resp = ureq::post(&d.url("/op/definitions_emit"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"shell_id":"bash","kind":"banana","name":"x"}"#);
+     let err = resp.expect_err("expected 404 unknown kind");
+     let status = match err {
++        ureq::Error::StatusCode(s) => s,
++        t => panic!("transport error: {t}"),
+-        ureq::Error::Status(s, _) => s,
+-        ureq::Error::Transport(t) => panic!("transport error: {t}"),
+     };
+     assert_eq!(status, 404);
+ }
+@@ -525,19 +560,19 @@
+     // require a long-lived IPC client, out of scope for HTTP tests).
+     let d = DaemonHttp::spawn(None);
+ 
++    let r = http_agent().post(&d.url("/op/definitions_subscribe"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/definitions_subscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("subscribe");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["subscribed"], serde_json::json!(true));
+     assert_eq!(body["was_subscribed"], serde_json::json!(false));
+ 
++    let r = http_agent().post(&d.url("/op/definitions_unsubscribe"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/definitions_unsubscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("unsubscribe");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["subscribed"], serde_json::json!(false));
+ }
+ 
+@@ -552,69 +587,69 @@
+     let path = tmp.path().to_str().unwrap().to_string();
+ 
+     // Two subscriptions on the same path.
++    let r1 = http_agent().post(&d.url("/op/watch_subscribe"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"path":"{path}"}}"#))
+-    let r1 = ureq::post(&d.url("/op/watch_subscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"path":"{path}"}}"#))
+         .expect("watch_subscribe 1");
++    let b1: serde_json::Value = serde_json::from_reader(r1.into_body().into_reader()).unwrap();
+-    let b1: serde_json::Value = r1.into_json().unwrap();
+     let id1 = b1["watch_id"].as_u64().expect("watch_id u64");
+     assert!(id1 > 0);
+ 
++    let r2 = http_agent().post(&d.url("/op/watch_subscribe"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"path":"{path}","recursive":true}}"#))
+-    let r2 = ureq::post(&d.url("/op/watch_subscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"path":"{path}","recursive":true}}"#))
+         .expect("watch_subscribe 2");
++    let b2: serde_json::Value = serde_json::from_reader(r2.into_body().into_reader()).unwrap();
+-    let b2: serde_json::Value = r2.into_json().unwrap();
+     let id2 = b2["watch_id"].as_u64().expect("watch_id u64");
+     assert_ne!(id1, id2, "ids must be distinct");
+ 
+     // List shows both with refcount=2 (same path).
++    let r = http_agent().post(&d.url("/op/watch_list"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/watch_list"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("watch_list");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["count"], serde_json::json!(2));
+     let subs = body["subscriptions"].as_array().unwrap();
+     assert!(subs.iter().all(|s| s["ref_count"] == serde_json::json!(2)));
+ 
+     // Unsubscribe one — other subscription survives, refcount drops to 1.
++    let r = http_agent().post(&d.url("/op/watch_unsubscribe"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"watch_id":{id1}}}"#))
+-    let r = ureq::post(&d.url("/op/watch_unsubscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"watch_id":{id1}}}"#))
+         .expect("watch_unsubscribe 1");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["removed"], serde_json::json!(true));
+ 
++    let r = http_agent().post(&d.url("/op/watch_list"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/watch_list"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("watch_list 2");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["count"], serde_json::json!(1));
+     assert_eq!(body["subscriptions"][0]["ref_count"], serde_json::json!(1));
+ 
+     // Final unsubscribe — list goes empty.
++    let _ = http_agent().post(&d.url("/op/watch_unsubscribe"))
++        .header("Content-Type", "application/json")
++        .send(&format!(r#"{{"watch_id":{id2}}}"#))
+-    let _ = ureq::post(&d.url("/op/watch_unsubscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string(&format!(r#"{{"watch_id":{id2}}}"#))
+         .expect("watch_unsubscribe 2");
++    let r = http_agent().post(&d.url("/op/watch_list"))
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/watch_list"))
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("watch_list 3");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["count"], serde_json::json!(0));
+ }
+ 
+ #[test]
+ fn watch_unsubscribe_unknown_id_is_idempotent() {
+     let d = DaemonHttp::spawn(None);
++    let r = http_agent().post(&d.url("/op/watch_unsubscribe"))
++        .header("Content-Type", "application/json")
++        .send(r#"{"watch_id":999999}"#)
+-    let r = ureq::post(&d.url("/op/watch_unsubscribe"))
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"watch_id":999999}"#)
+         .expect("watch_unsubscribe missing id");
++    let body: serde_json::Value = serde_json::from_reader(r.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = r.into_json().unwrap();
+     assert_eq!(body["removed"], serde_json::json!(false));
+ }
+ 
+@@ -625,8 +660,8 @@
+ /// problems).
+ fn status_of(err: ureq::Error) -> u16 {
+     match err {
++        ureq::Error::StatusCode(s) => s,
++        t => panic!("transport error: {t}"),
+-        ureq::Error::Status(s, _) => s,
+-        ureq::Error::Transport(t) => panic!("transport error: {t}"),
+     }
+ }
+ 
+@@ -639,10 +674,10 @@
+ 
+     // Touch ops from multiple scope namespaces.
+     for op in ["info", "cache_stats", "definitions_kinds", "snapshot_list"] {
++        let r = http_agent().post(&d.url(&format!("/op/{op}")))
++            .header("Authorization", "Bearer legacy-secret")
++            .header("Content-Type", "application/json")
++            .send("{}")
+-        let r = ureq::post(&d.url(&format!("/op/{op}")))
+-            .set("Authorization", "Bearer legacy-secret")
+-            .set("Content-Type", "application/json")
+-            .send_string("{}")
+             .unwrap_or_else(|e| panic!("{op}: {e}"));
+         assert_eq!(r.status(), 200, "{op}");
+     }
+@@ -661,18 +696,18 @@
+     let d = DaemonHttp::spawn_with_extra_toml(None, extra);
+ 
+     // cache_stats is `cache.read` → allowed.
++    let r = http_agent().post(&d.url("/op/cache_stats"))
++        .header("Authorization", "Bearer cache-secret")
++        .header("Content-Type", "application/json")
++        .send("{}")
+-    let r = ureq::post(&d.url("/op/cache_stats"))
+-        .set("Authorization", "Bearer cache-secret")
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+         .expect("cache_stats");
+     assert_eq!(r.status(), 200);
+ 
+     // snapshot_save is `snapshot.write` → denied.
++    let err = http_agent().post(&d.url("/op/snapshot_save"))
++        .header("Authorization", "Bearer cache-secret")
++        .header("Content-Type", "application/json")
++        .send(r#"{"tag":"x"}"#)
+-    let err = ureq::post(&d.url("/op/snapshot_save"))
+-        .set("Authorization", "Bearer cache-secret")
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"tag":"x"}"#)
+         .expect_err("snapshot_save must 403");
+     assert_eq!(status_of(err), 403);
+ }
+@@ -687,17 +722,17 @@
+     let d = DaemonHttp::spawn_with_extra_toml(None, extra);
+ 
+     // cache_put is `cache.write` → denied for *.read token.
++    let resp = http_agent().post(&d.url("/op/cache_put"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Authorization", "Bearer ro-secret")
++        .header("Content-Type", "application/json")
++        .send(r#"{"ns":"a","key":"b","value":"c"}"#)
++        .expect("cache_put must 403");
++    let status = resp.status().as_u16();
+-    let err = ureq::post(&d.url("/op/cache_put"))
+-        .set("Authorization", "Bearer ro-secret")
+-        .set("Content-Type", "application/json")
+-        .send_string(r#"{"ns":"a","key":"b","value":"c"}"#)
+-        .expect_err("cache_put must 403");
+-    let (status, resp) = match err {
+-        ureq::Error::Status(s, r) => (s, r),
+-        ureq::Error::Transport(t) => panic!("transport error: {t}"),
+-    };
+     assert_eq!(status, 403);
++    let body: serde_json::Value = serde_json::from_reader(resp.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = resp.into_json().unwrap();
+     assert_eq!(body["code"], serde_json::json!("scope_denied"));
+     assert_eq!(body["required_scope"], serde_json::json!("cache.write"));
+     let granted = body["granted_scopes"].as_array().unwrap();
+@@ -721,10 +756,10 @@
+         "snapshot_list",
+         "lock_list",
+     ] {
++        let r = http_agent().post(&d.url(&format!("/op/{op}")))
++            .header("Authorization", "Bearer dash-secret")
++            .header("Content-Type", "application/json")
++            .send("{}")
+-        let r = ureq::post(&d.url(&format!("/op/{op}")))
+-            .set("Authorization", "Bearer dash-secret")
+-            .set("Content-Type", "application/json")
+-            .send_string("{}")
+             .unwrap_or_else(|e| panic!("{op}: {e}"));
+         assert_eq!(r.status(), 200, "{op} (scope = {})", auth_scope(op));
+     }
+@@ -744,17 +779,17 @@
+ "#;
+     let d = DaemonHttp::spawn_with_extra_toml(None, extra);
+ 
++    let resp = http_agent().post(&d.url("/op/zzz_definitely_not_a_real_op"))
++        .config()
++        .http_status_as_error(false)
++        .build()
++        .header("Authorization", "Bearer co-secret")
++        .header("Content-Type", "application/json")
++        .send("{}")
++        .expect("must reject");
++    let status = resp.status().as_u16();
+-    let err = ureq::post(&d.url("/op/zzz_definitely_not_a_real_op"))
+-        .set("Authorization", "Bearer co-secret")
+-        .set("Content-Type", "application/json")
+-        .send_string("{}")
+-        .expect_err("must reject");
+-    let (status, resp) = match err {
+-        ureq::Error::Status(s, r) => (s, r),
+-        ureq::Error::Transport(t) => panic!("transport error: {t}"),
+-    };
+     assert_eq!(status, 403, "scope check fires before unknown-op 404");
++    let body: serde_json::Value = serde_json::from_reader(resp.into_body().into_reader()).unwrap();
+-    let body: serde_json::Value = resp.into_json().unwrap();
+     assert_eq!(body["required_scope"], serde_json::json!("meta.admin"));
+ }
+ 

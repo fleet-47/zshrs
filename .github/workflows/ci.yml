@@ -25,14 +25,30 @@ env:
 
 jobs:
   check:
-    name: Check
+    name: Check (${{ matrix.source }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [baseline, overlay]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/android-overlay
+        if: matrix.source == 'overlay'
+        with:
+          lockfile-artifact: overlay-lockfile-check
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets --locked
+        with:
+          prefix-key: v0-rust-${{ matrix.source }}
+          key: check
+      - name: Check baseline
+        if: matrix.source == 'baseline'
+        run: cargo check --all-targets --locked
+      - name: Check overlay workspace and optional binaries
+        if: matrix.source == 'overlay'
+        run: cargo check --workspace --all-targets --locked --features recorder,zd,parity-fuzz,prometheus
 
   # Cross-compile to aarch64-linux to catch portability regressions where
   # c_char (= u8 on aarch64-linux, = i8 on x86_64-linux) drifts in libc
@@ -51,8 +67,42 @@ jobs:
         run: cargo install cross --locked
       - run: cross check --locked --target aarch64-unknown-linux-gnu
 
+  cross-aarch64-android:
+    name: Android overlay compile and link (aarch64, API 29)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: ./.github/actions/android-overlay
+        with:
+          lockfile-artifact: overlay-lockfile-android-aarch64
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-overlay
+          key: android-aarch64-api29
+      - name: Configure the runner's Android NDK
+        shell: bash
+        run: |
+          android_ndk_bin="${ANDROID_NDK_LATEST_HOME:?Runner Android NDK is required}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$android_ndk_bin/aarch64-linux-android29-clang"
+          test -x "$android_ndk_bin/aarch64-linux-android29-clang++"
+          test -x "$android_ndk_bin/llvm-ar"
+          {
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$android_ndk_bin/aarch64-linux-android29-clang"
+            echo "CC_aarch64_linux_android=$android_ndk_bin/aarch64-linux-android29-clang"
+            echo "CXX_aarch64_linux_android=$android_ndk_bin/aarch64-linux-android29-clang++"
+            echo "AR_aarch64_linux_android=$android_ndk_bin/llvm-ar"
+          } >> "$GITHUB_ENV"
+      # Building, rather than checking, catches missing Bionic symbols at link
+      # time. This job does not execute the binaries on an Android device.
+      - name: Compile and link the Android workspace and optional binaries
+        run: cargo build --workspace --locked --target aarch64-linux-android --features recorder,zd,parity-fuzz,prometheus
+
   test:
-    name: Test
+    name: Test (${{ matrix.os }}, ${{ matrix.source }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -60,11 +110,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            source: baseline
+          - os: macos-latest
+            source: baseline
+          - os: ubuntu-latest
+            source: overlay
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/android-overlay
+        if: matrix.source == 'overlay'
+        with:
+          lockfile-artifact: overlay-lockfile-test-${{ matrix.os }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-${{ matrix.source }}
+          key: test
       # zsh is required by tests/zsh_zshrs_demo_equivalence.rs which
       # compares system-zsh stdout vs `zshrs --zsh` stdout for every
       # demo under examples/demos/. macOS-runner ships zsh by default;
@@ -107,8 +170,16 @@ jobs:
           brew install bash ksh93
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Test (all targets)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.source == 'baseline'
         run: cargo test --locked --no-fail-fast
+      # Integration tests launch workspace binaries directly, including the
+      # daemon; cargo test alone does not place every binary at that path.
+      - name: Build overlay workspace binaries
+        if: matrix.source == 'overlay'
+        run: cargo build --workspace --bins --locked --features recorder,zd,parity-fuzz,prometheus
+      - name: Test overlay workspace and optional binaries
+        if: matrix.source == 'overlay'
+        run: cargo test --workspace --locked --no-fail-fast --features recorder,zd,parity-fuzz,prometheus
       # The 49k-test `parity` binary spawns a reference zsh and zshrs per
       # case; the macOS runner got through ~7,200 of them in an hour (run
       # 37766178879) while ubuntu runs all of them in ~35 min, so on macOS

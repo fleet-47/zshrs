@@ -1,0 +1,34 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -182 +182 @@
+-fancy-regex = "0.18"
++fancy-regex = "0.19"
+--- a/src/ported/modules/pcre.rs
++++ b/src/ported/modules/pcre.rs
+@@ -313,7 +313,7 @@
+     // c:157
+     pat: &Regex,
+     arg: &str,
+-    mdata: &fancy_regex::Captures,
++    mdata: &fancy_regex::Captures<str>,
+     captured_count: i32,
+     matchvar: Option<&str>,
+     substravar: Option<&str>,
+@@ -591,7 +591,7 @@
+         // returns (c:409): no variables set.
+         let found = PCRE_PATTERN.with(|r| {
+             let re = r.borrow().as_ref()?.clone();
+-            let caps = re.captures_from_pos(&plaintext, search_base_offset).ok().flatten()?;
++            let caps = re.captures_from_pos(plaintext.as_str(), search_base_offset).ok().flatten()?;
+             Some((re, caps))
+         });
+         let Some((re, caps)) = found else {
+@@ -880,7 +880,7 @@
+             // c:465 — `pcre2_match(pcre_pat, lhstr_plain, ...)`.
+             // c:465 — fancy_regex returns Result; a runtime failure is
+             // reported like PCRE2's negative returns (c:493 warn/no-match).
+-            match re.captures(&lhs_plain).unwrap_or(None) {
++            match re.captures(lhs_plain.as_str()).unwrap_or(None) {
+                 Some(caps) => {
+                     // c:483-487 — match succeeded; emit via the
+                     // zpcre_get_substrings contract:

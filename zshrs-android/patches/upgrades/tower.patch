@@ -1,0 +1,5 @@
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -71 +71 @@
+-tower = { version = "0.4", default-features = false }
++tower = { version = "0.5", default-features = false }

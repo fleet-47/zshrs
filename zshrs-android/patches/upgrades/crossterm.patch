@@ -1,0 +1,5 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -224 +224 @@
+-crossterm = "0.27"
++crossterm = { version = "0.29", features = ["libc"] }

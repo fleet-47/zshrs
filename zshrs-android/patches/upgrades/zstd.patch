@@ -1,0 +1,39 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -225 +225 @@
+-zstd = "0.13"
++zstd = "0.14"
+@@ -298 +298 @@
+-zstd = "0.13"
++zstd = "0.14"
+--- a/src/extensions/aot.rs
++++ b/src/extensions/aot.rs
+@@ -237,5 +237,7 @@
+     let mut compressed = vec![0u8; compressed_len as usize];
+     f.read_exact(&mut compressed).ok()?;
+-    let payload = zstd::stream::decode_all(&compressed[..]).ok()?;
++    // Preserve incremental allocation instead of reserving from frame metadata.
++    let mut payload = Vec::new();
++    zstd::stream::copy_decode(&compressed[..], &mut payload).ok()?;
+     if payload.len() != uncompressed_len as usize {
+         return None;
+--- a/src/extensions/bundled_functions.rs
++++ b/src/extensions/bundled_functions.rs
+@@ -170,4 +170,5 @@
+     let fresh = !dir.join(STAMP).exists();
+-    let raw = zstd::decode_all(BUNDLE).ok()?;
++    let mut raw = Vec::new();
++    zstd::stream::copy_decode(BUNDLE, &mut raw).ok()?;
+     let mut files: Vec<(&str, &[u8])> = Vec::new();
+     let mut i = 0usize;
+--- a/src/extensions/bundled_docs.rs
++++ b/src/extensions/bundled_docs.rs
+@@ -134,5 +134,6 @@
+ pub fn entries() -> Vec<(String, Vec<u8>)> {
+-    let Ok(raw) = zstd::decode_all(BUNDLE) else {
++    let mut raw = Vec::new();
++    if zstd::stream::copy_decode(BUNDLE, &mut raw).is_err() {
+         return Vec::new();
+-    };
++    }
+     let u32_at = |i: usize| {

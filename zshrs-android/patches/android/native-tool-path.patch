@@ -1,0 +1,51 @@
+--- a/bins/parity-fuzz.rs
++++ b/bins/parity-fuzz.rs
+@@ -35,9 +35,10 @@
+     if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+         return PathBuf::from(p);
+     }
+-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+-        .join("target")
+-        .join("debug")
++    std::env::current_exe()
++        .expect("locate parity fuzzer executable")
++        .parent()
++        .expect("parity fuzzer executable has a parent directory")
+         .join("zshrs")
+ }
+ 
+--- a/bins/zshrs-recorder.rs
++++ b/bins/zshrs-recorder.rs
+@@ -284,6 +284,7 @@
+ /// `zpwrClearList` listed nothing. Keeps [`SESSION_ENV`], `LC_*`, `XDG_*`
+ /// and `ZSHRS_*` (the recorder's own settings), and resets `PATH` to the
+-/// system default (`confstr(_CS_PATH)`) that `/etc/zprofile` builds on.
++/// system default (`confstr(_CS_PATH)`, or Termux's `_PATH_DEFPATH` on Android)
++/// that the login startup files build on.
+ fn scrub_environment() {
+     let keep = |name: &str| {
+         SESSION_ENV.contains(&name) || ["LC_", "XDG_", "ZSHRS_"].iter().any(|p| name.starts_with(p))
+@@ -298,10 +299,17 @@
+-    let mut buf = vec![0u8; 1024];
+-    // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
+-    let n = unsafe { libc::confstr(libc::_CS_PATH, buf.as_mut_ptr().cast(), buf.len()) };
+-    if n > 0 && n <= buf.len() {
+-        let path = String::from_utf8_lossy(&buf[..n - 1]).into_owned();
+-        std::env::set_var("PATH", path);
++    #[cfg(not(target_os = "android"))]
++    {
++        let mut buf = vec![0u8; 1024];
++        // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
++        let n = unsafe { libc::confstr(libc::_CS_PATH, buf.as_mut_ptr().cast(), buf.len()) };
++        if n > 0 && n <= buf.len() {
++            let path = String::from_utf8_lossy(&buf[..n - 1]).into_owned();
++            std::env::set_var("PATH", path);
++        }
+     }
++    // This overlay targets Termux: <paths.h> defines _PATH_DEFPATH as this
++    // clean initial PATH. Never inherit the launching shell's expanded PATH.
++    #[cfg(target_os = "android")]
++    std::env::set_var("PATH", "/data/data/com.termux/files/usr/bin");
+ }
+ 
+ fn main() -> ExitCode {

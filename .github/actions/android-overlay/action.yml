@@ -1,0 +1,21 @@
+name: Apply Android overlay
+description: Apply enabled overlay patches and retain the dependency resolution used by CI.
+inputs:
+  lockfile-artifact:
+    description: Unique artifact name for this job's resolved Cargo.lock.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Apply overlay
+      shell: bash
+      run: cargo run --locked --manifest-path zshrs-android/runner/Cargo.toml -- apply --ci
+    - name: Resolve overlay dependencies
+      shell: bash
+      run: cargo metadata --format-version 1 > /dev/null
+    - name: Archive resolved overlay lockfile
+      uses: actions/upload-artifact@v6
+      with:
+        name: ${{ inputs.lockfile-artifact }}
+        path: Cargo.lock
+        if-no-files-found: error

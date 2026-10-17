@@ -1,0 +1,10 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -191 +191 @@
+-dirs = "5"
++dirs = "7"
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -27 +27 @@
+-dirs = "5"
++dirs = "7"

@@ -1,0 +1,40 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -221 +221 @@
+-sha2 = "0.10"
++sha2 = "0.11"
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -40 +40 @@
+-sha2 = "0.10"
++sha2 = "0.11"
+--- a/src/extensions/pkg/mod.rs
++++ b/src/extensions/pkg/mod.rs
+@@ -114,5 +114,11 @@
+             hasher.update(b"\n");
+         }
+     }
+-    Ok(format!("sha256-{:x}", hasher.finalize()))
++    use std::fmt::Write as _;
++    let mut digest = String::with_capacity(71);
++    digest.push_str("sha256-");
++    for byte in hasher.finalize() {
++        write!(digest, "{byte:02x}").expect("writing to String cannot fail");
++    }
++    Ok(digest)
+ }
+--- a/src/extensions/ext_builtins.rs
++++ b/src/extensions/ext_builtins.rs
+@@ -8300,7 +8300,11 @@
+             })();
+             match result {
+                 Ok(()) => {
+-                    let hex = format!("{:x}", hasher.finalize());
++                    use std::fmt::Write as _;
++                    let mut hex = String::with_capacity(64);
++                    for byte in hasher.finalize() {
++                        write!(hex, "{byte:02x}").expect("writing to String cannot fail");
++                    }
+                     let sep = if binary { " *" } else { "  " };
+                     println!("{}{}{}", hex, sep, f);
+                 }

@@ -1,0 +1,93 @@
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -58 +58 @@
+-printpdf = { version = "0.7", default-features = false }
++printpdf = { version = "0.12", default-features = false }
+--- a/daemon/export.rs
++++ b/daemon/export.rs
+@@ -1949,10 +1949,10 @@
+ /// monospace look comes from fixed line height, not the glyph
+ /// metrics — fine for the dump-style content).
+ fn pdf_render(target: &str, body: &str) -> std::result::Result<Vec<u8>, String> {
+-    use printpdf::{BuiltinFont, Mm, PdfDocument};
++    use printpdf::{BuiltinFont, Mm, Op, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt, TextItem};
+ 
+     // Letter: 215.9mm × 279.4mm. Margins: 12.7mm (~0.5in). printpdf
+-    // 0.7's `Mm` is `f32`, so all geometry constants are f32 to avoid
++    // uses `f32` geometry constants to avoid
+     // a sea of `as f32` at every call site.
+     const PAGE_W: f32 = 215.9;
+     const PAGE_H: f32 = 279.4;
+@@ -2002,49 +2002,41 @@
+     }
+ 
+     let total_pages = display_lines.len().div_ceil(lines_per_page).max(1);
+-    let (doc, first_page, first_layer) = PdfDocument::new(&title, Mm(PAGE_W), Mm(PAGE_H), "page-1");
+-    let font = doc
+-        .add_builtin_font(BuiltinFont::Helvetica)
+-        .map_err(|e| format!("printpdf font: {e}"))?;
+-    let bold = doc
+-        .add_builtin_font(BuiltinFont::HelveticaBold)
+-        .map_err(|e| format!("printpdf bold font: {e}"))?;
++    let mut doc = PdfDocument::new(&title);
+ 
+     for (page_idx, chunk) in display_lines.chunks(lines_per_page).enumerate() {
+-        let layer = if page_idx == 0 {
+-            doc.get_page(first_page).get_layer(first_layer)
+-        } else {
+-            let (p, l) = doc.add_page(Mm(PAGE_W), Mm(PAGE_H), format!("page-{}", page_idx + 1));
+-            doc.get_page(p).get_layer(l)
++        let mut ops = Vec::new();
++        let mut text = |value: &str, size: f32, x: f32, y: f32, font: BuiltinFont| {
++            ops.extend([
++                Op::StartTextSection,
++                Op::SetTextCursor { pos: Point::new(Mm(x), Mm(y)) },
++                Op::SetFont { font: PdfFontHandle::Builtin(font), size: Pt(size) },
++                Op::ShowText { items: vec![TextItem::Text(value.to_string())] },
++                Op::EndTextSection,
++            ]);
+         };
+ 
+         // Header (title + page number).
+         let mut y = PAGE_H - MARGIN;
+-        layer.use_text(&title, FONT_PT + 2.0, Mm(MARGIN), Mm(y), &bold);
++        text(&title, FONT_PT + 2.0, MARGIN, y, BuiltinFont::HelveticaBold);
+         let pageno = format!("page {} / {}", page_idx + 1, total_pages);
+-        layer.use_text(&pageno, FONT_PT, Mm(PAGE_W - MARGIN - 30.0), Mm(y), &font);
++        text(&pageno, FONT_PT, PAGE_W - MARGIN - 30.0, y, BuiltinFont::Helvetica);
+         y -= LINE_H * 2.0;
+ 
+-        // Body lines.
+         for line in chunk {
+-            layer.use_text(line.as_str(), FONT_PT, Mm(MARGIN), Mm(y), &font);
++            text(line, FONT_PT, MARGIN, y, BuiltinFont::Helvetica);
+             y -= LINE_H;
+         }
+-
+-        // Footer.
+-        layer.use_text(
+-            &footer_template,
+-            FONT_PT - 2.0,
+-            Mm(MARGIN),
+-            Mm(MARGIN / 2.0),
+-            &font,
+-        );
+-    }
+-
+-    let mut buf: Vec<u8> = Vec::new();
+-    doc.save(&mut std::io::BufWriter::new(&mut buf))
+-        .map_err(|e| format!("printpdf save: {e}"))?;
+-    Ok(buf)
++        text(&footer_template, FONT_PT - 2.0, MARGIN, MARGIN / 2.0, BuiltinFont::Helvetica);
++        doc.pages.push(PdfPage::new(Mm(PAGE_W), Mm(PAGE_H), ops));
++    }
++
++    let mut warnings = Vec::new();
++    let bytes = doc.save(&PdfSaveOptions::default(), &mut warnings);
++    if !warnings.is_empty() {
++        return Err(format!("printpdf save: {warnings:?}"));
++    }
++    Ok(bytes)
+ }
+ 
+ #[cfg(test)]

@@ -1,0 +1,8 @@
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -41 +41 @@
+-# Snapshot signing (daemon/snapshot.rs). Exact pin; v2 API (from_bytes,
++# Snapshot signing (daemon/snapshot.rs). Exact pin; v3 API (from_bytes,
+@@ -43 +43 @@
+-ed25519-dalek = "=2.2.0"
++ed25519-dalek = "=3.0.0"

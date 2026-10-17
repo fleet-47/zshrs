@@ -1,0 +1,13 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -238 +238 @@
+-base64 = { version = "0.22", optional = true }
++base64 = { version = "0.23", optional = true }
+@@ -293 +293 @@
+-base64 = "0.22"
++base64 = "0.23"
+--- a/daemon/Cargo.toml
++++ b/daemon/Cargo.toml
+@@ -59 +59 @@
+-base64 = "0.22"
++base64 = "0.23"
