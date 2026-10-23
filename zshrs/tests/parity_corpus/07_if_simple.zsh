@@ -1,3 +1,0 @@
-if true; then
-  echo yes
-fi

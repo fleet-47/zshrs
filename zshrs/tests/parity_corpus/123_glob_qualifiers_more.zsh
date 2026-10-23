@@ -1,7 +1,0 @@
-echo *(^/)
-echo *(rwx)
-echo *(U)
-echo *(f0644)
-echo *(m-1)
-echo *(L+10)
-echo *(.x)

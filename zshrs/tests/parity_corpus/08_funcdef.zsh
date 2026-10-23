@@ -1,3 +1,0 @@
-myfunc() {
-  echo body
-}

@@ -1,5 +1,0 @@
-[[ -f /etc/hosts ]]
-[[ -d /tmp ]]
-[[ -x /bin/ls ]]
-[[ -z "" ]]
-[[ -n "something" ]]
