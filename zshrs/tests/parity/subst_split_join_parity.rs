@@ -1,0 +1,653 @@
+//! Param-expansion split/join + case flags parity:
+//! `${(s./.)V}` split-on-string, `${(j.x.)A}` join-with-string,
+//! `${(w)V}` word-count, `${(C)V}` capitalize words,
+//! `${(L)V}` lowercase, `${(U)V}` uppercase, `${(0)V}` NUL-split.
+
+#![allow(non_snake_case)]
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+struct R {
+    stdout: String,
+    exit: i32,
+}
+fn run_zsh(s: &str) -> R {
+    let o = Command::new(zsh_path())
+        .args(["-fc", s])
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn run_zshrs(s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn assert_parity(s: &str) {
+    if !zsh_available() {
+        return;
+    }
+    let z = run_zsh(s);
+    let r = run_zshrs(s);
+    assert_eq!(
+        z.stdout, r.stdout,
+        "stdout divergence on:\n{s}\n--- zsh ---\n{:?}\n--- zshrs ---\n{:?}",
+        z.stdout, r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+mod split {
+    use super::*;
+
+    /// `${(s./.)PATH}` split on /. Fixed: paramsubst's split + auto-
+    /// splat now emits a Nularg sentinel (`\u{e1a1}`) for empty
+    /// elements per c:Src/subst.c:36 `nulstring[]`, and prefork's
+    /// remnulargs at c:Src/subst.c:170 strips it back to empty AFTER
+    /// the empty-delete branch has already passed. Without that
+    /// sentinel, the leading empty element of "/usr/local/bin" got
+    /// deleted by prefork's `else if (!keep) uremnode` arm.
+    #[test]
+    fn split_on_slash() {
+        assert_parity(r#"X="/usr/local/bin"; print -l "${(@s./.)X}""#);
+    }
+
+    /// `${(s.,.)X}` split on comma.
+    #[test]
+    fn split_on_comma() {
+        assert_parity(r#"X="a,b,c,d"; print -l "${(@s.,.)X}""#);
+    }
+
+    /// `${(s.:.)X}` colon-delimited.
+    #[test]
+    fn split_on_colon() {
+        assert_parity(r#"X="a:b:c"; print -l "${(@s.:.)X}""#);
+    }
+
+    /// Multi-char delimiter `${(s.,,.)X}`.
+    #[test]
+    fn split_on_multi_char_delimiter() {
+        assert_parity(r#"X="a,,b,,c"; print -l "${(@s.,,.)X}""#);
+    }
+
+    /// Empty intermediate fields kept. Same Nularg fix as
+    /// `split_on_slash`.
+    #[test]
+    fn split_keeps_empty_fields() {
+        assert_parity(r#"X="a,,b"; print -l "${(@s.,.)X}""#);
+    }
+}
+
+mod ps_split {
+    use super::*;
+
+    /// `${(ps.x.)X}` is split flag that supports special chars.
+    /// Use `${(ps:\0:)X}` for NUL split.
+    #[test]
+    fn ps_split_on_nul_byte() {
+        assert_parity(r#"X=$'a\0b\0c'; print -l "${(@ps:\0:)X}""#);
+    }
+}
+
+mod join {
+    use super::*;
+
+    /// `${(j./.)A}` joins array with /.
+    #[test]
+    fn join_with_slash() {
+        assert_parity(r#"arr=(usr local bin); echo "${(j./.)arr}""#);
+    }
+
+    /// Join with empty string concatenates.
+    #[test]
+    fn join_with_empty_string() {
+        assert_parity(r#"arr=(a b c); echo "${(j..)arr}""#);
+    }
+
+    /// Join with multi-char string.
+    #[test]
+    fn join_with_arrow_separator() {
+        assert_parity(r#"arr=(one two three); echo "${(j./->/)arr}""#);
+    }
+
+    /// Join + newline = `${(F)A}` shortcut.
+    #[test]
+    fn join_F_newline() {
+        assert_parity(r#"arr=(a b c); echo "${(F)arr}""#);
+    }
+}
+
+mod word_count {
+    use super::*;
+
+    /// `${(w)X}` count words (split on whitespace).
+    #[test]
+    fn count_three_words() {
+        assert_parity(r#"X="one two three"; echo "${#${(z)X}}""#);
+    }
+
+    /// Words preserve quoting via (z).
+    #[test]
+    fn z_split_respects_quotes() {
+        assert_parity(r#"X='one "two three" four'; arr=("${(z)X}"); echo "${#arr}""#);
+    }
+}
+
+mod case_flags {
+    use super::*;
+
+    /// `${(U)X}` uppercase.
+    #[test]
+    fn U_uppercase() {
+        assert_parity(r#"X=hello; echo "${(U)X}""#);
+    }
+
+    /// `${(L)X}` lowercase.
+    #[test]
+    fn L_lowercase() {
+        assert_parity(r#"X=HELLO; echo "${(L)X}""#);
+    }
+
+    /// `${(C)X}` capitalize each word.
+    #[test]
+    fn C_capitalize_words() {
+        assert_parity(r#"X="hello world foo bar"; echo "${(C)X}""#);
+    }
+
+    /// `${(C)X}` on already-uppercase.
+    #[test]
+    fn C_on_uppercase_lowers_rest() {
+        assert_parity(r#"X="HELLO WORLD"; echo "${(C)X}""#);
+    }
+}
+
+mod array_iterate {
+    use super::*;
+
+    /// Iterate over split result.
+    #[test]
+    fn iterate_split_result() {
+        assert_parity(
+            r#"
+X="a:b:c"
+for w in "${(@s.:.)X}"; do
+  echo "[$w]"
+done
+"#,
+        );
+    }
+
+    /// Iterate over joined array.
+    #[test]
+    fn iterate_joined_string() {
+        assert_parity(
+            r#"
+arr=(red green blue)
+echo "${(j., .)arr}"
+"#,
+        );
+    }
+}
+
+mod combined_flags {
+    use super::*;
+
+    /// `${(sj)X}` mixed flags don't make sense alone — combined with delim.
+    /// Test (Us) uppercase + split: zsh applies left-to-right.
+    #[test]
+    fn upper_then_split() {
+        assert_parity(r#"X="hi:there"; print -l "${(@s.:.U)X}""#);
+    }
+
+    /// `${(LF)A}` lowercase each elem then join with newline.
+    #[test]
+    fn lower_then_F_join() {
+        assert_parity(r#"arr=(HELLO WORLD); echo "${(LF)arr}""#);
+    }
+}
+
+mod p_string_subst {
+    use super::*;
+
+    /// `${(p)X}` enables prompt-style substitution. Test integration.
+    #[test]
+    fn p_flag_processes_escape() {
+        assert_parity(r#"X=$'a\nb'; echo "[${(p)X}]""#);
+    }
+}
+
+mod ps_join_combined {
+    use super::*;
+
+    /// `${(pj.\n.)A}` join with newline (escape-processed).
+    #[test]
+    fn pj_join_with_newline_escape() {
+        assert_parity(r#"arr=(a b c); echo "${(pj.\n.)arr}""#);
+    }
+}
+
+/// Bare `$=NAME` (forced IFS word-split) applies to positional and
+/// special parameter names too, not just alpha idents
+/// (c:Src/subst.c:2554). `$=1` previously leaked through as literal.
+mod bare_split_flag_special_names {
+    use super::*;
+
+    #[test]
+    fn positional_single_digit() {
+        assert_parity(r#"1="a b c"; print -l $=1"#);
+    }
+
+    #[test]
+    fn positional_multi_digit() {
+        assert_parity(r#"12="a b"; print -l $=12"#);
+    }
+
+    #[test]
+    fn star_splits_positionals() {
+        assert_parity(r#"set -- "a b"; print -l $=*"#);
+    }
+
+    #[test]
+    fn at_splits_each_positional() {
+        assert_parity(r#"set -- "a b" "c d"; print -l $=@"#);
+    }
+
+    #[test]
+    fn double_equals_disables_split_on_positional() {
+        assert_parity(r#"1="x y"; print -l $==1"#);
+    }
+
+    /// Alpha-ident name still works (regression guard).
+    #[test]
+    fn alpha_name_unaffected() {
+        assert_parity(r#"v="a b"; print -l $=v"#);
+    }
+
+    /// Unset special name → empty (regression guard).
+    #[test]
+    fn unset_name_empty() {
+        assert_parity(r#"print $=notset; echo done"#);
+    }
+}
+
+mod split_flag_over_nested_substitution {
+    use super::*;
+
+    /// `${(s:,:)${…}}` — the split flag applied to a NESTED substitution whose
+    /// value comes from literal text (a `${var:-word}` default). zshrs slices
+    /// the inner expansion out of the OUTER lex, where `,` had already gone
+    /// through `case LX2_COMMA` (c:Src/lex.c:1167-1169) and become the
+    /// brace-expansion `Comma` token; C re-lexes the inner text with `sub = 1`
+    /// (`parse_subst_string` → `gettokstr(c, 1)`, c:Src/lex.c:1812), where the
+    /// `!sub` term keeps it an ordinary comma. The split then compared a token
+    /// against the flag's ASCII `,` — `findsep` is a byte compare
+    /// (c:Src/utils.c:3839) — and produced one unsplit word.
+    #[test]
+    fn comma_split_over_nested_default() {
+        assert_parity(r#"print -l ${(s:,:)${:-a,b,c}}"#);
+    }
+
+    /// The reported shape: empty field between separators, counted by words.
+    #[test]
+    fn comma_split_over_nested_default_empty_field() {
+        assert_parity(r#"print ${(s:,:)${:-a,b,,c}} | wc -w"#);
+    }
+
+    /// Same with a named (unset) parameter rather than the empty-name form.
+    #[test]
+    fn comma_split_over_nested_named_default() {
+        assert_parity(r#"unset zr_s; print -l ${(s:,:)${zr_s:-a,b,c}}"#);
+    }
+
+    /// A comma inside a real brace GROUP keeps its token meaning — the group
+    /// brace-expands first and the split sees no separator, so both shells
+    /// print one word. This is the case the naive fix breaks.
+    #[test]
+    fn brace_group_inside_nested_default_still_expands() {
+        assert_parity(r#"unset zr_s; print -l ${(s:,:)${zr_s:-{a,b}}}"#);
+    }
+
+    /// Both at once: the top-level comma splits, the braced one expands.
+    #[test]
+    fn top_level_comma_splits_while_braced_comma_expands() {
+        assert_parity(r#"unset zr_s; print -l ${(s:,:)${zr_s:-a,{b,c}}}"#);
+    }
+
+    /// A quoted default was never tokenized and must keep splitting.
+    #[test]
+    fn quoted_nested_default_splits() {
+        assert_parity(r#"print -l ${(s:,:)${:-"a,b,c"}}"#);
+    }
+
+    /// Non-nested `${var:-…}` is unaffected — its comma is literal in both.
+    #[test]
+    fn plain_default_comma_is_literal() {
+        assert_parity(r#"unset zr_s; print -l ${zr_s:-a,b}"#);
+    }
+
+    /// Bare brace expansion outside any substitution still expands.
+    #[test]
+    fn bare_brace_expansion_unaffected() {
+        assert_parity(r#"print -l {a,b}"#);
+    }
+}
+
+/// c:Src/subst.c:566-620 — multsub splits a `${=x:-word}` default word on
+/// every ISEP char, a `Dash` token included once the loop turns it back into
+/// `-`, and skips the whole run of separators after a cut.
+mod default_word_split_on_non_whitespace_ifs {
+    use super::*;
+
+    #[test]
+    fn dash_and_dot_separators_split_the_default_word() {
+        assert_parity(
+            r#"f() { local IFS=.-; print -l ${=1:-1-2.3-4}; }; f
+g() { local IFS=-; print -rl -- ${=1:-a--b} ${=1:--a}; }; g
+h() { local IFS=:; print -rl -- ${=1:-:a::b:}; }; h"#,
+        );
+    }
+
+    /// c:Src/subst.c:3913-3915 — the `$foo` inside the default word is split
+    /// by sepsplit on $IFS, so a non-whitespace IFS char separates its value.
+    #[test]
+    fn parameter_value_in_the_default_word_splits_on_ifs() {
+        assert_parity(
+            r#"f() { local IFS=.-; local foo=1-2.3-4; print -l ${=1:-1-2.3-4} ${=1:-$foo} }; f"#,
+        );
+    }
+}
+
+/// c:Src/params.c:2210-2212 reads a positional name as its digits only, so
+/// anything but an operator or `}` after them is c:Src/subst.c:2994-3004's
+/// "bad substitution".
+mod positional_name_is_digits_only {
+    use super::*;
+
+    #[test]
+    fn letters_after_the_digits_are_a_bad_substitution() {
+        assert_parity(r#"print ${1a}; echo rc=$?"#);
+        assert_parity(r#"x=${12a}; echo rc=$?"#);
+        assert_parity(r#"print "${1_}"; echo rc=$?"#);
+    }
+
+    #[test]
+    fn valid_positional_and_identifier_shapes() {
+        assert_parity(
+            r#"set -- p q r s t u v w x y z; a1=A; print ${1} ${10} ${a1} ${#1} ${10:-x} ${11-d} $1a ${1}a ${1[1]} ${1:u}"#,
+        );
+    }
+}
+
+/// c:Src/params.c:1741-1760 — a lowercase `(i)`/`(r)` scan of an association
+/// that matches nothing yields an empty SCALAR (only `(I)`/`(R)` accept an
+/// empty array), so RC_EXPAND_PARAM keeps the surrounding word.
+mod assoc_scan_miss_is_scalar {
+    use super::*;
+
+    #[test]
+    fn rcexpandparam_keeps_word_for_lowercase_miss() {
+        assert_parity(
+            r#"setopt rcexpandparam; typeset -A h; h=(X x); print S key=$h[(i)y] val=$h[(r)Y]; print S k=$h[(I)y] a=${h[(r)X]} b=$h[(i)X]"#,
+        );
+    }
+}
+
+/// Errors a nested or re-lexed value must raise instead of passing through.
+mod flag_value_errors {
+    use super::*;
+
+    /// c:Src/subst.c:2709-2713 — a `(P)` inner whose name parameter is an
+    /// array of more than one element names no single parameter.
+    #[test]
+    fn nested_p_with_multi_element_array_errors() {
+        assert_parity(
+            r#"f() { local s1=foo s2=bar; local -a val=(s1 s2); print ${${(P)val}[1,3]} }; f; echo rc=$?
+g() { local s1=foo; local -a val=(s1); print ${${(P)val}[1,2]} }; g; echo rc=$?"#,
+        );
+    }
+
+    /// c:Src/subst.c:4137-4150 — under `(X)` the `(Q)` re-lex reports a
+    /// malformed value and ends the expansion; without `(X)` it is silent.
+    #[test]
+    fn qx_reports_an_unmatched_quote() {
+        assert_parity(r#"foo='unmatched "'; print ${(QX)foo}; echo rc=$?"#);
+        assert_parity(r#"foo='unmatched "'; print -r -- ${(Q)foo}; echo rc=$?"#);
+        assert_parity(r#"a=('"x"' 'y'); print -r -- ${(QX)a}; echo rc=$?"#);
+    }
+}
+
+/// `(~)` tokenizes the flag argument (c:Src/subst.c:1549 `if (tok_arg)
+/// shtokenize(dst);`), so a `(j)` separator or `(s)` delimiter is a
+/// pattern character, not a literal one.
+mod tilde_flag_tokenizes_the_argument {
+    use super::*;
+
+    #[test]
+    fn join_separator_is_a_pattern_operator() {
+        assert_parity(r#"a=(x y); b=(x y z xy); print -r -- ${b:#${(~j.|.)a}} "${(@)b:#${(~j.|.)a}}""#);
+    }
+
+    #[test]
+    fn split_delimiter_is_a_star_token() {
+        assert_parity(r#"x="a*b"; print -rl -- ${(~s.*.)x}"#);
+    }
+}
+
+/// An array range subscript sets `isarr` from `scanflags` whether or not
+/// it selects anything (c:Src/subst.c:2915-2916), so an EMPTY slice inside
+/// double quotes still joins (c:2798) to one empty word; `(@)` and the
+/// unquoted form stay zero words.
+mod quoted_empty_slice_word_count {
+    use super::*;
+
+    #[test]
+    fn empty_ranges_keep_one_quoted_word() {
+        assert_parity(
+            r#"args() { print -n "$# "; }; a=(foo bar); x=3
+args "${a[3,-1]}"; args "${a[2,1]}"; args "${a[3,3]}"; args "${a[5,-1]}"; args "${a[x,-1]}"
+args ${a[3,-1]}; args "${(@)a[x,-1]}"; args "${(j:,:)a[x,-1]}"; echo"#,
+        );
+    }
+}
+
+/// c:Src/subst.c:1551 — under `(~)` the flag argument is shtokenized, so a
+/// command-argument word built with it reaches globlist (c:Src/exec.c:3755)
+/// with active pattern characters. The compiler's `${(flags)NAME}` fast path
+/// returned plain text, so the joined `*` never globbed.
+mod tokenized_flag_argument_reaches_globlist {
+    use super::*;
+
+    #[test]
+    fn joined_star_globs_as_an_argument() {
+        assert_parity(r#"a=(zz_no 1); print -r -- ${(~j.*.)a}; echo rc=$?"#);
+        assert_parity(r#"a=(x y); print -r -- ${(j.*.)a} ${(~j.-.)a}"#);
+    }
+
+    #[test]
+    fn padding_string_globs_as_an_argument() {
+        assert_parity(r#"x=a; print -r -- ${(~l:5::*:)x}; echo rc=$?"#);
+        assert_parity(r#"x=a; y=${(~l:5::*:)x}; print -r -- $y"#);
+    }
+}
+
+/// c:Src/subst.c:3899-3906 — `else if (isarr && aval && aval[0] && !aval[1])
+/// { val = aval[0]; isarr = 0; }` demotes a ONE-element array to a scalar
+/// BEFORE the c:3912 force_split block, so c:3931
+/// `if (force_split && !isarr)` still sepsplits it. The port demoted only
+/// arrays of length > 1 (the c:3914 join), so a single-element array kept
+/// `isarr` and the split was skipped: `a=("x y z"); print ${#${=${a}}}` came
+/// back as 1 where zsh is 3. `_git`'s `__git_merge_strategies` parses
+/// `git merge -s ''` output with exactly this shape — the `(M)…:#…` filter
+/// matches ONE line — so `git merge --strategy=<TAB>` inserted
+/// `octopus\ ours\ recursive\ resolve\ subtree` as one backslash-escaped word
+/// instead of offering five matches.
+mod one_element_array_under_force_split {
+    use super::*;
+
+    #[test]
+    fn explicit_split_flag_splits_a_one_element_array() {
+        assert_parity(r##"a=("x y z"); y=(${=${a}}); print -r -- ${#y}; print -rl -- $y"##);
+        assert_parity(r##"a=("x y z"); y=(${=${(@)a}}); print -r -- ${#y}"##);
+        assert_parity(r##"a=("x y z"); y=(${=${${a}}}); print -r -- ${#y}"##);
+    }
+
+    /// The multi-element join (c:3914) and the plain-scalar path were already
+    /// correct — they must stay that way.
+    #[test]
+    fn multi_element_and_scalar_paths_are_unchanged() {
+        assert_parity(r##"a=("x y" "z w"); y=(${=${a}}); print -r -- ${#y}"##);
+        assert_parity(r##"s="x y z"; y=(${=${s}}); print -r -- ${#y}"##);
+        assert_parity(r##"a=("xyz"); y=(${=${a}}); print -r -- ${#y}"##);
+    }
+
+    /// The option-driven half of c:1707 `spbreak` reaches the same gate.
+    #[test]
+    fn shwordsplit_option_splits_a_one_element_array() {
+        assert_parity(r##"setopt shwordsplit; a=("x y z"); y=(${${a}}); print -r -- ${#y}"##);
+    }
+
+    /// c:3931 `sepsplit(val, spsep, 0, 1)` splits on IFS, and an EMPTY IFS
+    /// (c:1817 `nojoin` 1) keeps the element whole.
+    #[test]
+    fn ifs_governs_the_one_element_split() {
+        assert_parity(r##"IFS=:; a=("x:y:z"); y=(${=${a}}); print -r -- ${#y}"##);
+        assert_parity(r##"IFS=; a=("x y z"); y=(${=${a}}); print -r -- ${#y}"##);
+    }
+
+    /// The `_git` shape itself: `(f)` splits the program output, `(M)…:#…`
+    /// keeps the single "Available strategies are: …" line, and `${=…}` has
+    /// to split that lone element into one match per strategy.
+    #[test]
+    fn git_merge_strategies_parse_shape() {
+        assert_parity(
+            r##"out="Could not find merge strategy 'help'.
+Available strategies are: octopus ours recursive resolve subtree."
+s=(${=${${${(M)${(f)out}:#Available*}#Available strategies are: }%.}})
+print -r -- ${#s}; print -rl -- $s"##,
+        );
+    }
+}
+
+/// `${==…}` and the `(A)` assignment forms: C's c:2562 `spbreak = 0` and the
+/// c:3257-3262 multsub split of an array-assignment word (D04parameter).
+mod split_flag_and_array_assign {
+    use super::*;
+
+    /// c:2562 — `${==…}` clears spbreak, so under SH_WORD_SPLIT the default
+    /// word's nested expansions are not split (c:3219-3226 NOSHWORDSPLIT).
+    #[test]
+    fn double_equals_suppresses_shwordsplit_in_default_word() {
+        assert_parity(r##"emulate sh; foo="1 2" bar="3 4"; print -l ${==1:-$foo $bar}"##);
+        assert_parity(r##"emulate sh; foo="1 2"; print -l ${===1:-$foo} ${==foo}"##);
+    }
+
+    /// c:3259 — `${(A)=a=…}` splits at UNQUOTED blanks only; a quoted word
+    /// stays one element, and c:3307 makes the expansion the new array.
+    #[test]
+    fn array_assign_split_keeps_quoted_words() {
+        assert_parity(
+            r##"print -l ${(A)=foo=Make "this test keeps" on a\ b}; print ${(t)foo} $#foo"##,
+        );
+        assert_parity(r##"print -l ${(A)=bar::=x "y z" w}; print $#bar"##);
+        assert_parity(r##"print -l ${(A)=q:="p q" r}; print $#q"##);
+        assert_parity(r##"x="1 2 3"; print -l ${(A)=z::=$x}; print $#z"##);
+    }
+
+    /// c:3302 — `(AA)` expands to the hash values; c:3326-3334 joins a
+    /// quoted `(A)` assignment back into one word.
+    #[test]
+    fn assoc_assign_values_and_quoted_join() {
+        assert_parity(r##"print -l ${(AA)=h::=k "v w"}; print -r -- $h[k]"##);
+        assert_parity(
+            r##"set If "this test fails" "we have"; print -l "${(A)foo::=$@}"; print -l $foo"##,
+        );
+    }
+
+    /// c:4246-4253 — `(A)` re-forces array shape after a split that yielded
+    /// one field (c:3924), so a subscript picks the element, not a character.
+    #[test]
+    fn array_flag_keeps_one_field_split_an_array() {
+        assert_parity(
+            r##"o=Option1; print ${${(As:;:)o}[1]} ${#${(As:;:)o}} ${${(Af)o}[1]} ${${(A)=o}[1]} "${${(As:;:)o}[1]}""##,
+        );
+        assert_parity(r##"o=Option1; print ${${(s:;:)o}[1]} ${#${(s:;:)o}}"##);
+    }
+
+    /// c:4185-4197 — `(z)` untokenizes the value before bufferwords re-lexes
+    /// it; token chars (Dash, Star, Quest) left in were skipped by the lexer.
+    #[test]
+    fn z_flag_untokenizes_before_lexing() {
+        assert_parity(r##"setopt nonomatch; print -rl -- ${(z):-foo-bar*thingy?}"##);
+        assert_parity(r##"print -rl -- ${(z):-a-b} ${(z):-"x*y"} ${(z):-a?b}"##);
+    }
+
+    /// c:3549-3568 — a SCALAR left operand of `:|` / `:*` is tested for
+    /// membership as a whole.
+    #[test]
+    fn scalar_operand_of_array_set_ops() {
+        assert_parity(
+            r##"mod=("one word" "two words"); s="two words"; print -r -- "[${s:|mod}] [${s:*mod}]""##,
+        );
+        assert_parity(
+            r##"s=abc; e=(); print -r -- "[${s:*nonexist}] [${s:|nonexist}] [${s:*e}] [${s:|e}] [${u:*e}]""##,
+        );
+    }
+}
+
+/// c:Src/subst.c:3912-3940 — an array is joined (j) first, then the joined
+/// text is split; unique/sort (c:4264/4301) run once on the split words.
+mod join_then_split_then_sort {
+    use super::*;
+
+    #[test]
+    fn split_after_join_is_sorted() {
+        assert_parity(
+            r#"a=(c.b a.d); v=q.c.a; printf '<%s>' ${(s:.:j:,:o)a}; echo; printf '<%s>' ${(s:.:Oa)v}; echo; printf '<%s>' ${(oj/-/)a}; echo"#,
+        );
+    }
+
+    #[test]
+    fn assoc_values_join_before_split() {
+        assert_parity(
+            r#"typeset -A h=(k v1.x k2 v2); printf '<%s>' ${(j:,:s:.:)h} ${(fj:,:)h}; echo"#,
+        );
+    }
+
+    /// SH_WORD_SPLIT splits in the same c:3912 block, so the sort sees the
+    /// split words, and an explicit (s:X:) takes over from the IFS split.
+    #[test]
+    fn shwordsplit_splits_before_sort() {
+        assert_parity(
+            r#"setopt shwordsplit; a=(foo 'b ar' baz); s='a b:c.d'; printf '<%s>' ${(o)a}; echo; printf '<%s>' x${(s:.:)s}y; echo"#,
+        );
+    }
+}

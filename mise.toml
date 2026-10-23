@@ -1,0 +1,187 @@
+# Android tasks: toolchain, patch, build and publish zshrs for aarch64-linux-android.
+
+[env]
+ZSHRS_ASSETS = "{{env.HOME}}/outputs/release-assets/zshrs"
+
+[tasks."toolchain:ensure"]
+description = "Install the latest toolchain release of fleet-47/termux-bionicc-aarch64 from GitHub when the installed one is older, and record it"
+run = '''
+set -euo pipefail
+REPO="${TOOLCHAIN_REPO:-fleet-47/termux-bionicc-aarch64}"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zshrs-android"
+
+# Newest published versioned toolchain release; the moving `*-latest` tags are skipped.
+TAG=$(gh api --paginate "repos/$REPO/releases" \
+  --jq '.[] | select(.draft | not) | select(.prerelease | not)
+        | select(.tag_name | test("^cargo-llvm[0-9]+-clang.+-rust.+$")) | [.published_at, .tag_name] | @tsv' \
+  | sort -r | head -n 1 | cut -f 2)
+if [ -z "$TAG" ]; then
+  echo "Error: $REPO has no published cargo-llvm<N>-clang<ver>-rust<ver> release." >&2
+  exit 1
+fi
+echo "==> Toolchain release: $REPO @ $TAG"
+
+DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zshrs-android/toolchain/$TAG"
+mkdir -p "$DIR"
+gh release download "$TAG" --repo "$REPO" --dir "$DIR" --clobber \
+  --pattern SHA256SUMS-toolchain.txt \
+  --pattern 'clang_*.deb' --pattern 'lld_*.deb' --pattern 'llvm_*.deb' \
+  --pattern 'libllvm_*.deb' --pattern 'libcompiler-rt_*.deb' \
+  --pattern 'rust_*.deb' --pattern 'rust-std-aarch64-linux-android_*.deb'
+
+# Every downloaded deb must be listed and match.
+(
+  cd "$DIR"
+  for deb in *.deb; do
+    grep -q "  $deb\$" SHA256SUMS-toolchain.txt || { echo "Error: $deb is not in SHA256SUMS-toolchain.txt" >&2; exit 1; }
+  done
+  sha256sum --check --ignore-missing SHA256SUMS-toolchain.txt
+)
+
+# Installed version: the dpkg record, else the binary (a toolchain extracted with `dpkg -x` has no record).
+installed() {
+  if dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; then
+    dpkg-query -W -f='${Version}' "$1"
+    return
+  fi
+  case "$1" in
+    clang|lld|llvm|libllvm|libcompiler-rt)
+      "$PREFIX/bin/clang" --version 2>/dev/null | head -n 1 | sed -nE 's/.*version ([0-9]+(\.[0-9]+)+).*/\1/p' ;;
+    rust|rust-std-aarch64-linux-android)
+      "$PREFIX/bin/rustc" --version 2>/dev/null | awk '{print $2}' ;;
+  esac
+}
+upstream() { v="${1#*:}"; echo "${v%-*}"; }
+
+NEED=""
+for deb in "$DIR"/*.deb; do
+  pkg=$(dpkg-deb -f "$deb" Package)
+  ver=$(dpkg-deb -f "$deb" Version)
+  have=$(installed "$pkg" || true)
+  if [ -z "$have" ] || dpkg --compare-versions "$(upstream "$have")" lt "$(upstream "$ver")"; then
+    echo "  $pkg: ${have:-none} -> $ver"
+    NEED="$NEED $deb"
+  else
+    echo "  $pkg: $have is current"
+  fi
+done
+if [ -n "$NEED" ]; then
+  echo "==> Installing:$NEED"
+  # shellcheck disable=SC2086
+  apt-get install -y $NEED
+fi
+
+CLANG_VERSION=$(dpkg-deb -f "$DIR"/clang_*.deb Version)
+RUST_VERSION=$(dpkg-deb -f "$DIR"/rust_*.deb Version)
+mkdir -p "$STATE_DIR"
+cat > "$STATE_DIR/toolchain.env" <<EOF
+TOOLCHAIN_REPO=$REPO
+TOOLCHAIN_TAG=$TAG
+TOOLCHAIN_CLANG_VERSION=$CLANG_VERSION
+TOOLCHAIN_RUST_VERSION=$RUST_VERSION
+EOF
+echo "==> Recorded $STATE_DIR/toolchain.env"
+cat "$STATE_DIR/toolchain.env"
+'''
+
+[tasks."zshrs:prepare"]
+description = "Copy zshrs/ into the build copy ($ZSHRS_BUILD, default ~/outputs/build/zshrs) and apply the Android series"
+wait_for = ["toolchain:ensure"]
+run = '''
+set -euo pipefail
+SRC="{{config_root}}/zshrs"
+OVERLAY="{{config_root}}/zshrs-android"
+BUILD="${ZSHRS_BUILD:-$HOME/outputs/build/zshrs}"
+
+mkdir -p "$BUILD"
+case "$(cd "$BUILD" && pwd -P)/" in
+  "$(cd "{{config_root}}" && pwd -P)"/*)
+    echo "Error: build copy $BUILD is inside this repository; refusing." >&2
+    exit 1 ;;
+esac
+
+echo "==> Copying $SRC to $BUILD..."
+find "$BUILD" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
+cp -a "$SRC/." "$BUILD/"
+
+echo "==> Applying Android patches via runner..."
+cargo run --release --manifest-path "$OVERLAY/runner/Cargo.toml" -- \
+  apply --repo "$BUILD" --overlay "$OVERLAY"
+'''
+
+[tasks."zshrs:build"]
+description = "Build the patched zshrs with the recorded toolchain and stage the binaries in $ZSHRS_ASSETS"
+depends = ["toolchain:ensure", "zshrs:prepare"]
+run = '''
+set -euo pipefail
+: "${ZSHRS_ASSETS:?}"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+BUILD="${ZSHRS_BUILD:-$HOME/outputs/build/zshrs}"
+. "${XDG_STATE_HOME:-$HOME/.local/state}/zshrs-android/toolchain.env"
+
+# The recorded toolchain, and nothing else on PATH. clang links with ld.lld by default.
+export CARGO="$PREFIX/bin/cargo" RUSTC="$PREFIX/bin/rustc"
+export CC="$PREFIX/bin/clang" CXX="$PREFIX/bin/clang++" AR="$PREFIX/bin/llvm-ar"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$PREFIX/bin/clang"
+HAVE_RUST=$("$RUSTC" --version | awk '{print $2}')
+HAVE_CLANG=$("$CC" --version | head -n 1 | sed -nE 's/.*version ([0-9]+(\.[0-9]+)+).*/\1/p')
+case "$TOOLCHAIN_RUST_VERSION" in *"$HAVE_RUST"*) ;; *) echo "Error: rustc $HAVE_RUST is not $TOOLCHAIN_TAG's $TOOLCHAIN_RUST_VERSION" >&2; exit 1 ;; esac
+case "$TOOLCHAIN_CLANG_VERSION" in *"$HAVE_CLANG"*) ;; *) echo "Error: clang $HAVE_CLANG is not $TOOLCHAIN_TAG's $TOOLCHAIN_CLANG_VERSION" >&2; exit 1 ;; esac
+echo "==> Toolchain $TOOLCHAIN_TAG: rustc $HAVE_RUST, clang $HAVE_CLANG"
+
+echo "==> Compiling release binaries..."
+(
+  cd "$BUILD"
+  "$CARGO" build --release --features zd --bin zshrs --bin zd
+  "$CARGO" build --release -p zshrs-daemon --bin zshrs-daemon
+)
+
+TARGET_DIR=$("$CARGO" metadata --format-version 1 --no-deps --manifest-path "$BUILD/Cargo.toml" | jq -r .target_directory)
+BIN_DIR="$TARGET_DIR/release"
+VERSION=$("$BIN_DIR/zshrs" --version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "latest")
+TARBALL="zshrs-${VERSION}-aarch64-linux-android.tar.gz"
+
+echo "==> Staging release assets in $ZSHRS_ASSETS..."
+rm -rf "$ZSHRS_ASSETS"
+mkdir -p "$ZSHRS_ASSETS"
+cp -a "$BIN_DIR/zshrs" "$BIN_DIR/zd" "$BIN_DIR/zshrs-daemon" "$ZSHRS_ASSETS/"
+tar -czf "$ZSHRS_ASSETS/$TARBALL" -C "$BIN_DIR" zshrs zd zshrs-daemon
+(
+  cd "$ZSHRS_ASSETS"
+  sha256sum zshrs zd zshrs-daemon "$TARBALL" > SHA256SUMS-zshrs.txt
+)
+
+echo "==> Build complete. Release assets staged in $ZSHRS_ASSETS"
+'''
+
+[tasks."zshrs:publish"]
+description = "Publish the staged zshrs assets to GitHub Releases zshrs-v<version> and zshrs-latest, pruning stale assets"
+hide = true
+run = '''
+set -euo pipefail
+REPO="${ZSHRS_REPO:-fleet-47/zshrs}"
+
+if [ ! -f "$ZSHRS_ASSETS/zshrs" ]; then
+  echo "Error: zshrs binary not found in $ZSHRS_ASSETS. Run 'mise run zshrs:build' first." >&2
+  exit 1
+fi
+
+VERSION=$("$ZSHRS_ASSETS/zshrs" --version | head -n 1 | awk '{print $2}')
+test -n "$VERSION"
+TITLE="zshrs v$VERSION (aarch64-linux-android, Cortex-X3)"
+NOTES="Automated native Android Bionic release for Cortex-X3. Binaries: zshrs (shell), zd + zshrs-daemon (optional cache daemon pair)."
+
+for TAG in "zshrs-v$VERSION" zshrs-latest; do
+  echo "==> Publishing zshrs release to GitHub ($REPO @ $TAG)..."
+  if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name' | while read -r name; do
+      [ -e "$ZSHRS_ASSETS/$name" ] || gh release delete-asset "$TAG" "$name" --repo "$REPO" --yes
+    done
+    gh release upload "$TAG" "$ZSHRS_ASSETS"/* --repo "$REPO" --clobber
+  else
+    gh release create "$TAG" "$ZSHRS_ASSETS"/* --repo "$REPO" --title "$TITLE" --notes "$NOTES"
+  fi
+done
+echo "==> zshrs release published successfully."
+'''

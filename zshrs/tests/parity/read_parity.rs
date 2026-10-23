@@ -1,0 +1,359 @@
+//! `read` builtin parity tests.
+
+#![allow(non_snake_case)]
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+struct R {
+    stdout: String,
+    exit: i32,
+}
+fn run_zsh(s: &str) -> R {
+    let o = Command::new(zsh_path())
+        .args(["-fc", s])
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn run_zshrs(s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn assert_parity(s: &str) {
+    if !zsh_available() {
+        return;
+    }
+    let z = run_zsh(s);
+    let r = run_zshrs(s);
+    assert_eq!(
+        z.stdout, r.stdout,
+        "stdout divergence on:\n{s}\n--- zsh ---\n{:?}\n--- zshrs ---\n{:?}",
+        z.stdout, r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+mod basic {
+    use super::*;
+
+    #[test]
+    fn read_single_var_from_heredoc() {
+        assert_parity("read X <<< hello; echo $X");
+    }
+
+    #[test]
+    fn read_two_vars_from_heredoc() {
+        assert_parity("read X Y <<< 'one two'; echo \"$X|$Y\"");
+    }
+
+    /// With more args than vars, last var gets remaining tokens (space-joined).
+    #[test]
+    fn read_three_vars_last_captures_rest() {
+        assert_parity("read X Y Z <<< 'a b c d e'; echo \"[$X][$Y][$Z]\"");
+    }
+
+    #[test]
+    fn read_more_vars_than_input_empties_extras() {
+        assert_parity("read X Y Z <<< 'only'; echo \"[$X][$Y][$Z]\"");
+    }
+
+    #[test]
+    fn read_no_input_eof_exit_nonzero() {
+        assert_parity("read X </dev/null; echo $?");
+    }
+
+    /// `read` with no var defaults to $REPLY.
+    #[test]
+    fn read_no_var_uses_reply() {
+        assert_parity("read <<< hello; echo $REPLY");
+    }
+}
+
+mod raw_mode {
+    use super::*;
+
+    /// Without -r, backslash escapes are processed (line continuation).
+    #[test]
+    fn read_default_consumes_backslash() {
+        assert_parity(r#"read X <<< 'a\ b'; echo "[$X]""#);
+    }
+
+    /// `-r` raw mode preserves backslashes.
+    #[test]
+    fn read_r_preserves_backslash() {
+        assert_parity(r#"read -r X <<< 'a\ b'; echo "[$X]""#);
+    }
+}
+
+mod delimiter {
+    use super::*;
+
+    /// `-d X` uses X as delimiter instead of newline.
+    #[test]
+    fn read_d_custom_delimiter_colon() {
+        assert_parity(r#"read -d : X <<< 'before:after'; echo "[$X]""#);
+    }
+
+    /// `-d ''` reads ALL input (no delimiter).
+    #[test]
+    fn read_d_empty_consumes_all() {
+        assert_parity(r#"read -d '' X <<< 'a b c'; echo "[$X]""#);
+    }
+}
+
+mod count_chars {
+    use super::*;
+
+    /// `-k N` reads N characters (zsh-specific).
+    #[test]
+    fn read_k_reads_n_chars() {
+        assert_parity("read -k 3 X <<< 'abcdef'; echo $X");
+    }
+}
+
+/// `read -q` reads ONE char: "yes" (status 0, REPLY=y) iff it is exactly
+/// 'y'/'Y', else "no" (status 1, REPLY=n) — c:Src/builtin.c:6730-6742.
+mod yes_no {
+    use super::*;
+
+    #[test]
+    fn read_q_yes_lowercase() {
+        assert_parity("read -q -u0 <<<y; echo \"$?:$REPLY\"");
+    }
+
+    #[test]
+    fn read_q_yes_uppercase() {
+        assert_parity("read -q -u0 <<<Y; echo \"$?:$REPLY\"");
+    }
+
+    #[test]
+    fn read_q_no_n() {
+        assert_parity("read -q -u0 <<<n; echo \"$?:$REPLY\"");
+    }
+
+    #[test]
+    fn read_q_other_is_no() {
+        assert_parity("read -q -u0 <<<X; echo \"$?:$REPLY\"");
+    }
+
+    /// Loop over y/Y/n/N/X — the workers/42248-style status sequence.
+    #[test]
+    fn read_q_sequence() {
+        assert_parity("for c in y Y n N X; do read -q -u0 <<<$c; print $?; done");
+    }
+}
+
+mod from_pipeline {
+    use super::*;
+
+    /// `while read line; do …` loop pattern.
+    #[test]
+    fn while_read_loop_processes_each_line() {
+        assert_parity(
+            r#"
+while read line; do
+  echo "got: $line"
+done <<EOF
+one
+two
+three
+EOF
+"#,
+        );
+    }
+
+    #[test]
+    fn while_read_from_pipe() {
+        assert_parity(
+            r#"
+echo -e "a\nb\nc" | while read line; do
+  echo "X $line"
+done
+"#,
+        );
+    }
+
+    #[test]
+    fn while_read_handles_lines_with_spaces() {
+        assert_parity(
+            r#"
+while read line; do
+  echo "[$line]"
+done <<EOF
+hello world
+two   spaces
+EOF
+"#,
+        );
+    }
+}
+
+mod array_read {
+    use super::*;
+
+    /// `read -A arr` reads input into array, splitting on $IFS.
+    #[test]
+    fn read_A_into_array() {
+        assert_parity(r#"read -A arr <<< 'a b c d'; print -l "${arr[@]}""#);
+    }
+}
+
+mod with_prompt {
+    use super::*;
+
+    /// `read -s` silent mode — doesn't echo input. Use with stdin
+    /// redirect so we don't need a terminal.
+    #[test]
+    fn read_s_silent_still_reads_value() {
+        assert_parity("read -s X <<< secret; echo $X");
+    }
+}
+
+mod ifs_handling {
+    use super::*;
+
+    /// Custom IFS splits on that char.
+    #[test]
+    fn ifs_colon_splits_on_colon() {
+        assert_parity(r#"IFS=: read X Y Z <<< 'a:b:c'; echo "[$X][$Y][$Z]""#);
+    }
+
+    /// A multibyte non-whitespace IFS character always ends the current
+    /// word, even an empty one: zread feeds mbrtowc one byte at a time and
+    /// the leading bytes are stored before the character decodes, so
+    /// c:Src/builtin.c:6815 `bptr != buf` holds. The same test at the start
+    /// of the last variable (c:7009 `bptr == buf`) fails, so that variable
+    /// keeps the separator.
+    #[test]
+    fn multibyte_separator_delimits_empty_fields() {
+        assert_parity(
+            r#"IFS=" 日"; read -rA a <<< " a 日 b"; print ${#a} "[${(j:][:)a}]"
+read -rA a <<< "a日日b 日 c"; print ${#a} "[${(j:][:)a}]"
+read -r x y <<< "a 日 b"; print -r -- "[$x][$y]""#,
+        );
+    }
+
+    /// Empty IFS — no splitting, whole line goes to first var.
+    #[test]
+    fn ifs_empty_no_splitting() {
+        assert_parity(r#"IFS= read X Y <<< 'one two three'; echo "[$X][$Y]""#);
+    }
+}
+
+/// `read -A` combined with `-E`/`-e`: `-E` echoes each word (one per
+/// line) AND sets the array; `-e` echoes each word but leaves the array
+/// untouched (c:Src/builtin.c:6910-6961). The port previously always
+/// assigned and never echoed.
+mod array_with_echo {
+    use super::*;
+
+    #[test]
+    fn big_e_echoes_and_assigns() {
+        assert_parity(r#"read -AE array <<<'one two three'; print ${(j.:.)array}"#);
+    }
+
+    #[test]
+    fn small_e_echoes_without_assigning() {
+        assert_parity(r#"array=(); read -Ae array <<<'four five six'; print ${(j.:.)array}"#);
+    }
+
+    /// Plain `-A` still assigns silently (regression guard).
+    #[test]
+    fn plain_a_assigns_no_echo() {
+        assert_parity(r#"read -A array <<<'a b c'; print ${(j.:.)array}"#);
+    }
+}
+
+/// A failed assignment of the reply is a non-zero status: bin_read ends
+/// with `return errflag` (c:Src/builtin.c:7116-7121). The port returned 0,
+/// so the subshell below exited 0 in zshrs and 1 in zsh (B04read.ztst).
+mod failed_assignment_status {
+    use super::*;
+
+    #[test]
+    fn readonly_reply_makes_subshell_exit_1() {
+        assert_parity("(typeset -r foo; read foo) <<<bar 2>/dev/null; echo rc=$?");
+    }
+
+    #[test]
+    fn readonly_second_of_two_vars_makes_subshell_exit_1() {
+        assert_parity("(typeset -r y; read x y) <<<'a b' 2>/dev/null; echo rc=$?");
+    }
+}
+
+/// `-k` / `-q` at end of input. The raw-character loop sets `eof = 1` when
+/// `read(2)` returns 0 (c:Src/builtin.c:6674-6677) and returns it; `-q` turns
+/// that into status 2 (c:6737-6740, "If we timed out, status is 2"). The port
+/// dropped the flag, so `read -k2` at EOF exited 0 and `read -q` exited 1.
+mod raw_char_eof_status {
+    use super::*;
+
+    #[test]
+    fn q_at_eof_is_2_and_reply_n() {
+        assert_parity(r#"read -q -u0 mb </dev/null; print $? "[$mb]""#);
+    }
+
+    #[test]
+    fn k_at_eof_is_1() {
+        assert_parity(r#"read -k2 -u0 mb </dev/null; print $? "[$mb]""#);
+    }
+
+    #[test]
+    fn k_short_read_keeps_the_bytes_and_is_1() {
+        assert_parity(r#"print -n a | read -k2 -u0 mb; print $? "[$mb]""#);
+    }
+
+    /// Not EOF: a multibyte answer is simply "not y" (D07multibyte.ztst).
+    #[test]
+    fn q_multibyte_answer_is_1() {
+        assert_parity(r#"print -n « | read -q -u0 mb; print $? "[$mb]""#);
+    }
+}
+
+/// `read -A` into an existing associative array. `setaparam` keeps a
+/// PM_HASHED target hashed (c:Src/params.c:3341-3342) and `setarrvalue`
+/// reads the words as key/value pairs; the port reset it to a plain array.
+/// The `-A` arm then returns `c == EOF` (c:Src/builtin.c:6964), not errflag.
+mod array_into_assoc {
+    use super::*;
+
+    #[test]
+    fn pairs_land_as_keys() {
+        assert_parity(r#"typeset -A g; read -A g <<< "x 1 y 2"; typeset -p g"#);
+    }
+
+    #[test]
+    fn odd_count_errors_but_status_is_c_eq_eof() {
+        assert_parity(r#"typeset -A o; read -A o <<< "x 1 y" 2>/dev/null; print unreached"#);
+    }
+}

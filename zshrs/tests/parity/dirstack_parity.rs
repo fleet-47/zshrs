@@ -1,0 +1,266 @@
+//! pushd / popd / dirs / DIRSTACK parity tests.
+//!
+//! ZSHRS-WIDE BUG CLUSTER: the entire directory-stack subsystem is
+//! broken in `-c` mode. `pushd`, `popd`, `dirs`, `$dirstack`, AUTO_PUSHD,
+//! and tilde-stack navigation all diverge from zsh. 11 of 16 tests
+//! fail; all marked #[ignore] with this FIXME. Real-world impact:
+//! zsh power-users who navigate via pushd/popd lose that workflow.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+struct R {
+    stdout: String,
+    exit: i32,
+}
+fn run_zsh(s: &str) -> R {
+    let o = Command::new(zsh_path())
+        .args(["-fc", s])
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn run_zshrs(s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn assert_parity(s: &str) {
+    if !zsh_available() {
+        return;
+    }
+    let z = run_zsh(s);
+    let r = run_zshrs(s);
+    assert_eq!(
+        z.stdout, r.stdout,
+        "stdout divergence on:\n{s}\n--- zsh ---\n{:?}\n--- zshrs ---\n{:?}",
+        z.stdout, r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+mod pushd_basic {
+    use super::*;
+
+    #[test]
+    fn pushd_changes_pwd() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; pwd"#);
+    }
+
+    #[test]
+    fn pushd_no_args_swaps_top_two() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; pushd >/dev/null; pwd"#);
+    }
+
+    #[test]
+    fn popd_returns_to_previous() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; popd >/dev/null; pwd"#);
+    }
+}
+
+mod dirs_listing {
+    use super::*;
+
+    #[test]
+    fn dirs_shows_pwd_when_empty_stack() {
+        assert_parity(r#"cd /tmp; dirs"#);
+    }
+
+    #[test]
+    fn dirs_after_pushd_shows_two_entries() {
+        if !zsh_available() {
+            return;
+        }
+        let s = r#"cd /tmp; pushd / >/dev/null; dirs | wc -w"#;
+        let z = run_zsh(s);
+        let r = run_zshrs(s);
+        assert_eq!(z.stdout, r.stdout);
+    }
+
+    #[test]
+    fn dirs_dash_p_one_per_line() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; dirs -p | wc -l"#);
+    }
+
+    #[test]
+    fn dirs_dash_v_numbered() {
+        if !zsh_available() {
+            return;
+        }
+        let s = r#"cd /tmp; pushd / >/dev/null; dirs -v | head -2 | wc -l"#;
+        let z = run_zsh(s);
+        let r = run_zshrs(s);
+        assert_eq!(z.stdout, r.stdout);
+    }
+}
+
+mod dirstack_array {
+    use super::*;
+
+    #[test]
+    fn dirstack_after_pushd_has_entries() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; echo ${#dirstack}"#);
+    }
+
+    #[test]
+    fn dirstack_first_element_is_previous_pwd() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; echo $dirstack[1]"#);
+    }
+}
+
+mod nav_tilde {
+    use super::*;
+
+    #[test]
+    fn cd_tilde_plus_zero_is_pwd() {
+        assert_parity(r#"cd /tmp; pushd / >/dev/null; cd ~+0; pwd"#);
+    }
+}
+
+mod popd_modes {
+    use super::*;
+
+    #[test]
+    fn popd_no_args_pops_top() {
+        assert_parity(
+            r#"cd /; pushd /tmp >/dev/null; pushd /var >/dev/null; popd >/dev/null; pwd"#,
+        );
+    }
+
+    #[test]
+    fn popd_on_empty_stack_errors() {
+        assert_parity(r#"cd /tmp; popd 2>/dev/null; echo $?"#);
+    }
+}
+
+mod cd_dash {
+    use super::*;
+
+    /// `cd -` swaps to previous dir ($OLDPWD).
+    #[test]
+    fn cd_dash_swaps_to_oldpwd() {
+        assert_parity(r#"cd /; cd /tmp; cd - >/dev/null; pwd"#);
+    }
+
+    #[test]
+    fn cd_dash_twice_back_to_start() {
+        assert_parity(r#"cd /; cd /tmp; cd - >/dev/null; cd - >/dev/null; pwd"#);
+    }
+}
+
+mod auto_pushd {
+    use super::*;
+
+    #[test]
+    fn auto_pushd_makes_cd_act_like_pushd() {
+        assert_parity(r#"setopt AUTO_PUSHD; cd /; cd /tmp; dirs | wc -w"#);
+    }
+}
+
+mod with_relative_paths {
+    use super::*;
+
+    #[test]
+    fn pushd_relative_dotdot() {
+        assert_parity(r#"cd /tmp; pushd .. >/dev/null; pwd"#);
+    }
+}
+
+/// c:Src/builtin.c:1097 — CDABLE_VARS resolves the head of the argument with
+/// getnameddir(), which only accepts a parameter whose value begins with `/`
+/// (c:Src/utils.c:1257-1260). A relative value is not a named directory, so
+/// `cd` fails; the port read the parameter directly and changed into it.
+mod cdable_vars_named_directory {
+    use super::*;
+
+    #[test]
+    fn relative_value_is_not_a_cdable_var() {
+        assert_parity(
+            r#"d=$(mktemp -d); cd $d; mkdir tmpcd; setopt cdablevars; v1=tmpcd; (cd v1) 2>&1; v2=$d/tmpcd; (cd v2 && print ok ${PWD:t}); (cd v2/ && print slash ${PWD:t}); cd /; command rm -rf $d"#,
+        );
+    }
+}
+
+/// c:Src/builtin.c:908 + c:928-931 — `popd` with an argument that is not a
+/// `+N`/`-N` index pushes it as the node to remove and chdirs to the next
+/// node, the pwd bin_cd pushed at c:849. So the directory and the stack
+/// are unchanged and the status is 0; the port tried to cd into the word.
+mod popd_non_index_argument {
+    use super::*;
+
+    #[test]
+    fn popd_word_is_a_no_op() {
+        assert_parity(
+            r#"d=$(mktemp -d); cd $d; mkdir a b; pushd -q a; pushd -q ../b; popd foo 2>&1; echo $?; popd -z 2>&1; echo $?; print $#dirstack ${dirstack[1]:t} ${PWD:t}; cd /; command rm -rf $d"#,
+        );
+    }
+}
+
+/// c:Src/builtin.c:1030-1080 — cd_do_chdir remembers the first errno that
+/// was not ENOENT and reports it with `%e`, so `cd <file>` says "not a
+/// directory" and an unreadable directory "permission denied".
+mod cd_error_errno {
+    use super::*;
+
+    #[test]
+    fn cd_into_file_reports_enotdir() {
+        assert_parity(
+            r#"d=$(mktemp -d); cd $d; touch f; mkdir -p s/t; touch s/g; cd f 2>&1; echo $?; CDPATH=s cd g 2>&1; echo $?; cd /; command rm -rf $d"#,
+        );
+    }
+
+    #[test]
+    fn cd_into_unsearchable_dir_reports_eacces() {
+        assert_parity(
+            r#"d=$(mktemp -d); cd $d; mkdir x; chmod 000 x; cd x 2>&1; echo $?; chmod 755 x; cd /; command rm -rf $d"#,
+        );
+    }
+}
+
+/// c:Src/builtin.c:1190-1199 — `cd +N`/`-N` only removes the target node;
+/// rolllist is BIN_PUSHD's. With AUTO_PUSHD the old pwd (pushed at c:849)
+/// stays on top; without it `getlinknode` drops the front node, which for
+/// `cd +0` is the entry below pwd. The port rotated the stack like pushd
+/// under AUTO_PUSHD and kept everything for `cd +0`.
+mod cd_stack_index {
+    use super::*;
+
+    #[test]
+    fn cd_index_with_and_without_autopushd() {
+        for opt in ["autopushd", "noautopushd"] {
+            for n in ["+0", "+1", "+2", "-1", "-2"] {
+                assert_parity(&format!(
+                    "d=$(mktemp -d); cd $d; mkdir a b c; setopt {opt}; pushd -q a; pushd -q ../b; pushd -q ../c; cd {n}; print ${{PWD#$d}} ${{dirstack#$d}}; cd /; command rm -rf $d"
+                ));
+            }
+        }
+    }
+}

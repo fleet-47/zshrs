@@ -1,0 +1,160 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -168,7 +168,7 @@ regex = "1.11"
+ # handle and falls back to a backtracking VM for the rest.
+ fancy-regex = "0.18"
+ glob = "0.3"
+-libc = "0.2"
++libc = { package = "libc-android", path = "libc-shim" }
+ indexmap = "2"
+ parking_lot = "0.12"
+ thiserror = "2"
+--- /dev/null
++++ b/libc-shim/Cargo.toml
+@@ -0,0 +1,9 @@
++[package]
++name = "libc-android"
++version = "0.2.191"
++edition = "2024"
++publish = false
++description = "Android bionic bindings missing from libc, with real libc re-exports"
++
++[dependencies]
++libc_real = { package = "libc", version = "0.2.191" }
+--- /dev/null
++++ b/libc-shim/src/lib.rs
+@@ -0,0 +1,134 @@
++//! The `libc` crate plus the bionic declarations it omits for Android.
++//! zshrs depends on this crate under the key `libc`.
++#![allow(non_camel_case_types)]
++
++pub use libc_real::*;
++
++#[cfg(target_os = "android")]
++mod android {
++    use libc_real::*;
++
++    /// `int` in bionic `<nl_types.h>`.
++    pub type nl_item = c_int;
++
++    /// The bionic LP64 `utmpx` and `utmp` layouts match.
++    pub type utmpx = libc_real::utmp;
++
++    pub const CODESET: nl_item = 1;
++    pub const D_T_FMT: nl_item = 2;
++    pub const D_FMT: nl_item = 3;
++    pub const T_FMT: nl_item = 4;
++    pub const T_FMT_AMPM: nl_item = 5;
++    pub const AM_STR: nl_item = 6;
++    pub const PM_STR: nl_item = 7;
++    pub const DAY_1: nl_item = 8;
++    pub const DAY_2: nl_item = 9;
++    pub const DAY_3: nl_item = 10;
++    pub const DAY_4: nl_item = 11;
++    pub const DAY_5: nl_item = 12;
++    pub const DAY_6: nl_item = 13;
++    pub const DAY_7: nl_item = 14;
++    pub const ABDAY_1: nl_item = 15;
++    pub const ABDAY_2: nl_item = 16;
++    pub const ABDAY_3: nl_item = 17;
++    pub const ABDAY_4: nl_item = 18;
++    pub const ABDAY_5: nl_item = 19;
++    pub const ABDAY_6: nl_item = 20;
++    pub const ABDAY_7: nl_item = 21;
++    pub const MON_1: nl_item = 22;
++    pub const MON_2: nl_item = 23;
++    pub const MON_3: nl_item = 24;
++    pub const MON_4: nl_item = 25;
++    pub const MON_5: nl_item = 26;
++    pub const MON_6: nl_item = 27;
++    pub const MON_7: nl_item = 28;
++    pub const MON_8: nl_item = 29;
++    pub const MON_9: nl_item = 30;
++    pub const MON_10: nl_item = 31;
++    pub const MON_11: nl_item = 32;
++    pub const MON_12: nl_item = 33;
++    pub const ABMON_1: nl_item = 34;
++    pub const ABMON_2: nl_item = 35;
++    pub const ABMON_3: nl_item = 36;
++    pub const ABMON_4: nl_item = 37;
++    pub const ABMON_5: nl_item = 38;
++    pub const ABMON_6: nl_item = 39;
++    pub const ABMON_7: nl_item = 40;
++    pub const ABMON_8: nl_item = 41;
++    pub const ABMON_9: nl_item = 42;
++    pub const ABMON_10: nl_item = 43;
++    pub const ABMON_11: nl_item = 44;
++    pub const ABMON_12: nl_item = 45;
++    pub const ERA: nl_item = 46;
++    pub const ERA_D_FMT: nl_item = 47;
++    pub const ERA_D_T_FMT: nl_item = 48;
++    pub const ERA_T_FMT: nl_item = 49;
++    pub const ALT_DIGITS: nl_item = 50;
++    pub const RADIXCHAR: nl_item = 51;
++    pub const THOUSEP: nl_item = 52;
++    pub const YESEXPR: nl_item = 53;
++    pub const NOEXPR: nl_item = 54;
++    pub const CRNCYSTR: nl_item = 55;
++
++    /// bionic defines `AT_EACCESS` as `0` in `<linux/fcntl.h>`.
++    pub const AT_EACCESS: c_int = 0;
++    /// BSD tab-expansion flag; equals `XTABS`/`TAB3` on Linux-family systems.
++    pub const OXTABS: tcflag_t = libc_real::TAB3;
++    /// bionic `<utmp.h>` record type for a terminated process.
++    pub const DEAD_PROCESS: c_short = 8;
++    /// bionic `<asm-generic/ioctls.h>` detach-controlling-terminal request.
++    pub const TIOCNOTTY: c_int = 0x5422;
++
++    unsafe extern "C" {
++        pub fn nl_langinfo(item: nl_item) -> *mut c_char;
++        pub fn getloadavg(loadavg: *mut c_double, nelem: c_int) -> c_int;
++
++        /// bionic's errno accessor is `__errno()`.
++        #[link_name = "__errno"]
++        pub fn __errno_location() -> *mut c_int;
++        #[link_name = "__errno"]
++        pub fn __error() -> *mut c_int;
++
++        /// bionic ships the `utmp` entry points; bind the `utmpx` spellings.
++        #[link_name = "getutent"]
++        pub fn getutxent() -> *mut utmpx;
++        #[link_name = "setutent"]
++        pub fn setutxent();
++        #[link_name = "endutent"]
++        pub fn endutxent();
++        #[link_name = "endutent"]
++        pub fn endutent();
++
++        pub fn rand() -> c_int;
++        pub fn srand(seed: ::std::os::raw::c_uint);
++        pub fn seed48(seed16v: *mut c_ushort) -> *mut c_ushort;
++        pub fn erand48(xsubi: *mut c_ushort) -> c_double;
++
++        /// POSIX spawn family — bionic exports all of these.
++        pub fn posix_spawn(
++            pid: *mut libc_real::pid_t,
++            path: *const c_char,
++            file_actions: *const libc_real::posix_spawn_file_actions_t,
++            attrp: *const libc_real::posix_spawnattr_t,
++            argv: *const *mut c_char,
++            envp: *const *mut c_char,
++        ) -> c_int;
++        pub fn posix_spawnattr_init(attr: *mut libc_real::posix_spawnattr_t) -> c_int;
++        pub fn posix_spawnattr_destroy(attr: *mut libc_real::posix_spawnattr_t) -> c_int;
++        pub fn posix_spawnattr_setsigmask(
++            attr: *mut libc_real::posix_spawnattr_t,
++            sigmask: *const libc_real::sigset_t,
++        ) -> c_int;
++        pub fn posix_spawnattr_setsigdefault(
++            attr: *mut libc_real::posix_spawnattr_t,
++            sigdefault: *const libc_real::sigset_t,
++        ) -> c_int;
++        pub fn posix_spawnattr_setflags(
++            attr: *mut libc_real::posix_spawnattr_t,
++            flags: c_short,
++        ) -> c_int;
++    }
++}
++
++#[cfg(target_os = "android")]
++pub use android::*;

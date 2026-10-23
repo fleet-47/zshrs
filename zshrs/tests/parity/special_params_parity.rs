@@ -1,0 +1,559 @@
+//! Special parameter parity tests — $?, $$, $LINENO, $SECONDS, $RANDOM,
+//! $UID, $PPID, $SHLVL, $PWD, etc.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+struct R {
+    stdout: String,
+    exit: i32,
+}
+fn run_zsh(s: &str) -> R {
+    let o = Command::new(zsh_path())
+        .args(["-fc", s])
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn run_zshrs(s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn assert_parity(s: &str) {
+    if !zsh_available() {
+        return;
+    }
+    let z = run_zsh(s);
+    let r = run_zshrs(s);
+    assert_eq!(
+        z.stdout, r.stdout,
+        "stdout divergence on:\n{s}\n--- zsh ---\n{:?}\n--- zshrs ---\n{:?}",
+        z.stdout, r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+mod exit_status {
+    use super::*;
+
+    #[test]
+    fn dollar_question_after_true() {
+        assert_parity("true; echo $?");
+    }
+
+    #[test]
+    fn dollar_question_after_false() {
+        assert_parity("false; echo $?");
+    }
+
+    #[test]
+    fn dollar_question_after_subshell_exit() {
+        assert_parity("(exit 42); echo $?");
+    }
+
+    #[test]
+    fn dollar_question_after_pipeline() {
+        // By default, $? = exit status of last command in pipeline.
+        assert_parity("false | true; echo $?");
+    }
+
+    #[test]
+    fn dollar_question_after_grouped_commands() {
+        assert_parity("{ false; }; echo $?");
+    }
+}
+
+mod positional_count {
+    use super::*;
+
+    #[test]
+    fn dollar_hash_no_args() {
+        assert_parity("echo $#");
+    }
+
+    #[test]
+    fn dollar_hash_after_set() {
+        assert_parity("set -- a b c d e; echo $#");
+    }
+
+    #[test]
+    fn dollar_hash_in_function() {
+        assert_parity("f() { echo $#; }; f one two three");
+    }
+
+    #[test]
+    fn dollar_hash_after_shift() {
+        assert_parity("set -- a b c; shift; echo $#");
+    }
+}
+
+mod pid {
+    use super::*;
+
+    /// `$$` is positive integer, stable within shell.
+    #[test]
+    fn dollar_dollar_is_positive_integer() {
+        if !zsh_available() {
+            return;
+        }
+        let z = run_zsh("echo $$");
+        let r = run_zshrs("echo $$");
+        // Both must be a parseable positive integer; values DIFFER
+        // since they're separate processes.
+        let z_pid: u32 = z.stdout.trim().parse().expect("zsh $$ parseable");
+        let r_pid: u32 = r.stdout.trim().parse().expect("zshrs $$ parseable");
+        assert!(z_pid > 0);
+        assert!(r_pid > 0);
+    }
+
+    /// $$ is stable within the same shell invocation.
+    #[test]
+    fn dollar_dollar_stable_within_shell() {
+        assert_parity(r#"A=$$; B=$$; [[ "$A" == "$B" ]]; echo $?"#);
+    }
+
+    /// Subshell sees parent $$ (not its own pid).
+    /// zsh special: $$ stays parent's pid in subshell; $sysparams[pid] is current.
+    #[test]
+    fn dollar_dollar_unchanged_in_subshell() {
+        assert_parity(r#"A=$$; B=$(echo $$); [[ "$A" == "$B" ]]; echo $?"#);
+    }
+}
+
+mod lineno {
+    use super::*;
+
+    /// $LINENO increments per logical line in a script.
+    #[test]
+    fn lineno_increments_across_lines() {
+        if !zsh_available() {
+            return;
+        }
+        // Use 3-line script; the third echo should report a higher
+        // LINENO than the first.
+        let z = run_zsh(
+            r#"
+echo $LINENO
+echo $LINENO
+echo $LINENO
+"#,
+        );
+        let r = run_zshrs(
+            r#"
+echo $LINENO
+echo $LINENO
+echo $LINENO
+"#,
+        );
+        // Pin: line numbers strictly increasing.
+        let z_nums: Vec<i32> = z.stdout.lines().filter_map(|l| l.parse().ok()).collect();
+        let r_nums: Vec<i32> = r.stdout.lines().filter_map(|l| l.parse().ok()).collect();
+        assert_eq!(z_nums.len(), 3, "zsh 3 echos");
+        assert_eq!(r_nums.len(), 3, "zshrs 3 echos");
+        assert!(z_nums[1] > z_nums[0]);
+        assert!(z_nums[2] > z_nums[1]);
+        assert!(r_nums[1] > r_nums[0]);
+        assert!(r_nums[2] > r_nums[1]);
+    }
+}
+
+mod random_var {
+    use super::*;
+
+    /// $RANDOM is a positive integer in 0..32768 (some shells) or
+    /// larger ranges. Just pin parseable + positive.
+    #[test]
+    fn random_is_positive_integer() {
+        if !zsh_available() {
+            return;
+        }
+        let z = run_zsh("echo $RANDOM");
+        let r = run_zshrs("echo $RANDOM");
+        let _: u32 = z.stdout.trim().parse().expect("zsh $RANDOM");
+        let _: u32 = r.stdout.trim().parse().expect("zshrs $RANDOM");
+    }
+
+    /// Consecutive reads usually differ (probabilistically).
+    /// Not strict — pin that two reads of $RANDOM produce SOMETHING.
+    #[test]
+    fn random_two_reads_both_succeed() {
+        assert_parity(r#"R1=$RANDOM; R2=$RANDOM; [[ -n "$R1" ]] && [[ -n "$R2" ]]; echo $?"#);
+    }
+}
+
+mod seconds_var {
+    use super::*;
+
+    /// $SECONDS is wall-clock seconds since shell start. Pin >= 0.
+    #[test]
+    fn seconds_non_negative() {
+        assert_parity(r#"[[ $SECONDS -ge 0 ]]; echo $?"#);
+    }
+}
+
+mod uid_ppid {
+    use super::*;
+
+    /// $UID matches `id -u`.
+    #[test]
+    fn uid_matches_id_u() {
+        if !zsh_available() {
+            return;
+        }
+        let z = run_zsh("echo $UID");
+        let r = run_zshrs("echo $UID");
+        let z_uid: u32 = z.stdout.trim().parse().expect("zsh $UID");
+        let r_uid: u32 = r.stdout.trim().parse().expect("zshrs $UID");
+        assert_eq!(z_uid, r_uid, "both shells must report same UID");
+    }
+
+    /// $EUID equals $UID for non-suid shells.
+    #[test]
+    fn euid_equals_uid_for_normal_invocation() {
+        assert_parity(r#"[[ "$UID" == "$EUID" ]]; echo $?"#);
+    }
+
+    /// $PPID is positive.
+    #[test]
+    fn ppid_positive() {
+        assert_parity(r#"[[ $PPID -gt 0 ]]; echo $?"#);
+    }
+}
+
+mod shlvl {
+    use super::*;
+
+    /// $SHLVL increments in subshell.
+    #[test]
+    fn shlvl_value_present() {
+        // Each shell increments differently; pin presence.
+        assert_parity(r#"[[ -n "$SHLVL" ]]; echo $?"#);
+    }
+
+    /// c:Src/params.c:971-974 — `addenv(pm, buf)` runs UNCONDITIONALLY on
+    /// SHLVL right after the environment-import loop ("shlvl value in
+    /// environment needs updating unconditionally"), and `addenv` sets
+    /// `pm->node.flags |= PM_EXPORTED` (c:Src/params.c:5482-5484). The
+    /// parameter is therefore exported even when nothing in the inherited
+    /// environment named it.
+    ///
+    /// Probed through a scrubbed re-exec of the shell under test rather than
+    /// `${(t)SHLVL}` in place: the ambient environment of a `cargo test` run
+    /// already carries SHLVL, the import loop marks anything it imports
+    /// exported (c:Src/params.c:937), and that alone would mask the missing
+    /// `addenv`. `env -i` removes the import so only c:974 can set the flag.
+    #[test]
+    fn shlvl_is_exported() {
+        assert_parity(r#"/usr/bin/env -i "$ZSH_ARGZERO" -f -c 'print -r -- ${(t)SHLVL}'"#);
+    }
+
+    /// The value `addenv` publishes is the INCREMENTED one (c:972 —
+    /// `sprintf(buf, "%d", (int)++shlvl)`), so a FORKED child reads back
+    /// exactly the number the shell itself reports. That is what makes
+    /// $SHLVL count nesting depth: without it every nested shell re-reads
+    /// the grandparent's value and the count never advances.
+    ///
+    /// `/usr/bin/env` rather than `printenv`, because zshrs ships a
+    /// `printenv` builtin that answers from the parameter table and would
+    /// hide the very gap under test.
+    #[test]
+    fn shlvl_reaches_a_forked_child() {
+        assert_parity(r#"[[ $(/usr/bin/env | grep "^SHLVL=") == "SHLVL=$SHLVL" ]]; echo $?"#);
+    }
+}
+
+mod pwd {
+    use super::*;
+
+    #[test]
+    fn pwd_matches_pwd_builtin() {
+        assert_parity(r#"[[ "$PWD" == "$(pwd)" ]]; echo $?"#);
+    }
+
+    #[test]
+    fn oldpwd_after_cd() {
+        assert_parity(r#"START=$PWD; cd /tmp; [[ "$OLDPWD" == "$START" ]]; echo $?"#);
+    }
+}
+
+mod hostname {
+    use super::*;
+
+    /// $HOST = hostname.
+    #[test]
+    fn host_non_empty() {
+        assert_parity(r#"[[ -n "$HOST" ]]; echo $?"#);
+    }
+}
+
+mod pipestatus {
+    use super::*;
+
+    /// $pipestatus[N] gives exit status of Nth pipeline stage.
+    #[test]
+    fn pipestatus_array_after_pipeline() {
+        assert_parity(r#"false | true; echo "${pipestatus[1]} ${pipestatus[2]}""#);
+    }
+
+    #[test]
+    fn pipestatus_array_three_stages() {
+        assert_parity(r#"true | false | true; echo "${pipestatus[@]}""#);
+    }
+}
+
+mod plus_table_flags {
+    use super::*;
+
+    #[test]
+    fn plus_options() {
+        assert_parity(r#"print -r ${+options}"#);
+    }
+
+    #[test]
+    fn plus_parameters() {
+        assert_parity(r#"print -r ${+parameters}"#);
+    }
+
+    #[test]
+    fn plus_aliases() {
+        assert_parity(r#"print -r ${+aliases}"#);
+    }
+
+    #[test]
+    fn plus_builtins() {
+        assert_parity(r#"print -r ${+builtins}"#);
+    }
+
+    #[test]
+    fn plus_pipestatus() {
+        assert_parity(r#"print -r ${+pipestatus}"#);
+    }
+
+    #[test]
+    fn plus_dirstack() {
+        assert_parity(r#"print -r ${+dirstack}"#);
+    }
+}
+
+/// A tied colon/array special pair (`FPATH`/`fpath`, `PATH`/`path`, …) that is
+/// localized TWICE at the same `locallevel` — once through each half.
+///
+/// `Src/builtin.c:2394-2411` (`typeset_single`, `newspecial != NS_NONE` arm)
+/// special-cases exactly this: when `pm->ename`'s node is already at
+/// `locallevel`, the saved copy is stamped `PM_NORESTORE` instead of receiving
+/// a `copyparam` snapshot, which in turn makes `c:2608-2609` skip the
+/// "re-initialise the special parameter to empty" step. The second declaration
+/// therefore KEEPS the value the first one installed, and on scope exit only
+/// the first half's restore fires (`Src/params.c:5928`) — the tie propagates it
+/// to the other half.
+///
+/// zinit's `autoload` shadow (`:zinit-tmp-subst-autoload`) is built on this
+/// exact idiom — `local +h FPATH=…` then `local +h -a fpath` then
+/// `fpath=( $PLUGIN_DIR $fpath )` — so getting it wrong empties `$fpath` for
+/// the duration of every turbo-mode `autoload`, and `autoload +X NAME` then
+/// finds no definition file and leaves the stub in `$functions[NAME]`.
+mod tied_pair_double_local {
+    use super::*;
+
+    // Every script starts from a known `fpath`: its size at startup is the shell's
+    // own (the oracle seeds 3 entries on a Linux runner, zshrs 4), and what these
+    // tests pin is how the tied pair behaves relative to that start.
+
+    #[test]
+    fn array_half_after_scalar_half_keeps_value() {
+        assert_parity(
+            "fpath=(/p1 /p2 /p3); f() { local +h FPATH=/aa:$FPATH; local +h -a fpath; print ${#fpath} $fpath[1] }; \
+             print $#fpath; f; print $#fpath",
+        );
+    }
+
+    #[test]
+    fn array_half_alone_still_empties() {
+        // No prior localization of the scalar half → no PM_NORESTORE → C's
+        // c:2626 `pm->gsu.a->setfn(pm, mkarray(NULL))` runs and the local
+        // starts empty. This is the arm the fix must NOT disturb.
+        assert_parity("fpath=(/p1 /p2 /p3); f() { local +h -a fpath; print ${#fpath} }; f; print $#fpath");
+    }
+
+    #[test]
+    fn path_pair_matches_fpath_pair() {
+        assert_parity(
+            "f() { local +h PATH=/zz:$PATH; local +h -a path; print ${#path} $path[1] }; \
+             print $#path; f; print $#path",
+        );
+    }
+
+    #[test]
+    fn prepending_through_the_second_local_survives() {
+        // The zinit shape verbatim: build a new fpath on top of the value the
+        // scalar half installed, then check the global is intact afterwards.
+        assert_parity(
+            "fpath=(/p1 /p2 /p3); f() { local +h FPATH=/aa:$FPATH; local +h -a fpath; fpath=(/q $fpath); \
+             print ${#fpath} $fpath[1] $fpath[2] }; print $#fpath; f; print $#fpath",
+        );
+    }
+
+    #[test]
+    fn scalar_half_after_array_half() {
+        // Reverse order: the array half is localized first, so when the scalar
+        // half is declared its `ename` peer IS at locallevel — same c:2394 arm,
+        // opposite direction.
+        assert_parity(
+            "fpath=(/p1 /p2 /p3); f() { local +h -a fpath; local +h FPATH=/aa:$FPATH; print ${#fpath} $fpath[1] }; \
+             print $#fpath; f; print $#fpath",
+        );
+    }
+}
+
+mod prompt_alias_group {
+    use super::*;
+
+    /// `PS1` / `PROMPT` / `prompt` are ONE parameter in zsh — `IPDEF7("PS1",
+    /// &prompt)` and `IPDEF7("PROMPT", &prompt)` (Src/params.c:417-422) share
+    /// the backing pointer. zshrs keeps separate paramtab entries and mirrors
+    /// the write, and the mirror used to copy the value handed to
+    /// `assignsparam` — which under `ASSPM_AUGMENT` (`NAME+=frag`) is only the
+    /// APPENDED FRAGMENT. powerlevel10k assembles `PROMPT` with `+=`, so `$PS1`
+    /// ended up holding just the last chunk; since `ingetc` prompts with `PS1`
+    /// (Src/input.c:379-382), only p10k's final line was ever drawn.
+    #[test]
+    fn append_to_prompt_is_visible_through_ps1() {
+        assert_parity(r#"PROMPT=abc; PROMPT+=X; print "[$PS1][$PROMPT][$prompt]""#);
+    }
+
+    /// Same in the other direction — the group has no primary member.
+    #[test]
+    fn append_to_ps1_is_visible_through_prompt() {
+        assert_parity(r#"PS1=q; PS1+=R; print "[$PS1][$PROMPT]""#);
+    }
+
+    /// Repeated appends accumulate, the way a prompt theme builds one.
+    #[test]
+    fn repeated_appends_accumulate_through_the_alias() {
+        assert_parity(
+            r#"PROMPT=; PROMPT+=one; PROMPT+=two; PROMPT+=three; print "[$PS1]""#,
+        );
+    }
+
+    /// PS2/PROMPT2 share `&prompt2` (Src/params.c:419).
+    #[test]
+    fn append_to_prompt2_is_visible_through_ps2() {
+        assert_parity(r#"PS2=a; PROMPT2+=b; print "[$PS2][$PROMPT2]""#);
+    }
+
+    /// A plain assignment must still overwrite the whole group, not append.
+    #[test]
+    fn plain_assignment_still_replaces_through_the_alias() {
+        assert_parity(r#"PROMPT=abc; PROMPT+=X; PS1=fresh; print "[$PS1][$PROMPT][$prompt]""#);
+    }
+}
+
+/// c:Src/builtin.c:2608-2632 — a local that keeps a special's struct and is
+/// declared WITHOUT a value is re-initialised to empty through the special's
+/// own setfn, unless the saved node is PM_NORESTORE or PM_READONLY. The outer
+/// value comes back when the scope ends.
+mod local_special_starts_empty {
+    use super::*;
+
+    /// Tied array half: zsh `F=[] 0`, zshrs showed the outer `/g1:/g2`.
+    #[test]
+    fn tied_array_half_empties_the_scalar_half() {
+        assert_parity(r#"f(){ local +h -a fpath; print "F=[$FPATH] ${#FPATH}"; }; FPATH=/g1:/g2; f; print "[$FPATH]""#);
+    }
+
+    /// `local -a path` (no +h) is the same arm.
+    #[test]
+    fn local_path_empties_path_scalar() {
+        assert_parity(r#"f(){ local -a path; print "P=[$PATH]"; }; PATH=/g1:/g2; f; print "[$PATH]""#);
+    }
+
+    /// Scalar half of a tied pair.
+    #[test]
+    fn tied_scalar_half_empties_the_array_half() {
+        assert_parity(r#"f(){ local +h CDPATH; print "[$cdpath] [$CDPATH]" }; cdpath=(/a /b); f; print $CDPATH"#);
+    }
+
+    /// Plain scalar specials.
+    #[test]
+    fn scalar_specials_start_empty() {
+        assert_parity(r#"f(){ local +h IFS WORDCHARS HOME TERM; print -r "[$IFS][$WORDCHARS][$HOME][$TERM]" }; TERM=vt100; f; print ${#IFS} ${#WORDCHARS} ${#HOME} $TERM"#);
+    }
+
+    /// `histchars` is set to "" through histcharssetfn, which in C gives
+    /// three NUL history characters (`len ? x[0] : '\0'`), so it reads
+    /// empty. The port treats "" as C's NULL and resets `!^#`.
+    #[test]
+    fn histchars_starts_empty() {
+        assert_parity(r#"f(){ local +h histchars; print -r "[$histchars]" }; f; print $histchars"#);
+    }
+
+    /// Integer special.
+    #[test]
+    fn integer_specials_start_at_zero() {
+        assert_parity(r#"f(){ local +h TRY_BLOCK_ERROR; print "[$TRY_BLOCK_ERROR]" }; f"#);
+    }
+
+    /// `COLUMNS` is zeroed through zlevarsetfn; C's adjustwinsize returns
+    /// early without a terminal, so it stays 0. The port re-derives 80.
+    #[test]
+    fn columns_starts_at_zero() {
+        assert_parity(r#"f(){ local +h COLUMNS; print "[$COLUMNS]" }; COLUMNS=77; f; print $COLUMNS"#);
+    }
+
+    /// `argv` inside a nested function.
+    #[test]
+    fn argv_starts_empty() {
+        assert_parity(r#"f(){ g(){ local +h -a argv; print "in [$argv] $#" }; g x y; print "f $# $*" }; f a b"#);
+    }
+
+    /// Magic hash: the alias class is flushed inside the scope and restored.
+    #[test]
+    fn alias_hash_starts_empty_and_comes_back() {
+        assert_parity(r#"zmodload zsh/parameter; alias a1=b; g(){ local +h -A aliases; print "[${(k)aliases}]"; alias | wc -l }; g; alias a1"#);
+    }
+
+    /// Controls: read-only specials keep their value, a value given on the
+    /// declaration wins, and a function table is not flushed.
+    #[test]
+    fn readonly_and_valued_declarations_unchanged() {
+        assert_parity(r#"zmodload zsh/parameter; x(){ :; }; f(){ local +h status ARGC; local +h IFS=:; local +h -A functions builtins; print "[$status][$ARGC][$IFS][${(k)functions}][${+builtins[print]}]" }; f a; print ${#IFS}"#);
+    }
+}
+
+/// c:Src/params.c:4624 — `zwarn("failed to change group ID: %e", errno)`:
+/// `%e` is strerror with a lowercased first letter (c:Src/utils.c:366), not
+/// Rust's `io::Error` Display with its ` (os error N)` suffix. As root the
+/// assignment succeeds in both shells and prints nothing.
+#[test]
+fn username_setfn_failure_uses_zsh_errno_text() {
+    assert_parity(r#"USERNAME=root 2>&1; echo rc=$?"#);
+}

@@ -1,0 +1,1 @@
+/data/data/com.termux/files/home/Voyager/engineering/termux-bionicc-aarch64/zshrs-android-overlay/zshrs-android/runner/target/release/zshrs-android: /data/data/com.termux/files/home/Voyager/engineering/termux-bionicc-aarch64/zshrs-android-overlay/zshrs-android/runner/src/main.rs

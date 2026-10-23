@@ -1,0 +1,337 @@
+[package]
+name = "zshrs"
+version.workspace = true
+edition = "2021"
+description = "The first JIT-compiled Unix shell — bytecode VM, Cranelift JIT, worker pool, AOP intercept, Rkyv caching"
+license = "MIT"
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
+repository = "https://github.com/MenkeTechnologies/zshrs"
+homepage = "https://menketechnologies.github.io/zshrs/"
+documentation = "https://docs.rs/zshrs"
+readme = "README.md"
+keywords = ["shell", "zsh", "bytecode", "terminal", "unix"]
+categories = ["command-line-utilities"]
+# Keep the published crate lean: ship `src/`, `bins/`, the workspace member
+# crates, README/LICENSE — nothing else. Everything below stays in git for
+# local/CI use but is omitted from `cargo package` / the crates.io tarball.
+# Mirrors strykelang's exclude set.
+#
+# NOTE: exclude entries name directories that exist in the repo. A glob such as
+# the old `**/*parity*` also matched `bins/parity-fuzz.rs`, the source of the
+# declared `[[bin]] parity-fuzz` target, and would drop a build input from the
+# tarball.
+exclude = [
+    "/.github/",
+    "/tests/",
+    "/test/",
+    "/test_data/",
+    "/test_corpus/",
+    "/examples/",
+    # docs/ stays out of the PUBLISHED crate except the reference page
+    # `zshrs --docs` compiles in with include_str! (src/extensions/docs_book.rs).
+    "/docs/*",
+    "!/docs/reference.html",
+    "/editors/",
+    "/scripts/",
+    "/bench/",
+    # NOT "/vendor/": build.rs packs vendor/zsh into the binary (the
+    # function tree, man/info/help pages, newuser) and hard-errors when a
+    # tree is missing, so excluding it shipped a crate that cannot build.
+    # vendor/fish is porting reference only -- no build step reads it.
+    "/vendor/fish/",
+    # The Texinfo manual, dropped from the PUBLISHED crate only -- it is
+    # 0.44 MiB of the tarball and the crate is against crates.io's 10 MiB
+    # ceiling. `zshall.1` carries the same content, and a git or Homebrew
+    # build still bundles it. build.rs treats this tree as optional.
+    "/vendor/zsh/info/",
+    # zsh's own man pages (zsh.1, zshall.1, zshmisc.1, ... 17 files),
+    # dropped from the PUBLISHED crate only -- 0.44 MiB compressed, and
+    # 0.12.60 packaged at 10.13 MiB against the same 10 MiB ceiling with
+    # every other vendored tree marked required in build.rs. zshrs's OWN
+    # pages live in `/man/man1/` and still ship, so `man zshrs` works on a
+    # crates.io install; `man zsh` needs a git or Homebrew build (both
+    # bundle this tree unchanged) or a zsh installation. build.rs treats
+    # this tree as optional -- restore it to required if crates.io grants
+    # a size-limit increase.
+    "/vendor/zsh/man1/",
+    # The differential fuzzer's source, dropped from the PUBLISHED crate
+    # only -- 0.57 MiB of it, and the crate is against crates.io's 10 MiB
+    # ceiling again (0.12.58 shipped at 9.99 MiB). It is a development
+    # tool behind `required-features = ["parity-fuzz"]`; nobody installing
+    # zshrs runs it, and a git or Homebrew build still has it. Cargo warns
+    # and ignores a target whose source is excluded, the same way it
+    # already does for `tests/ztst_runner.rs`.
+    "/bins/parity-fuzz.rs",
+    "/zshrs_dump.*",
+    "/tmux",
+    "/zterm_columns",
+    "/.module_audit.md",
+    "/TODO.md",
+    # zsh's upstream completion sources kept beside their Rust ports under
+    # src/compsys/ported (991 files, `_git`, `_gcc`, `compinstall`, ...),
+    # dropped from the PUBLISHED crate only -- 0.12.65 packaged at
+    # 10.10 MiB against crates.io's 10 MiB ceiling. They are porting
+    # reference: no build step and no `include_str!` reads them (the
+    # package verify build succeeds without them), and the function tree
+    # the binary bundles comes from vendor/zsh/functions. Only the `.rs`
+    # ports and their directories are re-included. A git or Homebrew build
+    # still has them.
+    "/src/compsys/ported/**/*",
+    "!/src/compsys/ported/**/*.rs",
+    "!/src/compsys/ported/**/*/",
+]
+
+
+[workspace.package]
+version = "0.13.55"
+edition = "2021"
+license = "MIT"
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
+
+
+[lib]
+name = "zsh"
+path = "src/lib.rs"
+# rlib only. `libzsh.a` — the archive `zbuild --native` links AOT-compiled
+# objects (fusevm::aot) against — is emitted by the `runtime/` workspace member
+# instead, and still lands at the same `target/<profile>/libzsh.a` path.
+#
+# It used to be a second crate-type here, which meant every `cargo install
+# zshrs` built a 170 MB archive and then threw it away: `cargo install` copies
+# binaries into `~/.cargo/bin/` and nothing else, and `runtime_staticlib()`
+# (src/extensions/aot.rs:397) looks for the archive beside the running
+# executable, so it was unreachable post-install anyway.
+crate-type = ["lib"]
+
+[[bin]]
+name = "zshrs"
+path = "bins/zshrs.rs"
+
+# Plugin-Framework-Agnostic State-Modification Recorder. See docs/RECORDER.md.
+# Cargo refuses to build this bin without --features recorder, which is the
+# mechanism that keeps every recorder symbol out of the default `zshrs`
+# binary (Rule 1: zero recorder code in default build).
+[[bin]]
+name = "zshrs-recorder"
+path = "bins/zshrs-recorder.rs"
+required-features = ["recorder"]
+
+# `zd` — standalone HTTP client for zshrs-daemon (see docs/DAEMON_AS_SERVICE.md).
+# Same separation principle as zshrs-recorder: NOT a `zshrs --client` mode;
+# a separate binary so non-zshrs shells can `cargo install --bin zd` without
+# pulling in the shell. required-features gate keeps ureq+base64 out of the
+# default zshrs build.
+[[bin]]
+name = "zd"
+path = "bins/zd.rs"
+required-features = ["zd"]
+
+# Folded-in compsys binary (compsys was merged into this crate;
+# see commit "fold compsys into main"). `compsys-test` and `menu-demo`
+# were deleted alongside the dup builtin modules they exercised.
+[[bin]]
+name = "bench-autoload"
+path = "bins/bench-autoload.rs"
+
+# Differential parity fuzzer: generates thousands of grammar-driven shell
+# snippets and diffs `zsh -fc` vs `zshrs --zsh -f -c` to surface parity gaps in
+# bulk. Feature-gated so `rand`-driven fuzz code stays out of the default build.
+#   cargo build --features parity-fuzz --bin parity-fuzz
+#   ./target/debug/parity-fuzz --count 5000
+[[bin]]
+name = "parity-fuzz"
+path = "bins/parity-fuzz.rs"
+required-features = ["parity-fuzz"]
+
+# Aggregated parity suite — every tests/parity/*_parity.rs is a module of
+# tests/parity/main.rs, so the whole suite builds/runs as one binary:
+#   cargo test --test parity            (run all)
+#   cargo test --test parity zpwr       (filter by module)
+[[test]]
+name = "parity"
+path = "tests/parity/main.rs"
+
+[dependencies]
+ctrlc = "3"
+zshrs-daemon = { workspace = true, optional = true }
+# Native (Rust) plugin host: `zmodload -R <dylib>` dlopen's third-party
+# cdylibs through the stable C ABI in the `znative` crate. libloading
+# is the foundational Rust dlopen wrapper (cross-platform dlopen/dlsym).
+# See src/extensions/plugin_host.rs and docs/PLUGINS.md.
+libloading = "0.8"
+znative = { workspace = true }
+fusevm = { version = "0.26.7", features = ["jit", "jit-disk-cache", "aot", "ffi", "rkyv-archive"] }
+regex = "1.11"
+# zsh/pcre needs PCRE features the `regex` crate cannot express — zero-width
+# lookahead/lookbehind and backreferences (Src/Modules/pcre.c wraps libpcre2,
+# which has them). fancy-regex keeps the `regex` engine for patterns it can
+# handle and falls back to a backtracking VM for the rest.
+fancy-regex = "0.18"
+glob = "0.3"
+libc = "0.2"
+indexmap = "2"
+parking_lot = "0.12"
+thiserror = "2"
+nix = { version = "0.29", features = ["signal", "process", "term", "fs"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+regex-lite = "0.1"
+dirs = "5"
+bitflags = "2"
+tempfile = "3"
+chrono = "0.4"
+os_pipe = "1"
+hostname = "0.4"
+libm = "0.2"
+rand = "0.8"
+unicode-width = "0.2"
+once_cell = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-appender = "0.2"
+tracing-chrome = "0.7"
+tracing-flame = { version = "0.2", optional = true }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.16", optional = true, default-features = false, features = ["http-listener"] }
+walkdir = "2.5"
+crossbeam-channel = "0.5"
+rayon = "1.10"
+stacker = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+toml = "1"
+filetime = "0.2.27"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "fs", "io-util", "signal", "time", "sync", "macros"] }
+byteorder = "1"
+rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
+memmap2 = "0.9"
+sha2 = "0.10"
+notify = "6"
+notify-debouncer-mini = "0.4"
+crossterm = "0.27"
+zstd = "0.13"
+# HTTP client. NOT optional: the `ai` builtin (`src/extensions/ai.rs`)
+# reaches provider APIs over HTTPS from the DEFAULT shell build, so the
+# `tls` feature has to be on unconditionally. `tls` resolves to
+# rustls 0.23 — pinned by ureq to the `ring` backend with
+# default-features off — plus webpki-roots, i.e. a pure-Rust root
+# store: no OpenSSL, no cmake, no system certificate store, and a clean
+# cross-compile to macOS aarch64 / Linux x86_64 / Linux aarch64.
+# `bins/zd.rs` and `tests/daemon_http.rs` share the dep for their
+# plain-HTTP localhost traffic.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# Optional — enabled by the `zd` feature for bins/zd.rs; also re-listed
+# under dev-dependencies so tests/daemon_http.rs gets it unconditionally.
+base64 = { version = "0.22", optional = true }
+
+[features]
+default = ["daemon", "aot-hook"]
+# `aot-hook` compiles `fusevm_aot_register_builtins` — the `#[no_mangle]` symbol
+# fusevm's AOT runtime resolves by name when it links a native binary against
+# `libzsh.a` (see src/extensions/aot.rs). ON by default so `zbuild --native`
+# keeps working from an ordinary build. A crate that depends on zshrs as a
+# *library* and provides its own AOT hook (strykelang does) must take
+# `default-features = false`, or the two `#[no_mangle]` definitions collide at
+# link time — under `lto = "fat"` that surfaces as a bare
+# "failed to load bitcode of module zsh-….rcgu.o".
+aot-hook = []
+# `daemon` enables the zshrs-daemon dep. Disable with --no-default-features
+# to compile zshrs lib without dragging the daemon crate into the build —
+# useful while the daemon is mid-refactor in a concurrent session and the
+# port-only lib work shouldn't depend on it. Stubs in src/lib.rs cover the
+# few `crate::daemon::*` references when this feature is off.
+daemon = ["zshrs-daemon"]
+# Plugin-Framework-Agnostic State-Modification Recorder (PFA-SMR).
+# OFF by default — every recorder symbol is `#[cfg(feature = "recorder")]`
+# gated and deleted by rustc when this feature is off, satisfying
+# docs/RECORDER.md's "zero recorder code in default `zshrs` binary" rule.
+# Built into the separate `zshrs-recorder` binary only. Implies `daemon`
+# because the recorder's whole purpose is to ship its bundle to the
+# daemon at end-of-run via IPC.
+recorder = ["daemon"]
+# `zd` — standalone HTTP CLI for zshrs-daemon. OFF by default so the
+# main `zshrs` build doesn't drag in base64. Enable via
+# `cargo install --bin zd --features zd` (Cargo's required-features
+# mechanism enforces the gate). `ureq` left the gate when the `ai`
+# builtin made it a mandatory dep of the shell itself.
+zd = ["dep:base64"]
+# `parity-fuzz` — differential zsh/zshrs fuzzer binary. OFF by default so the
+# fuzz driver never compiles into the shipping shell. `rand` is already a
+# non-optional dep, so this is a pure build gate (required-features on the bin).
+parity-fuzz = []
+profiling = []
+flamegraph = ["tracing-flame"]
+# `zsh-debug` — enables DPUTS / DPUTS1 / DPUTS2 debug-assertion macros
+# (Src/zsh.h:2914-2920). Mirrors zsh's `--enable-zsh-debug` configure
+# flag: stock zsh ships with `#ifdef DEBUG` un-set so DPUTS is a no-op;
+# zshrs matches that contract by gating the macros on this feature
+# rather than `cfg(debug_assertions)` (which is active for every
+# `cargo build` and produced spurious "shouldn't-happen" assertion
+# noise during normal interactive use).
+zsh-debug = []
+prometheus = ["metrics", "metrics-exporter-prometheus"]
+
+[dev-dependencies]
+tempfile = "3"
+# `ureq` is a plain (non-optional) dep above now that the `ai` builtin
+# needs it, so it is NOT re-listed here. `base64` is still gated by the
+# `zd` feature, and this dev-dep re-listing is what lets
+# tests/daemon_http.rs use it without every `cargo test` enabling `zd`.
+base64 = "0.22"
+
+[build-dependencies]
+# Same crate as the runtime dep: build.rs compresses the bundled zsh
+# function tree that `bundled_functions` materialises into ~/.zshrs/functions.
+zstd = "0.13"
+
+[workspace]
+members = [".", "daemon", "znative", "runtime"]
+
+
+# Single source of truth for inter-crate path-dep versions. Updated by
+# `scripts/bp.sh` together with `[workspace.package].version` above so a
+# single `bp.sh <new-version>` run touches one file. Members reference
+# these via `compsys.workspace = true` etc.
+[workspace.dependencies]
+zshrs-daemon = { path = "daemon", version = "0.13.55" }
+# The root package, so the `runtime/` member can depend on it to bundle its
+# objects into libzsh.a. bp.sh rewrites every version literal in this block.
+zshrs = { path = ".", version = "0.13.55" }
+znative = { path = "znative", version = "0.13.55" }
+
+# `cargo install zshrs` always builds with `[profile.release]`, so this profile
+# is what every crates.io user's machine has to survive — not what CI's release
+# artifacts want. Those are different goals and they used to be the same knob.
+#
+# With `lto = "fat"` + `codegen-units = 1` the whole crate lands in one LLVM
+# module. Measured on the 634k-line `zsh` lib: peak rustc RSS 7.28 GB for the
+# lib compile ALONE, before the binary's LTO step. That OOM-kills `cargo
+# install` on any box under ~8 GB of RAM: reported as a bare "signal: 9,
+# SIGKILL" from the OOM killer on an aarch64 Debian VM building zshrs 0.12.40.
+#
+# So `release` is now the memory-sane profile: thin LTO across 16 codegen units
+# still inlines across crate boundaries, but LLVM works on 16 independent
+# modules instead of one, and each unit's peak is a fraction of the whole.
+# Max-perf shipping binaries use `[profile.dist]` below.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+
+# The profile for artifacts we ship: fat LTO, one codegen unit, no compile-time
+# or memory budget. Used by .github/workflows/release.yml (`--profile dist`),
+# never by `cargo install`. Build it locally with `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+# chrono's `Local` asks `iana_time_zone::get_timezone()` for the zone name, and
+# the upstream macOS backend links CoreFoundation, which dyld then loads and
+# initialises in every zshrs process. The stub reads `/etc/localtime` instead;
+# with no CF symbols left, build.rs's `-dead_strip_dylibs` drops the framework.
+# Ignored when this crate is built from crates.io (patches do not publish).
+[patch.crates-io]
+iana-time-zone = { path = "patches/iana-time-zone" }

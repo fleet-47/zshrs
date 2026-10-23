@@ -1,0 +1,70 @@
+# Example ~/.zshrc for zshrs
+#
+# zshrs reads the same startup files as zsh (~/.zshrc for interactive
+# shells). Everything here is ordinary zsh syntax — copy the parts you
+# want. The point of this file is the `znative` section: how to install and
+# load plugins, both zsh script plugins and native (Rust) plugins.
+#
+# znative keeps a single global, content-addressed store under
+# $ZSHRS_HOME/pkg/ (default ~/.zshrs/pkg/). There is no per-project
+# manifest or lockfile — you `znative add` once, and `znative load` at startup.
+
+# ---------------------------------------------------------------------------
+# Options / history — plain zsh, works the same in zshrs
+# ---------------------------------------------------------------------------
+setopt hist_ignore_all_dups   # collapse duplicate history entries
+setopt share_history          # share history across sessions
+setopt auto_cd                # `zshrs` a bare dir name to cd into it
+setopt extended_glob          # ^ ~ # glob operators
+HISTSIZE=100000
+SAVEHIST=100000
+
+# ---------------------------------------------------------------------------
+# Completion — compinit as usual (zshrs ships the ported compsys)
+# ---------------------------------------------------------------------------
+autoload -Uz compinit && compinit
+zstyle ':completion:*' menu select
+zstyle ':completion:*' list-colors ${(s.:.)LS_COLORS}
+
+# ---------------------------------------------------------------------------
+# Plugins with znative
+# ---------------------------------------------------------------------------
+#
+# All you need is `znative load owner/repo`. On the FIRST shell start it installs
+# the plugin (clones, builds a native one, records it in the store) and loads
+# it; on every start after that the plugin is already in the store, so the
+# same line just loads it — zero network. No separate install step, no
+# guarding with `[[ -d ... ]]`.
+#
+znative load zdharma-continuum/history-search-multi-word   # Ctrl-R multi-word search
+znative load zsh-users/zsh-autosuggestions                 # script plugin (github)
+znative load MenkeTechnologies/zshrs-forgit                # native (Rust) plugin
+znative load MenkeTechnologies/zshrs-revolver              # native spinner
+znative load zsh-users/zsh-syntax-highlighting             # keep highlighting last
+
+# Source forms all work here too:
+#   znative load github:zsh-users/zsh-syntax-highlighting  # explicit github:
+#   znative load git+https://example.com/team/plugin.git@v1.2.0   # git+URL @ref
+#   znative load path:~/src/my-plugin                      # local dir (no network)
+#
+# znative auto-detects the kind: a Cargo.toml with crate-type = ["cdylib"] (or a
+# prebuilt lib) -> native (built with cargo, loaded via `zmodload -R`);
+# *.plugin.zsh / functions/ / *.zsh -> script (fpath + source). An optional
+# znative.toml at the repo root can override the metadata/kind.
+#
+# Bare `znative load` (no argument) loads everything already installed. Manage the
+# store with: `znative list`, `znative info <name>`, `znative update [name]`,
+# `znative remove <name>`.   Full reference: docs/ZNATIVE.md
+
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+# zshrs has a native powerlevel10k engine — if you use p10k, its config
+# loads the same way it does under zsh:
+#   [[ -f ~/.p10k.zsh ]] && source ~/.p10k.zsh
+
+# ---------------------------------------------------------------------------
+# Aliases / env — your own stuff below
+# ---------------------------------------------------------------------------
+alias ll='ls -lah'
+export EDITOR=vim

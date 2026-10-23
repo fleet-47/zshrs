@@ -1,0 +1,157 @@
+# Snapshot of (rust_file, fn_name) pairs where the Rust port lands in
+# a file whose C-counterpart basename doesn't contain the matching
+# function definition. Format: `<rust_relpath>::<fn_name>`.
+#
+# Examples:
+#   src/ported/utils.rs::printhhmmss
+#     — C source has printhhmmss in jobs.c, not utils.c. Either move
+#       to a jobs-area Rust file or accept the mismatch.
+#   src/ported/utils.rs::getpid / mkdir / getenv / setenv / etc.
+#     — these are libc wrappers, not zsh-specific. zsh's C source
+#       references them without defining them; the file-grep finds
+#       call-site occurrences. Listed here as exempt since they're
+#       genuine system-call wrappers.
+#
+# Anything in this list is exempt from the file-mapping check.
+# Anything NOT in this list AND in the wrong file fails the test.
+#
+# To shrink: move the fn to the right Rust file (matching its C
+# basename), or rename to point at the actual C definition you're
+# porting from. Then remove the line.
+#
+# Lines starting with `#` are comments. Blank lines ignored.
+
+# string.c family — Rust hosts string helpers in mem.rs since they
+# share the heap-arena/zalloc ABI. C splits string.c (zalloc wrappers
+# for char* manipulation) and mem.c (the arena itself); zshrs collapses
+# both into mem.rs.
+src/ported/mem.rs::appstr
+src/ported/mem.rs::bicat
+src/ported/mem.rs::dupstring
+src/ported/mem.rs::dupstring_wlen
+src/ported/mem.rs::dyncat
+src/ported/mem.rs::strend
+src/ported/mem.rs::tricat
+src/ported/mem.rs::ztrdup
+src/ported/mem.rs::ztrduppfx
+
+# utils.c-resident array helpers hosted in mem.rs (same heap-arena
+# rationale as the string.c entries above).
+src/ported/mem.rs::arrdup_max
+src/ported/mem.rs::arrlen
+src/ported/mem.rs::arrlen_gt
+src/ported/mem.rs::arrlen_le
+src/ported/mem.rs::arrlen_lt
+src/ported/mem.rs::sepjoin
+src/ported/mem.rs::sepsplit
+src/ported/mem.rs::zarrdup
+
+# libc wrappers — zsh's C source references these without defining
+# them; the file-grep finds call-site occurrences only. utils.rs hosts
+# them since the syscall-wrapper layer collapses there in zshrs.
+src/ported/utils.rs::getegid
+src/ported/utils.rs::getenv
+src/ported/utils.rs::getgid
+src/ported/utils.rs::gethostname
+src/ported/utils.rs::getpid
+src/ported/utils.rs::getppid
+src/ported/utils.rs::mkdir
+src/ported/utils.rs::realpath
+src/ported/utils.rs::setenv
+src/ported/utils.rs::symlink
+src/ported/utils.rs::unsetenv
+
+# Misplaced fns hosted in utils.rs that belong in their respective
+# C-file homes. Move-when-touched.
+src/ported/utils.rs::base64_decode      # termquery.c
+src/ported/utils.rs::checkglobqual      # glob.c
+src/ported/utils.rs::convfloat          # params.c
+src/ported/utils.rs::convfloat_underscore   # params.c (sibling of convfloat)
+src/ported/utils.rs::isident            # params.c
+src/ported/utils.rs::statuidprint       # stat.c (Modules)
+src/ported/utils.rs::zgetcwd            # compat.c
+src/ported/modules/watch.rs::printtime  # jobs.c (watch.c calls but doesn't define)
+
+# zle_bindings.rs hosts ports that span zle_keymap.c (bindkey,
+# bindlistout) + utils.c (getkeystring) + zle_utils.c (printbind).
+# The Rust file groups the user-facing `bindkey` builtin surface.
+src/ported/zle/zle_bindings.rs::bindkey
+src/ported/zle/zle_bindings.rs::bindlistout
+src/ported/zle/zle_bindings.rs::getkeystring
+
+# Port of `#define zistype(X,Y)` macro from Src/ztype.h:47. C indexes
+# it as `utils.c:zistype` because the macro is consumed inline in
+# utils.c; the canonical home is ztype.h which we map to ztype_h.rs.
+src/ported/ztype_h.rs::zistype
+
+# Port of zsh_system.h's per-platform stat-time-nanosecond accessor
+# macros (zsh_system.h:877-897). C indexes them from the call sites
+# (cond.c, glob.c, stat.c — wherever stat() results are inspected);
+# canonical home is zsh_system.h which maps to zsh_system_h.rs.
+src/ported/zsh_system_h.rs::GET_ST_ATIME_NSEC
+src/ported/zsh_system_h.rs::GET_ST_MTIME_NSEC
+src/ported/zsh_system_h.rs::GET_ST_CTIME_NSEC
+
+# Port of signals.h's macro family (signals.h:39-127). C uses
+# preprocessor macros so call sites get indexed across many .c
+# files (jobs.c, exec.c, signals.c, etc.); canonical home is
+# signals.h which maps to signals_h.rs.
+src/ported/signals_h.rs::SIGIDX
+src/ported/signals_h.rs::SIGNUM
+src/ported/signals_h.rs::queue_signals
+src/ported/signals_h.rs::unqueue_signals
+src/ported/signals_h.rs::dont_queue_signals
+src/ported/signals_h.rs::restore_queue_signals
+src/ported/signals_h.rs::queue_signal_level
+src/ported/signals_h.rs::run_queued_signals
+src/ported/signals_h.rs::child_block
+src/ported/signals_h.rs::child_unblock
+src/ported/signals_h.rs::winch_block
+src/ported/signals_h.rs::winch_unblock
+src/ported/signals_h.rs::signal_ignore
+src/ported/signals_h.rs::signal_default
+
+# Port of zsh.h's macro family. C indexes them across many .c files
+# (subst.c, glob.c, params.c, zle_*.c, etc.) since they're
+# preprocessor macros expanded at every call site. Canonical home
+# is zsh.h which maps to zsh_h.rs.
+src/ported/zsh_h.rs::IS_DASH
+src/ported/zsh_h.rs::minimum
+src/ported/zsh_h.rs::MB_METACHARINIT
+src/ported/zsh_h.rs::MB_METACHARLEN
+src/ported/zsh_h.rs::MB_METACHARLENCONV
+src/ported/zsh_h.rs::MB_METASTRLEN
+src/ported/zsh_h.rs::MB_METASTRWIDTH
+src/ported/zsh_h.rs::MB_METASTRLEN2
+src/ported/zsh_h.rs::MB_CHARINIT
+src/ported/zsh_h.rs::MB_CHARLEN
+src/ported/zsh_h.rs::MB_CHARLENCONV
+src/ported/zsh_h.rs::WCWIDTH
+src/ported/zsh_h.rs::WCWIDTH_WINT
+src/ported/zsh_h.rs::IS_COMBINING
+src/ported/zsh_h.rs::IS_BASECHAR
+src/ported/zsh_h.rs::OPT_ARG
+src/ported/zsh_h.rs::OPT_ARG_SAFE
+
+# More zsh.h macro family ports — same situation as the MB_*/IS_*
+# above. C indexes them at every consumer site (builtin.c table
+# rows, init.c, exec.c, etc.); canonical home is zsh.h → zsh_h.rs.
+src/ported/zsh_h.rs::EMULATION
+src/ported/zsh_h.rs::SHELL_EMULATION
+src/ported/zsh_h.rs::IN_EVAL_TRAP
+src/ported/zsh_h.rs::ASG_ARRAYP
+src/ported/zsh_h.rs::ASG_VALUEP
+src/ported/zsh_h.rs::MB_METASTRLEN2END
+src/ported/zsh_h.rs::ZWS
+src/ported/zsh_h.rs::BUILTIN
+src/ported/zsh_h.rs::BIN_PREFIX
+src/ported/zsh_h.rs::CONDDEF
+src/ported/zsh_h.rs::HOOKDEF
+src/ported/zsh_h.rs::NUMMATHFUNC
+src/ported/zsh_h.rs::STRMATHFUNC
+src/ported/zsh_h.rs::PARAMDEF
+src/ported/zsh_h.rs::INTPARAMDEF
+src/ported/zsh_h.rs::STRPARAMDEF
+src/ported/zsh_h.rs::ARRPARAMDEF
+src/ported/zsh_h.rs::SPECIALPMDEF
+src/ported/zsh_h.rs::WRAPDEF

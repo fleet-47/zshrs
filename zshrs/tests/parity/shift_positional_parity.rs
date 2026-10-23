@@ -1,0 +1,419 @@
+//! Positional params and shift parity:
+//! `$#`, `$*`, `$@`, `$N`, `${N}`, `$argv`, `shift`, `set --`.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+struct R {
+    stdout: String,
+    exit: i32,
+}
+fn run_zsh(s: &str) -> R {
+    let o = Command::new(zsh_path())
+        .args(["-fc", s])
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn run_zshrs(s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn assert_parity(s: &str) {
+    if !zsh_available() {
+        return;
+    }
+    let z = run_zsh(s);
+    let r = run_zshrs(s);
+    assert_eq!(
+        z.stdout, r.stdout,
+        "stdout divergence on:\n{s}\n--- zsh ---\n{:?}\n--- zshrs ---\n{:?}",
+        z.stdout, r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+mod set_dash_dash {
+    use super::*;
+
+    /// `set -- a b c` sets positionals.
+    #[test]
+    fn set_dash_dash_assigns() {
+        assert_parity(r#"set -- a b c; echo "$1/$2/$3""#);
+    }
+
+    /// `set --` clears all positionals.
+    #[test]
+    fn set_dash_dash_empty_clears() {
+        assert_parity(r#"set -- a b c; set --; echo "[$1] count=$#""#);
+    }
+
+    /// `set --` with mixed values.
+    #[test]
+    fn set_dash_dash_with_spaces() {
+        assert_parity(r#"set -- "a b" "c d"; echo "$1|$2""#);
+    }
+}
+
+mod count {
+    use super::*;
+
+    /// `$#` returns count.
+    #[test]
+    fn dollar_hash_count_three() {
+        assert_parity(r#"set -- a b c; echo $#"#);
+    }
+
+    #[test]
+    fn dollar_hash_count_zero() {
+        assert_parity(r#"echo $#"#);
+    }
+
+    #[test]
+    fn dollar_hash_count_one() {
+        assert_parity(r#"set -- "single arg"; echo $#"#);
+    }
+}
+
+mod numeric_positionals {
+    use super::*;
+
+    #[test]
+    fn unset_positional_empty() {
+        assert_parity(r#"set -- a; echo "[$2]""#);
+    }
+
+    /// `${10}` braces required for 2-digit positions.
+    #[test]
+    fn double_digit_positional() {
+        assert_parity(r#"set -- 1 2 3 4 5 6 7 8 9 ten; echo "${10}""#);
+    }
+
+    /// Without braces, `$10` = `$1` + literal `0`.
+    #[test]
+    fn ten_unbraced_is_one_zero() {
+        assert_parity(r#"set -- a b c; echo "$10""#);
+    }
+}
+
+mod star_at_difference {
+    use super::*;
+
+    /// `$*` joined by first char of IFS (space by default).
+    #[test]
+    fn star_joined_unquoted() {
+        assert_parity(r#"set -- a b c; echo $*"#);
+    }
+
+    /// `"$*"` joined as single string.
+    #[test]
+    fn star_joined_quoted() {
+        assert_parity(r#"set -- a b c; printf '<%s>' "$*"; echo"#);
+    }
+
+    /// `"$@"` keeps args separate.
+    #[test]
+    fn at_separate_quoted() {
+        assert_parity(r#"set -- a b c; printf '<%s>' "$@"; echo"#);
+    }
+
+    /// `$@` unquoted same as `$*` unquoted (subject to splitting).
+    #[test]
+    fn at_unquoted_same_as_star() {
+        assert_parity(r#"set -- a b c; printf '<%s>' $@; echo"#);
+    }
+
+    /// `$*` with empty arg.
+    #[test]
+    fn star_with_empty_arg() {
+        assert_parity(r#"set -- a "" c; printf '<%s>' "$*"; echo"#);
+    }
+
+    /// `$@` with empty arg keeps the empty position.
+    #[test]
+    fn at_with_empty_arg() {
+        assert_parity(r#"set -- a "" c; printf '<%s>' "$@"; echo"#);
+    }
+}
+
+mod custom_ifs {
+    use super::*;
+
+    /// IFS affects `$*` join.
+    #[test]
+    fn custom_ifs_joins_with_first_char() {
+        assert_parity(r#"set -- a b c; IFS=:; echo "$*""#);
+    }
+
+    /// Empty IFS → `$*` concatenates.
+    #[test]
+    fn empty_ifs_concatenates() {
+        assert_parity(r#"set -- a b c; IFS=""; echo "$*""#);
+    }
+}
+
+mod shift_builtin {
+    use super::*;
+
+    /// `shift` by 1.
+    #[test]
+    fn shift_one() {
+        assert_parity(r#"set -- a b c; shift; echo "$@""#);
+    }
+
+    /// `shift 2` shifts by 2.
+    #[test]
+    fn shift_two() {
+        assert_parity(r#"set -- a b c d e; shift 2; echo "$@""#);
+    }
+
+    /// `shift 0` no-op.
+    #[test]
+    fn shift_zero() {
+        assert_parity(r#"set -- a b c; shift 0; echo "$@""#);
+    }
+
+    /// `shift` past end → error / nothing shifted.
+    #[test]
+    fn shift_past_end() {
+        assert_parity(r#"set -- a b; shift 5 2>/dev/null; echo "exit=$? count=$#""#);
+    }
+}
+
+mod argv_alias {
+    use super::*;
+
+    /// zsh's `$argv` is alias for positional array.
+    #[test]
+    fn argv_alias_array() {
+        assert_parity(r#"set -- a b c; echo "${argv[1]}/${argv[2]}/${argv[3]}""#);
+    }
+
+    /// `${#argv}` matches `$#`.
+    #[test]
+    fn argv_count_matches_dollar_hash() {
+        assert_parity(r#"set -- a b c d; echo "${#argv} $#""#);
+    }
+
+    /// `${argv[@]}` = `"$@"`.
+    #[test]
+    fn argv_at_matches_dollar_at() {
+        assert_parity(r#"set -- a b c; printf '<%s>' "${argv[@]}"; echo"#);
+    }
+}
+
+mod range_subscript {
+    use super::*;
+
+    /// `${@:1:2}` first 2.
+    #[test]
+    fn at_with_zsh_range_subscript() {
+        // zsh syntax: ${argv[1,2]} or ${@[1,2]}.
+        assert_parity(r#"set -- a b c d e; echo "${@[1,2]}""#);
+    }
+
+    /// `$@[2,4]` middle slice.
+    #[test]
+    fn at_with_range_2_4() {
+        assert_parity(r#"set -- a b c d e; echo "${@[2,4]}""#);
+    }
+
+    /// `$@[-2,-1]` last 2.
+    #[test]
+    fn at_with_negative_range() {
+        assert_parity(r#"set -- a b c d e; echo "${@[-2,-1]}""#);
+    }
+}
+
+mod in_function {
+    use super::*;
+
+    /// Function has its own positionals.
+    #[test]
+    fn function_has_own_positionals() {
+        assert_parity(
+            r#"
+f() { echo "fn: $1/$2/$# outer: $myout"; }
+myout=outer
+set -- a b
+f x y z
+echo "after: $1/$2/$#"
+"#,
+        );
+    }
+
+    /// $0 inside function = function name (zsh behavior).
+    #[test]
+    fn dollar_zero_in_function() {
+        assert_parity(
+            r#"
+greet() { echo $0; }
+greet
+"#,
+        );
+    }
+}
+
+mod compound_use {
+    use super::*;
+
+    /// Loop over `"$@"`.
+    #[test]
+    fn for_loop_over_at() {
+        assert_parity(
+            r#"
+set -- alpha beta gamma
+for x in "$@"; do echo "[$x]"; done
+"#,
+        );
+    }
+
+    /// Iterate by index.
+    #[test]
+    fn for_loop_with_index() {
+        assert_parity(
+            r#"
+set -- a b c
+i=1
+while (( i <= $# )); do
+  echo "$i:${(P)i}"
+  (( i++ ))
+done
+"#,
+        );
+    }
+}
+
+/// Bare all-digit name on the LHS of an assignment addresses the
+/// positional parameter $N directly (`2=X`, `2+=end`). zsh maps digit
+/// names onto `argv` (isident accepts them, c:params.c:1336-1340); the
+/// lexer accepts the optional `+` for the augment form (c:1241-1242).
+mod numeric_name_assign {
+    use super::*;
+
+    #[test]
+    fn assign_positional() {
+        assert_parity("set -- a b c; 2=X; echo $2");
+    }
+
+    #[test]
+    fn append_positional() {
+        assert_parity("set -- a b c; 2+=end; echo $2");
+    }
+
+    /// Assigning past $# extends and pads (`5=Z` on 3 args → $#==5).
+    #[test]
+    fn assign_past_end_extends() {
+        assert_parity(r#"set -- a b c; 5=Z; echo "[$5]"; echo $#"#);
+    }
+
+    #[test]
+    fn append_first_positional() {
+        assert_parity(r#"set -- a b c; 1+=Z; echo "$@""#);
+    }
+
+    /// A numeric word in ARGUMENT position stays a literal (not an assign).
+    #[test]
+    fn numeric_word_as_arg_is_literal() {
+        assert_parity("echo 2=3 2+=3");
+    }
+}
+
+mod shift_named_array {
+    use super::*;
+
+    /// c:Src/builtin.c:5600,5616 — `getaparam("argv")` reads the live
+    /// positional vector (`arrvargetfn`, Src/params.c:4231), so `argv` is an
+    /// array name for `shift`. It used to read a stale paramtab slot:
+    /// `shift 2 argv` reported "shift count must be <= $#" and shifted nothing.
+    #[test]
+    fn shift_argv_by_name() {
+        assert_parity(r#"() { shift 2 argv; echo $@; shift argv; echo $@ } a b c d e"#);
+    }
+
+    #[test]
+    fn shift_argv_past_end_fails() {
+        assert_parity(r#"() { shift 9 argv 2>/dev/null; echo $? $# } a b c"#);
+    }
+
+    /// c:Src/builtin.c:5602 — a named-array overflow names the array:
+    /// `zwarnnam(name, "shift count must be <= ${#%s}", *argv)`. Only the
+    /// positional case (c:5623) says `$#`. zsh 5.9.x predates this message,
+    /// so it is checked against the C source rather than the host zsh.
+    #[test]
+    fn shift_named_array_overflow_names_the_array() {
+        let o = Command::new(zshrs_bin())
+            .args(["--zsh", "-f", "-c", "() { local -a arr=( a b c ); shift 9 arr }; () { shift 9 argv } a"])
+            .output()
+            .expect("zshrs");
+        assert_eq!(
+            String::from_utf8_lossy(&o.stderr),
+            "(anon):shift: shift count must be <= ${#arr}\n(anon):shift: shift count must be <= ${#argv}\n"
+        );
+    }
+}
+
+/// c:Src/params.c:430 `IPDEF9("argv", &pparams, …)` — `argv` is an array,
+/// so `argv[n]=v` evaluates `n` as arithmetic (getindex) in every input
+/// mode. Read from standard input the `argv` node carries no materialised
+/// array, and the subscript was taken literally: `argv[n++]=$ans`, the line
+/// zcalc stores each result with, left `$1` empty.
+mod argv_element_assignment_from_stdin {
+    use super::*;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    fn run_stdin(cmd: &mut Command, input: &str) -> String {
+        let mut child = cmd
+            .env_remove("ZSHRS_CACHE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn shell");
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        String::from_utf8_lossy(&child.wait_with_output().expect("wait").stdout).into_owned()
+    }
+
+    #[test]
+    fn arithmetic_subscripts_on_argv_assign_the_positionals() {
+        if !zsh_available() {
+            return;
+        }
+        let input = "set -- q r; n=1; argv[n]=a; print -r -- \"[$*]\"\n\
+                     argv[n+1]=b; print -r -- \"[$*]\"\n\
+                     f() { integer i=1; argv[i++]=x; argv[i++]=y; print -r -- \"[$*] $i\" }; f\n";
+        let z = run_stdin(Command::new(zsh_path()).arg("-f"), input);
+        let r = run_stdin(Command::new(zshrs_bin()).args(["--zsh", "-f"]), input);
+        assert_eq!(z, "[a r]\n[a b]\n[x y] 3\n", "reference zsh");
+        assert_eq!(z, r);
+    }
+}

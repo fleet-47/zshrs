@@ -1,0 +1,78 @@
+#compdef zwhere
+
+# Query the definitions catalog: which shell defined an alias, function,
+# parameter, ... and where. Prints one row per definition,
+# kind<TAB>name<TAB>value<TAB>shell_id<TAB>file:line<TAB>state<TAB>via,
+# from the daemon when it runs and from the newest recorder shard when not.
+#
+# zshrs builtin. Registered in ZSHRS_BUILTIN_NAMES
+# (daemon/builtins.rs); flags mirror zwhere() in daemon/builtins.rs,
+# kinds mirror KNOWN_KINDS in daemon/definitions.rs.
+# Bundled into ~/.zshrs/functions by build.rs.
+
+local -a kinds
+kinds=(
+    'alias:regular aliases'
+    'galias:global aliases'
+    'salias:suffix aliases'
+    'function:shell functions'
+    'function_autoload:autoloaded functions'
+    'env:exported environment variables'
+    'params:shell parameters'
+    'params_typed:shell parameters with their types'
+    'bindkey:key bindings'
+    'compdef:completion bindings'
+    'named_dir:named directories (hash -d)'
+    'zstyle:zstyle settings'
+    'zmodload:loaded modules'
+    'setopt:shell options'
+    'trap:traps'
+    'sched:scheduled commands'
+    'source:sourced files'
+    'zle:zle widgets'
+    'completion:completion definitions'
+    'path:command search path'
+    'fpath:function search path'
+    'manpath:manual search path'
+)
+
+_arguments -C \
+    '(- *)'{-h,--help}'[print usage]' \
+    '(- *)--kinds[list every kind that has rows]' \
+    '--prefix[only names starting with STR]:name prefix:->names' \
+    '--shell-id[only rows recorded by this shell id]:shell id:->shellids' \
+    '--limit[maximum rows to print (default 1000)]:row limit (a number): ' \
+    '1:kind:->kinds' \
+    '2:name:->names' && return 0
+
+case $state in
+    kinds) _describe -t kinds 'kind' kinds && return 0 ;;
+    names|shellids)
+        # Live values come from zwhere itself, which answers with or without
+        # the daemon. A name has one row per definition, so de-duplicate.
+        # Rows are tab-separated: kind name value shell_id file:line state via.
+        local row expl kind=$line[1]
+        local -a values query
+        if [[ $state == names ]]; then
+            # With no kind yet (`zwhere --prefix <TAB>`) every kind is searched.
+            query=( ${kind:+$kind} --prefix "$PREFIX" --limit 100000 )
+            for row in ${(f)"$(zwhere "${query[@]}" 2>/dev/null)"}; do
+                values+=( "${${(@ps:\t:)row}[2]}" )
+            done
+        else
+            query=( --limit 100000 )
+            [[ -n $kind ]] && query=( $kind $query )
+            for row in ${(f)"$(zwhere "${query[@]}" 2>/dev/null)"}; do
+                values+=( "${${(@ps:\t:)row}[4]}" )
+            done
+        fi
+        values=( ${(u)values} )
+        if [[ $state == names ]]; then
+            _wanted names expl "${kind:-definition} name" compadd -a values && return 0
+        else
+            _wanted shell-ids expl 'shell id' compadd -a values && return 0
+        fi
+        ;;
+esac
+
+return 1

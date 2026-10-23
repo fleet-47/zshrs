@@ -1,0 +1,4015 @@
+//! zshrs - Rust rewrite of zsh
+//!
+//! A drop-in zsh replacement that combines:
+//! - Full bash/zsh script compatibility  
+//! - Fish-quality completions with SQLite indexing
+//! - Fish-style syntax highlighting and autosuggestions
+//!
+//! Copyright (C) 2026 MenkeTechnologies
+//! License: GPL-2.0 (incorporates code from fish-shell)
+
+use std::env;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use zsh::vm_helper::ShellExecutor;
+use zsh::zwc;
+
+// CompletionGroup / Completion / CompletionState / do_completion /
+// MenuState / MenuAction were deleted with completion.rs + compcore.rs
+// + menu.rs. Stub locally so this bin still compiles; real menu +
+// completion assembly now live in src/ported/zle/{compcore,complist}.rs.
+// The stubs aren't reached by the live REPL code path — `dead_code`
+// is suppressed wholesale on the vestigial block.
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct CompsysCompletion {
+    pub disp: Option<String>,
+    pub desc: Option<String>,
+}
+#[allow(dead_code)]
+impl CompsysCompletion {
+    fn new(_s: impl AsRef<str>) -> Self {
+        Self::default()
+    }
+}
+#[allow(unused_imports)]
+use CompsysCompletion as Completion;
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+enum MenuAction {
+    #[default]
+    Next,
+    Prev,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct MenuState;
+#[allow(dead_code)]
+impl MenuState {
+    fn new() -> Self {
+        Self
+    }
+    fn start(&mut self) {}
+    fn stop(&mut self) {}
+    fn cols(&self) -> usize {
+        0
+    }
+    fn selected_index(&self) -> Option<usize> {
+        None
+    }
+    fn set_term_size(&mut self, _w: usize, _h: usize) {}
+    fn set_available_rows(&mut self, _r: usize) {}
+    fn process_action(&mut self, _a: MenuAction) -> MenuResult {
+        MenuResult
+    }
+    fn render(&self) -> MenuRendering {
+        MenuRendering::default()
+    }
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct MenuRendering {
+    lines: Vec<MenuLine>,
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct MenuLine {
+    content: String,
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct MenuResult;
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct CompletionGroup {
+    pub matches: Vec<CompsysCompletion>,
+}
+#[allow(dead_code)]
+impl CompletionGroup {
+    fn new(_name: impl AsRef<str>) -> Self {
+        Self::default()
+    }
+    fn add(&mut self, c: CompsysCompletion) {
+        self.matches.push(c);
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+struct CompletionState;
+#[allow(dead_code)]
+impl CompletionState {
+    fn new() -> Self {
+        Self
+    }
+    fn from_line(_line: &str, _cursor: usize) -> Self {
+        Self
+    }
+    fn add_match(&mut self, _c: CompsysCompletion, _group: Option<&str>) {}
+    fn begin_group(&mut self, _name: &str, _sorted: bool) {}
+    fn end_group(&mut self) {}
+}
+
+#[allow(dead_code)]
+fn do_completion(
+    _line: &str,
+    _cursor: usize,
+    _state: &mut CompletionState,
+    _custom: impl FnOnce(&mut CompletionState),
+) -> usize {
+    0
+}
+
+/// `zshrs --gen-docs [PATH] [--out DIR]` — walk PATH (default `.`),
+/// find every `.zsh` / `.sh` / `.bash` / `.ksh` / dotfile source, and
+/// emit per-file Markdown module docs under `--out DIR` (default
+/// `docs/`). Output layout mirrors source layout: `lib/foo.zsh` →
+/// `docs/lib/foo.md`. Also writes an `index.md` summary.
+///
+/// Mirrors `stryke gen-docs` for the zshrs CLI. Use this to ship
+/// human-readable reference docs alongside your shell scripts —
+/// extracts `##` doc-comments paired with the function decl below.
+fn run_gen_docs_subcommand(args: &[&str]) -> i32 {
+    if args.first().copied() == Some("-h") || args.first().copied() == Some("--help") {
+        println!("usage: zshrs --gen-docs [PATH] [--out DIR]");
+        println!();
+        println!("Walk PATH (default `.`) for `.zsh` / `.sh` / `.bash` / `.ksh`");
+        println!("/ rc-dotfile sources and emit Markdown module docs for each.");
+        println!("Output goes under --out DIR (default `docs/`), mirroring the");
+        println!("source layout.");
+        println!();
+        println!("Doc-comment convention: contiguous `##` lines IMMEDIATELY above");
+        println!("a `function NAME` / `NAME()` declaration become that function's");
+        println!("documentation. A `##` block at the top of the file becomes the");
+        println!("module header.");
+        return 0;
+    }
+
+    let mut path: Option<String> = None;
+    let mut out_dir: String = "docs".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--out" | "-o" => {
+                if i + 1 >= args.len() {
+                    eprintln!("zshrs --gen-docs: --out requires a directory argument");
+                    return 2;
+                }
+                out_dir = args[i + 1].to_string();
+                i += 2;
+            }
+            other if !other.starts_with('-') && path.is_none() => {
+                path = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("zshrs --gen-docs: unexpected argument: {other}");
+                return 2;
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(path.unwrap_or_else(|| ".".to_string()));
+    if !root.exists() {
+        eprintln!("zshrs --gen-docs: path does not exist: {}", root.display());
+        return 1;
+    }
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+    zsh::gen_docs::collect_doc_sources(&root, &mut sources);
+    sources.sort();
+    if sources.is_empty() {
+        eprintln!(
+            "zshrs --gen-docs: no shell sources found under {}",
+            root.display()
+        );
+        return 1;
+    }
+    let out_root = std::path::PathBuf::from(&out_dir);
+    if let Err(e) = std::fs::create_dir_all(&out_root) {
+        eprintln!(
+            "zshrs --gen-docs: cannot create output dir {}: {}",
+            out_root.display(),
+            e
+        );
+        return 1;
+    }
+    let mut index: Vec<(String, String)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut used_paths: std::collections::HashSet<std::path::PathBuf> = Default::default();
+    for src in &sources {
+        let source = match std::fs::read_to_string(src) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("{}: {}", src.display(), e));
+                continue;
+            }
+        };
+        let md = zsh::gen_docs::generate_markdown(&src.to_string_lossy(), &source);
+        let rel = src.strip_prefix(&root).unwrap_or(src);
+        // Output path preserves the SOURCE extension as part of the
+        // stem to dedupe collisions when the source tree has multiple
+        // shells with the same basename (`foo.zsh` vs `foo.sh` vs
+        // `foo.bash`). Without this each one overwrites the next and
+        // the index lists duplicates pointing at the last writer.
+        let stem = rel.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = rel.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let renamed = if ext.is_empty() {
+            format!("{}.md", stem)
+        } else {
+            format!("{}.{}.md", stem, ext)
+        };
+        let mut out_path = match rel.parent() {
+            Some(p) if !p.as_os_str().is_empty() => out_root.join(p).join(renamed),
+            _ => out_root.join(renamed),
+        };
+        // Last-resort uniqueness: append `-N` if two distinct sources
+        // somehow still hash to the same output path.
+        let mut n = 1;
+        while used_paths.contains(&out_path) {
+            n += 1;
+            let stem2 = format!("{}.{}-{}", stem, ext, n);
+            out_path = match rel.parent() {
+                Some(p) if !p.as_os_str().is_empty() => {
+                    out_root.join(p).join(format!("{}.md", stem2))
+                }
+                _ => out_root.join(format!("{}.md", stem2)),
+            };
+        }
+        used_paths.insert(out_path.clone());
+        // Discard the original `.md` redirect — we already built the
+        // final path above. (Variable retained as type-anchor below.)
+        let _ = ();
+        if let Some(parent) = out_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                errors.push(format!("{}: mkdir failed: {}", parent.display(), e));
+                continue;
+            }
+        }
+        if let Err(e) = std::fs::write(&out_path, &md) {
+            errors.push(format!("{}: write failed: {}", out_path.display(), e));
+            continue;
+        }
+        let title = std::path::Path::new(rel.as_os_str())
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(unknown)")
+            .to_string();
+        index.push((title, out_path.display().to_string()));
+    }
+    // index.md
+    let mut idx = String::new();
+    idx.push_str("# Module Index\n\n");
+    idx.push_str(&format!("{} module(s) generated.\n\n", index.len()));
+    for (title, path) in &index {
+        idx.push_str(&format!(
+            "- [{}]({})\n",
+            title,
+            std::path::Path::new(path)
+                .strip_prefix(&out_root)
+                .unwrap_or(std::path::Path::new(path))
+                .display()
+        ));
+    }
+    if let Err(e) = std::fs::write(out_root.join("index.md"), &idx) {
+        eprintln!("zshrs --gen-docs: index write failed: {}", e);
+    }
+    eprintln!(
+        "zshrs --gen-docs: wrote {} module(s) under {}",
+        index.len(),
+        out_root.display()
+    );
+    if !errors.is_empty() {
+        eprintln!("zshrs --gen-docs: {} error(s):", errors.len());
+        for e in &errors {
+            eprintln!("  {}", e);
+        }
+        return 1;
+    }
+    0
+}
+
+/// Print help message identical to zsh --help
+fn print_help() {
+    println!(
+        r#"Usage: zsh [<options>] [<argument> ...]
+
+Special options:
+  --help       show this message, then exit
+  --version    show zsh version number, then exit
+  --doctor     full diagnostic report of shell health, caches, and performance
+  --doctor --json   the same report as one JSON object
+  --banner     print the ZSHRS logo, version and builtin totals, and daemon status
+
+Parser-pipeline dumpers (FILE, or `-` for stdin; output goes to stdout):
+  --dump-tokens   FILE   one TOKNAME<tab>TOKSTR line per lexer token
+  --dump-ast      FILE   parser AST as canonical S-expression
+  --dump-wordcode FILE   wordcode emitter output (EPROG / WORDS / WC[i] / STRS)
+  --dump-zwc      ZWCFILE [FN]   inspect compiled .zwc cache (list or one fn)
+
+VM debugging (stdout; does not suppress execution):
+  --disasm       print fusevm opcodes for each compiled unit before VM run
+
+Editor integration (served by zshrs itself, consumed by editors/intellij
+and other LSP/DAP clients — Helix, Neovim, VS Code, …):
+  --lsp                  LSP server on stdio (completion / hover / definition
+                         / references / rename / documentSymbol / foldingRange
+                         / semanticTokens / formatting / diagnostics)
+  --dap [HOST:PORT]      DAP debug adapter. With HOST:PORT, connects back to the
+                         IDE's listener over TCP (JetBrains). Without, serves DAP
+                         over stdio (for executable-spawned clients, e.g. VS Code)
+  --dump-reflection      emit the JSON consumed by the IntelliJ "zshrs"
+                         reflection tool window (builtins / keywords / options
+                         / special_vars, each tagged by category)
+  --dump-plugins         emit the JSON consumed by the IntelliJ External
+                         Libraries view: every sourced plugin grouped by
+                         manager (zinit / oh-my-zsh / prezto / antidote /
+                         antigen / zplug / zsh-more-completions / zpwr / loose)
+  --docs                 open the reference book (paged, searchable; keys: ?)
+  --docs NAME            render the hover card the LSP would return for NAME
+                         (used by the IntelliJ tool window's docs popup)
+  --docs PAGE | -t | -l | -s PAT
+                         print a book page, the contents, every topic,
+                         or the topics matching PAT
+
+Parity modes (caches OFF, daemon OFF — match the named reference shell
+byte-for-byte; every `source` re-runs the file fresh, every echo re-fires):
+  --zsh        identical-behaviour drop-in for /bin/zsh (compat-test entrypoint)
+  --bash       identical-behaviour drop-in for /bin/bash
+  --ksh        identical-behaviour drop-in for /bin/ksh (ksh-93)
+  --mksh       identical-behaviour drop-in for mksh (MirBSD ksh; ksh base)
+  --pdksh      identical-behaviour drop-in for pdksh (Public Domain ksh; ksh base)
+  --sh         identical-behaviour drop-in for /bin/sh / POSIX (alias of --posix)
+  --dash       identical-behaviour drop-in for /bin/dash (strict POSIX subset)
+  --ash        identical-behaviour drop-in for ash (Almquist; alias of --dash)
+  --csh        identical-behaviour drop-in for /bin/csh
+  --posix      identical-behaviour drop-in for /bin/sh (Bourne)
+  --emulate MODE  alias for --MODE (zsh-compat: `emulate zsh` etc.)
+  --zsh-compat alias of --zsh (legacy spelling)
+
+bash startup-file options (`--bash` only; ignored in the other modes):
+  --norc            do not read ~/.bashrc for an interactive non-login shell
+  --noprofile       do not read /etc/profile or the ~/.bash_profile chain
+  --rcfile FILE     read FILE instead of ~/.bashrc
+  --init-file FILE  alias of --rcfile
+Every drop-in reads ITS OWN startup files, not zsh's (skipped by -f /
+--no-rcs, as always):
+  --bash    login: /etc/profile + first of ~/.bash_profile, ~/.bash_login,
+            ~/.profile.  interactive non-login: /etc/bash.bashrc (where
+            present) + ~/.bashrc.  non-interactive: $BASH_ENV.
+            login exit: ~/.bash_logout
+  --ksh     login: /etc/profile + ~/.profile.  interactive: /etc/ksh.kshrc
+            (where present) + $ENV, defaulting to ~/.kshrc
+  --mksh    as --ksh, but $ENV defaults to ~/.mkshrc
+  --pdksh   as --ksh, but $ENV has no default
+  --sh/--posix/--dash/--ash
+            login: /etc/profile + ~/.profile.  interactive: $ENV (no default)
+  --csh     always: /etc/csh.cshrc + ~/.tcshrc, or ~/.cshrc if absent.
+            login also: /etc/csh.login + ~/.login.  login exit: ~/.logout
+An interactive LOGIN shell reads both its profile AND its interactive file
+in every mode except --bash, which reads the profile only.
+
+Argv[0] inference: invoking the binary as `ksh` / `sh` / `csh` / `bash`
+(via symlink or hardlink) selects the matching mode automatically, matching
+C zsh's behaviour at Src/init.c:1869+. Use the explicit `--MODE` flag to
+override.
+
+Default mode (no flag) is full zshrs: rkyv script_cache + plugin_cache
++ daemon enabled. Use the parity flags for compat testing or when caching
+behavior is unwanted.
+
+Standard zsh options:
+  -b           end option processing, like --
+  -c           take first argument as a command to execute
+  -f           equivalent to --no-rcs (don't source startup files)
+  -i           force interactive mode
+  -l           force login shell mode
+  -s           read commands from stdin
+  -o OPTION    set an option by name (see below)
+  -v           verbose (equivalent to --verbose)
+  -x           xtrace (equivalent to --xtrace)
+
+Normal options are named.  An option may be turned on by
+`-o OPTION', `--OPTION', `+o no_OPTION' or `+-no-OPTION'.  An
+option may be turned off by `-o no_OPTION', `--no-OPTION',
+`+o OPTION' or `+-OPTION'.  Options are listed below only in
+`--OPTION' or `--no-OPTION' form.
+
+Named options:
+  --aliases
+  --aliasfuncdef
+  --allexport
+  --alwayslastprompt
+  --alwaystoend
+  --appendcreate
+  --appendhistory
+  --autocd
+  --autocontinue
+  --autolist
+  --automenu
+  --autonamedirs
+  --autoparamkeys
+  --autoparamslash
+  --autopushd
+  --autoremoveslash
+  --autoresume
+  --badpattern
+  --banghist
+  --bareglobqual
+  --bashautolist
+  --bashrematch
+  --beep
+  --bgnice
+  --braceccl
+  --bsdecho
+  --caseglob
+  --casematch
+  --casepaths
+  --cbases
+  --cdablevars
+  --cdsilent
+  --chasedots
+  --chaselinks
+  --checkjobs
+  --checkrunningjobs
+  --clobber
+  --clobberempty
+  --combiningchars
+  --completealiases
+  --completeinword
+  --continueonerror
+  --correct
+  --correctall
+  --cprecedences
+  --cshjunkiehistory
+  --cshjunkieloops
+  --cshjunkiequotes
+  --cshnullcmd
+  --cshnullglob
+  --debugbeforecmd
+  --dvorak
+  --emacs
+  --equals
+  --errexit
+  --errreturn
+  --evallineno
+  --exec
+  --extendedglob
+  --extendedhistory
+  --flowcontrol
+  --forcefloat
+  --functionargzero
+  --glob
+  --globalexport
+  --globalrcs
+  --globassign
+  --globcomplete
+  --globdots
+  --globstarshort
+  --globsubst
+  --hashcmds
+  --hashdirs
+  --hashexecutablesonly
+  --hashlistall
+  --histallowclobber
+  --histbeep
+  --histexpiredupsfirst
+  --histfcntllock
+  --histfindnodups
+  --histignorealldups
+  --histignoredups
+  --histignorespace
+  --histlexwords
+  --histnofunctions
+  --histnostore
+  --histreduceblanks
+  --histsavebycopy
+  --histsavenodups
+  --histsubstpattern
+  --histverify
+  --hup
+  --ignorebraces
+  --ignoreclosebraces
+  --ignoreeof
+  --incappendhistory
+  --incappendhistorytime
+  --interactive
+  --interactivecomments
+  --ksharrays
+  --kshautoload
+  --kshglob
+  --kshoptionprint
+  --kshtypeset
+  --kshzerosubscript
+  --listambiguous
+  --listbeep
+  --listpacked
+  --listrowsfirst
+  --listtypes
+  --localloops
+  --localoptions
+  --localpatterns
+  --localtraps
+  --login
+  --longlistjobs
+  --magicequalsubst
+  --mailwarning
+  --markdirs
+  --menucomplete
+  --monitor
+  --multibyte
+  --multifuncdef
+  --multios
+  --nomatch
+  --notify
+  --nullglob
+  --numericglobsort
+  --octalzeroes
+  --overstrike
+  --pathdirs
+  --pathscript
+  --pipefail
+  --posixaliases
+  --posixargzero
+  --posixbuiltins
+  --posixcd
+  --posixidentifiers
+  --posixjobs
+  --posixstrings
+  --posixtraps
+  --printeightbit
+  --printexitvalue
+  --privileged
+  --promptbang
+  --promptcr
+  --promptpercent
+  --promptsp
+  --promptsubst
+  --pushdignoredups
+  --pushdminus
+  --pushdsilent
+  --pushdtohome
+  --rcexpandparam
+  --rcquotes
+  --rcs
+  --recexact
+  --rematchpcre
+  --restricted
+  --rmstarsilent
+  --rmstarwait
+  --sharehistory
+  --shfileexpansion
+  --shglob
+  --shinstdin
+  --shnullcmd
+  --shoptionletters
+  --shortloops
+  --shortrepeat
+  --shwordsplit
+  --singlecommand
+  --singlelinezle
+  --sourcetrace
+  --sunkeyboardhack
+  --transientrprompt
+  --trapsasync
+  --typesetsilent
+  --typesettounset
+  --unset
+  --verbose
+  --vi
+  --warncreateglobal
+  --warnnestedvar
+  --xtrace
+  --zle
+
+Option aliases:
+  --braceexpand            equivalent to --no-ignorebraces
+  --dotglob                equivalent to --globdots
+  --hashall                equivalent to --hashcmds
+  --histappend             equivalent to --appendcreate
+  --histexpand             equivalent to --badpattern
+  --log                    equivalent to --no-histnofunctions
+  --mailwarn               equivalent to --mailwarning
+  --onecmd                 equivalent to --singlecommand
+  --physical               equivalent to --cdsilent
+  --promptvars             equivalent to --promptsubst
+  --stdin                  equivalent to --shinstdin
+  --trackall               equivalent to --hashcmds
+
+Option letters:
+  -0    equivalent to --completeinword
+  -1    equivalent to --printexitvalue
+  -2    equivalent to --no-autoresume
+  -3    equivalent to --no-nomatch
+  -4    equivalent to --globdots
+  -5    equivalent to --notify
+  -6    equivalent to --beep
+  -7    equivalent to --ignoreeof
+  -8    equivalent to --markdirs
+  -9    equivalent to --autocontinue
+  -B    equivalent to --no-bashrematch
+  -C    equivalent to --no-checkjobs
+  -D    equivalent to --pushdtohome
+  -E    equivalent to --pushdsilent
+  -F    equivalent to --no-glob
+  -G    equivalent to --nullglob
+  -H    equivalent to --rmstarsilent
+  -I    equivalent to --ignorebraces
+  -J    equivalent to --appendhistory
+  -K    equivalent to --no-badpattern
+  -L    equivalent to --sunkeyboardhack
+  -M    equivalent to --singlelinezle
+  -N    equivalent to --autoparamslash
+  -O    equivalent to --continueonerror
+  -P    equivalent to --rcexpandparam
+  -Q    equivalent to --pathdirs
+  -R    equivalent to --longlistjobs
+  -S    equivalent to --recexact
+  -T    equivalent to --cbases
+  -U    equivalent to --mailwarning
+  -V    equivalent to --no-promptcr
+  -W    equivalent to --autoremoveslash
+  -X    equivalent to --listtypes
+  -Y    equivalent to --menucomplete
+  -Z    equivalent to --zle
+  -a    equivalent to --allexport
+  -d    equivalent to --no-globalrcs
+  -e    equivalent to --errexit
+  -f    equivalent to --no-rcs
+  -g    equivalent to --histignorespace
+  -h    equivalent to --histignoredups
+  -i    equivalent to --interactive
+  -k    equivalent to --interactivecomments
+  -l    equivalent to --login
+  -m    equivalent to --monitor
+  -n    equivalent to --no-exec
+  -p    equivalent to --privileged
+  -r    equivalent to --restricted
+  -s    equivalent to --shinstdin
+  -t    equivalent to --singlecommand
+  -u    equivalent to --no-unset
+  -v    equivalent to --verbose
+  -w    equivalent to --cdsilent
+  -x    equivalent to --xtrace
+  -y    equivalent to --shwordsplit
+"#
+    );
+}
+
+/// Shell mode: zshrs (default), --zsh (zsh drop-in), --bash (bash drop-in),
+/// --posix (POSIX sh / Bourne strict).
+///
+/// Each mode is a parity-target: the visible behavior should match the named
+/// shell byte-for-byte where the script under test only uses features common
+/// to that shell. zshrs's caches, daemon, and zshrs-exclusive builtins are
+/// disabled in every mode except `Zshrs` so observable side-effects (stdout,
+/// signal handlers, file I/O) re-fire on every invocation just like the
+/// reference shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellMode {
+    /// Full zshrs — all features, --doctor, plugin cache UI, exclusive builtins.
+    Zshrs,
+    /// zsh drop-in — identical to C zsh (Src/builtin.c bin_dot, no caches,
+    /// no daemon, no plugin replay). Used for compat-testing zshrs against
+    /// /bin/zsh with `zshrs --zsh script.zsh`.
+    Zsh,
+    /// bash drop-in — bash 5.x semantics. zsh extensions disabled; bash-only
+    /// features (e.g. `BASH_VERSION`, `[[ =~ ]]` BASH_REMATCH, `mapfile`,
+    /// `readarray`, `${arr[@]: ... }` slice rules) preferred. No caches,
+    /// no daemon. Used for `zshrs --bash script.sh` parity tests against
+    /// /bin/bash.
+    Bash,
+    /// ksh-93 drop-in — Korn-shell semantics. Applies the same option
+    /// presets that `emulate ksh` would (`ksharrays`, `kshglob`,
+    /// `shwordsplit`, `posixbuiltins`, `kshoptionprint`, `promptbang`,
+    /// etc.). zsh-only extensions disabled. No caches, no daemon. Used
+    /// for `zshrs --ksh script.ksh` parity tests against /bin/ksh.
+    Ksh,
+    /// POSIX sh / Bourne strict — only POSIX builtins, no zsh / bash
+    /// extensions, no arrays, no `[[`, no extended globbing, no SQLite
+    /// caches, no worker pool, no daemon. Used for parity tests against
+    /// `/bin/sh` (Bourne).
+    Posix,
+    /// dash (Debian Almquist Shell) strict — `sh` emulation PLUS the
+    /// strict-POSIX syntactic subset that makes zshrs reject exactly what
+    /// `/bin/dash` rejects: `$'...'`, `<<<`, `+=`, `name=(...)` arrays,
+    /// the `[[ ]]` reserved word, arith `**` / `,`, and non-XSI echo.
+    /// Drives `emulate("dash")` → `EMULATE_SH` + `DASH_STRICT`. Used for
+    /// parity tests against `/bin/dash` with `zshrs --dash script.sh`.
+    Dash,
+}
+
+static mut SHELL_MODE: ShellMode = ShellMode::Zshrs;
+
+/// Global log file path for zshrs background operations (compinit, etc.)
+pub fn zshrs_log_path() -> PathBuf {
+    // Single source of truth: zsh::log::log_path() honors $ZSHRS_HOME
+    // and falls back to ~/.zshrs/zshrs.log.
+    zsh::log::log_path()
+}
+/// `shell_mode` — see implementation.
+pub fn shell_mode() -> ShellMode {
+    unsafe { SHELL_MODE }
+}
+/// `is_zsh_mode` — see implementation.
+pub fn is_zsh_mode() -> bool {
+    matches!(shell_mode(), ShellMode::Zsh)
+}
+/// `is_bash_mode` — see implementation.
+pub fn is_bash_mode() -> bool {
+    matches!(shell_mode(), ShellMode::Bash)
+}
+/// `is_ksh_mode` — see implementation.
+pub fn is_ksh_mode() -> bool {
+    matches!(shell_mode(), ShellMode::Ksh)
+}
+/// `is_posix_mode` — see implementation.
+pub fn is_posix_mode() -> bool {
+    matches!(shell_mode(), ShellMode::Posix)
+}
+/// `is_dash_mode` — true in strict-dash parity mode (`zshrs --dash`).
+pub fn is_dash_mode() -> bool {
+    matches!(shell_mode(), ShellMode::Dash)
+}
+/// `is_zshrs_mode` — see implementation.
+pub fn is_zshrs_mode() -> bool {
+    matches!(shell_mode(), ShellMode::Zshrs)
+}
+
+/// Legacy compat shim — maps to --zsh mode
+pub fn is_zsh_compat() -> bool {
+    is_zsh_mode()
+}
+
+/// Recovery of the process-entry environment.
+///
+/// zsh reads `extern char **environ` in `createparamtable`
+/// (c:Src/params.c:893) and nothing in the zsh process mutates it before
+/// that point, so the C shell always imports exactly what `execve` passed.
+/// A Rust binary on macOS does not get that for free: dyld runs the
+/// initializers of every linked library before `main`, and CoreFoundation's
+/// initializer calls `setenv("__CF_USER_TEXT_ENCODING", ...)`. CF is linked
+/// transitively (chrono -> iana-time-zone -> core-foundation-sys, and
+/// notify -> fsevent-sys -> CoreServices -> CoreFoundation), neither of
+/// which can be dropped: `cron` pins `chrono` with `features = ["clock"]`
+/// and `notify-debouncer-mini` pins `notify` with default features, so
+/// Cargo's feature unification re-enables both no matter what this crate
+/// requests. The result is one phantom parameter in every environment- or
+/// parameter-enumerating completion.
+///
+/// The fix uses the one copy of the environment that CF's `setenv` cannot
+/// reach. Mach-O `__DATA,__mod_init_func` entries are invoked by dyld with
+/// the C `main` signature plus extras — `(argc, argv, envp, apple, vars)` —
+/// and that `envp` is the array the kernel wrote onto the process stack at
+/// `execve` time, not the `environ` pointer. When `setenv` has to grow the
+/// array (which is what adding a new name always requires) it allocates a
+/// fresh one on the heap and repoints `environ` at it, leaving the stack
+/// array untouched. So a variable that the parent never passed is by
+/// construction absent here, while every variable the parent did pass is
+/// still present.
+///
+/// Verified with a standalone probe binary linking chrono:
+/// `env -i A=1 B=2 C=3 ./probe` reported `orig_n=3 live_n=4`, the single
+/// extra live name being `__CF_USER_TEXT_ENCODING`; with a 409-variable
+/// inherited environment it reported `orig_n=409 live_n=409` with no name
+/// added, dropped, or value-changed. Nothing pre-`main` calls `unsetenv`,
+/// which is the only operation that could shift entries out of the stack
+/// array; if that ever changed, the affected name would be missing from
+/// the live environment too, so the shell cannot end up worse off.
+///
+/// Value-only caveat: when the parent *did* export
+/// `__CF_USER_TEXT_ENCODING`, `setenv` overwrites the array slot in place
+/// (the array is not grown), so the recovered value is CF's rewritten one
+/// rather than the inherited one. That divergence is pre-existing and
+/// already pinned by `export_minus_p_full_dump` in
+/// `tests/parity/zsh_compat_parity_gaps.rs`; only the phantom-name case is
+/// addressed here.
+#[cfg(target_os = "macos")]
+mod initial_env {
+    use std::ffi::CStr;
+    use std::os::raw::{c_char, c_int};
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    /// The stack `envp` dyld handed us, or null if the initializer never
+    /// ran (e.g. a future linker drops the section). Null means "fall
+    /// back to the live environment"; a non-null pointer to an
+    /// immediately-NULL-terminated array is a genuinely empty
+    /// environment (`env -i`) and must be honoured as such.
+    static ENTRY_ENVP: AtomicPtr<*const c_char> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// dyld passes `(argc, argv, envp, apple, vars)`; the trailing
+    /// arguments are ignored, which is ABI-safe in both the SysV and
+    /// AAPCS64 C calling conventions.
+    extern "C" fn capture_entry_envp(
+        _argc: c_int,
+        _argv: *const *const c_char,
+        envp: *mut *const c_char,
+        _apple: *const *const c_char,
+    ) {
+        ENTRY_ENVP.store(envp, Ordering::SeqCst);
+    }
+
+    #[link_section = "__DATA,__mod_init_func"]
+    #[used]
+    static MOD_INIT_FUNC: [extern "C" fn(
+        c_int,
+        *const *const c_char,
+        *mut *const c_char,
+        *const *const c_char,
+    ); 1] = [capture_entry_envp];
+
+    /// Walk the captured array. Runs from `main`, after every dyld
+    /// initializer has finished, so the array is stable. Values are
+    /// decoded lossily rather than panicking the way `std::env::vars()`
+    /// does on non-UTF-8 — a shell must not die on a hostile environment.
+    pub fn snapshot() -> Option<Vec<(String, String)>> {
+        let envp = ENTRY_ENVP.load(Ordering::SeqCst);
+        if envp.is_null() {
+            return None;
+        }
+        let mut out = Vec::new();
+        // SAFETY: `envp` is the NULL-terminated array dyld passed at
+        // process entry; it lives on the process stack for the lifetime
+        // of the process and libc never frees or shortens it.
+        unsafe {
+            let mut i = 0isize;
+            loop {
+                let entry = *envp.offset(i);
+                if entry.is_null() {
+                    break;
+                }
+                let s = String::from_utf8_lossy(CStr::from_ptr(entry).to_bytes());
+                if let Some((name, value)) = s.split_once('=') {
+                    out.push((name.to_string(), value.to_string()));
+                }
+                i += 1;
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Delete from the live process environment every name that was injected
+/// after `execve` and before `main` — i.e. every live name absent from the
+/// process-entry `envp`. In practice that set is exactly
+/// `{__CF_USER_TEXT_ENCODING}` (empty when the parent already exported it).
+///
+/// Fixing the parameter-table import alone is not enough. `getsparam` falls
+/// back to the live environment on a table miss
+/// (`src/ported/params.rs:5544-5547`), as do `zgetenv`
+/// (`src/ported/params.rs:11228`) and `findenv`
+/// (`src/ported/params.rs:11212`), so an injected variable stays visible to
+/// `${+name}` and friends however clean the table is. It would also be
+/// exported to every child process, which zsh's children never see. Pruning
+/// the live environment closes all of those at once and leaves the process
+/// environment byte-identical to what zsh would be running with.
+///
+/// Only names the parent provably did not pass are removed, so no
+/// inherited variable can be lost. CoreFoundation reads
+/// `__CF_USER_TEXT_ENCODING` once from its own initializer and only
+/// re-publishes it for child processes, so removing it after `main` starts
+/// does not disturb the frameworks that are already initialised.
+#[cfg(target_os = "macos")]
+fn prune_preinit_env_injections(entry: &[(String, String)]) {
+    use std::collections::HashSet;
+    let entry_names: HashSet<&str> = entry.iter().map(|(k, _)| k.as_str()).collect();
+    let injected: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| !entry_names.contains(k.as_str()))
+        .collect();
+    for name in injected {
+        tracing::debug!(
+            "pruning pre-main environment injection: {} (absent from process-entry envp)",
+            name
+        );
+        std::env::remove_var(name);
+    }
+}
+
+/// Non-macOS: no pre-`main` initializer rewrites the environment, so the
+/// live one already is the process-entry one and no recovery is needed.
+#[cfg(not(target_os = "macos"))]
+mod initial_env {
+    pub fn snapshot() -> Option<Vec<(String, String)>> {
+        None
+    }
+}
+
+/// Process-entry setup: everything that has to happen once, before any
+/// dispatch path forks off, and that the C shell does in `zsh_main`/`main`
+/// before it looks at argv — the `$SECONDS` stamp, `$$`/`$PPID`, the
+/// panic log hook, the cache flush at exit, the process-entry environment,
+/// bundled docs on `MANPATH`, default SIGPIPE.
+///
+/// Run from [`zshrs_main`], not from `main`: the fat `zshrs-native` binary
+/// registers its builtins and then calls `zshrs_main` directly, so setup
+/// that lived in `main` never ran there (no atexit flush: a script run as
+/// `zshrs FILE` left the process through `std::process::exit` and its
+/// compiled program was never written to `scripts.rkyv`).
+fn process_entry_init() {
+    // Read the inherited signal dispositions before anything below installs
+    // or resets one (the SIGPIPE reset further down, the init_signals replay).
+    // bash's trap builtin needs the original SIG_IGN set (BUGS.md #1109).
+    zsh::startup_signals::snapshot_inherited_ignores();
+    // c:Src/init.c:1121 — `zgettime_monotonic_if_available(&shtimer);
+    // /* init $SECONDS */`. C stamps `shtimer` once, at shell start.
+    // zshrs's analog is a lazily-primed OnceLock
+    // (`params::shtimer_lock()`), and the `-c` driver never reaches
+    // `setupvals` (it dispatches straight into `ShellExecutor::new`), so
+    // nothing stamped it: the FIRST reader primed it to its own "now",
+    // making every elapsed-since-shell-start measurement come out ~0.
+    //   zsh   -fc 'sleep 2.2; print $SECONDS'  -> 2
+    //   zshrs -fc 'sleep 2.2; print $SECONDS'  -> 0   (before this)
+    //   zsh   -fc 'sleep 0.5; time'  -> `shell … 1% cpu 0.511 total`
+    //   zshrs -fc 'sleep 0.5; time'  -> `… 1875199% cpu 0.000 total`
+    // Merely TOUCHING the lock primes it to the current instant, which is
+    // exactly C's stamp; doing it here — the process entry point, before
+    // any dispatch path forks off — covers `-c`, script and interactive
+    // alike. Must stay the first statement so shell init cannot skew it.
+    let _ = zsh::ported::params::shtimer_lock(); // c:1121
+    // c:Src/init.c:1226-1227 — `ppid = getppid(); mypid = getpid();`, the
+    // values `$PPID` / `$$` read for the life of the shell (a forked
+    // pipeline stage or `&` job keeps them). `setupvals` stores them too,
+    // but the emulation drivers (`--bash`, `--sh`, `--ksh`, …) dispatch
+    // without reaching it, which left both at 0 there. Same process-entry
+    // placement, and the same reason, as the `shtimer` stamp above.
+    zsh::ported::params::ppid.store(
+        unsafe { libc::getppid() } as i64,
+        std::sync::atomic::Ordering::Relaxed,
+    ); // c:1226
+    zsh::ported::params::mypid.store(
+        unsafe { libc::getpid() } as i64,
+        std::sync::atomic::Ordering::Relaxed,
+    ); // c:1227
+    // !!! WARNING: RUST-ONLY — NO C COUNTERPART !!!
+    // C cannot panic, so there is nothing to port here; this exists purely to
+    // make a Rust panic diagnosable after the fact.
+    //
+    // Why: a panic inside a completion widget is currently a dead end. The
+    // parity harness scans the pty stream for the `panicked at` marker and
+    // records only that marker, throwing the message, location and backtrace
+    // away — and a completion may run external programs on the same pty (the
+    // user's `_files` falls through to `fasd -f | stryke -e …` whenever
+    // `_path_files` comes back empty, e.g. on a buffer with a leading `//`),
+    // so a panic from a CHILD is indistinguishable from one in this process.
+    // A crash sighted on 2026-09-07 cost ~300 sessions of re-running and was
+    // never reproduced or located, because nothing kept the text.
+    //
+    // This is purely ADDITIVE: it appends to the log and then calls the
+    // previous hook, so stderr output is byte-for-byte unchanged. That matters
+    // beyond politeness — the harness's crash DETECTION keys on the default
+    // hook's `panicked at` line, and swallowing it would silently turn every
+    // future crash into a plain divergence. The `pid=` field is what tells a
+    // zshrs panic apart from a child's.
+    //
+    // The hook must never itself panic: every step is best-effort, and a
+    // failure to open the log is dropped rather than reported, because the
+    // process is already dying and terminal chatter is forbidden.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown location>".to_string());
+            let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // force_capture, not capture: this must not depend on
+            // RUST_BACKTRACE being set in the environment that crashed.
+            let bt = std::backtrace::Backtrace::force_capture();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(zshrs_log_path())
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "=== zshrs PANIC epoch={secs} pid={} ===\n\
+                     location: {loc}\n\
+                     message : {msg}\n\
+                     backtrace:\n{bt}",
+                    std::process::id()
+                );
+            }
+            default_hook(info);
+        }));
+    }
+    // !!! WARNING: RUST-ONLY — NO C COUNTERPART !!!
+    // Register the autoload-cache flush as a libc atexit hook. `preprompt()`
+    // covers the interactive loop and `zexit` covers a normal unwind, but
+    // NEITHER runs on the paths that end a one-shot: `-c` leaves through
+    // `std::process::exit` below, and the `exit` builtin terminates the
+    // process directly. `std::process::exit` runs no Rust destructors, so
+    // every `zshrs -c` was recompiling its autoloads and writing nothing
+    // back. Registered here, at the process entry point before any dispatch
+    // path forks off, for the same reason the stamp above is.
+    zsh::autoload_cache::install_atexit_flush();
+                                                 // c:Src/params.c:893 createparamtable reads `environ` exactly as
+                                                 // it was at process entry. Snapshot it as the first statement so
+                                                 // nothing later in shell init (setenv from builtins, lazy crate
+                                                 // init) skews the import.
+                                                 //
+                                                 // On macOS `std::env::vars()` is NOT the process-entry environment:
+                                                 // zshrs links CoreFoundation (chrono -> iana-time-zone ->
+                                                 // core-foundation-sys) and CoreServices (notify -> fsevent-sys), and
+                                                 // CF's dyld initializer runs before `main` and `setenv`s
+                                                 // __CF_USER_TEXT_ENCODING. zsh links neither, so it imports an
+                                                 // environment without that variable. `initial_env::snapshot()`
+                                                 // recovers the real one from the stack `envp` dyld hands to a
+                                                 // `__mod_init_func` entry (see the module below); it returns None on
+                                                 // non-macOS and on any capture failure, in which case the live
+                                                 // environment is used exactly as before. The kernel's exec-image copy
+                                                 // (sysctl KERN_PROCARGS2) was tried earlier and REJECTED: it silently
+                                                 // truncates large environments (tail vars vanish).
+    let entry_env = initial_env::snapshot();
+    #[cfg(target_os = "macos")]
+    if let Some(entry) = entry_env.as_deref() {
+        prune_preinit_env_injections(entry);
+    }
+    let mut entry_env = entry_env.unwrap_or_else(|| std::env::vars().collect());
+    // zshrs ships zsh's man/info pages (build.rs packs vendor/zsh/{man1,info};
+    // bundled_docs writes ~/.zshrs/{man,info}). Their directories have to go
+    // onto MANPATH/INFOPATH HERE, while the snapshot is still mutable: once
+    // it is frozen, paramtab is built from it and a later setenv can no
+    // longer change what `$INFOPATH` reports in the shell.
+    //
+    // The drop-in flag (set again with the rest of the mode at the CLI-mode
+    // block below) has to be known HERE: `--zsh` publishes none of the
+    // bundled-docs paths, because zsh itself sets none of them.
+    zsh::extensions::dash_mode::set_zsh_dropin(
+        std::env::args_os().any(|a| a == "--zsh" || a == "--zsh-compat"),
+    );
+    zsh::bundled_docs::publish_into(&mut entry_env);
+    let _ = zsh::ported::params::environ.set(entry_env);
+    // Restore default SIGPIPE behavior before anything writes to
+    // stdout/stderr. Rust runtime installs SIG_IGN on SIGPIPE in
+    // some Linux builds and ignores it on macOS — either way,
+    // writes to a closed pipe yield an EPIPE error that bubbles
+    // up and panics the println!/writeln! callers in any builtin
+    // emitting multi-line output (\`set -o\`, \`setopt\`,
+    // \`functions\`, etc.).
+    //
+    // zsh-the-program writes are bare write() syscalls with no
+    // EPIPE recovery, so the C process dies silently with status
+    // 141 on SIGPIPE. Match that: install SIG_DFL so we terminate
+    // on broken pipe instead of panicking. Test: \`set -o | head -3\`
+    // exited 1 with a panic stack trace; with SIG_DFL it exits 141
+    // and emits only the head'd lines.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
+    // The shell runs on the main thread (keeping all signal/job-control
+    // semantics intact). Deep function recursion needs a large stack —
+    // each zshrs call frame is heavy (fusevm executor state, closures,
+    // parse buffers) and real configs (p10k/zinit precmd hooks) nest
+    // deeply per call, so on the default 8 MB main-thread stack a deep
+    // (or runaway) recursion overflowed and SEGFAULTed before the
+    // FUNCNEST guard could fire. Rather than move the shell onto a
+    // spawned thread (which breaks async-signal/trap delivery — signals
+    // race to worker threads), the main-thread stack itself is enlarged
+    // at link time via `-stack_size` (see build.rs). That lets recursion
+    // up to FUNCNEST (default 500) complete and lets the guard turn true
+    // runaways into a zsh-matching error instead of a crash.
+}
+
+fn main() {
+    // C's `home` is NULL when the shell starts without `$HOME`, which `cd` reports (c:881).
+    zsh::ported::params::HOME_NULL.store(
+        std::env::var_os("HOME").is_none(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    zshrs_main();
+}
+
+/// The process argv as the shell pipeline's `String`s.
+///
+/// C zsh takes `argv` as bytes and metafies it (c:Src/init.c:1910
+/// `metafy(*t, -1, META_ALLOC)`), so an argument that is not valid
+/// UTF-8 — `zsh -fc $'[[ bj\xf6rn = *[\xf6]* ]]'`, D02glob's "single byte
+/// match with top bit set" — runs like any other. `std::env::args()` panics
+/// on such an argument; decode each one the way a script file's bytes are
+/// decoded instead, so the byte reaches the lexer Meta-encoded.
+fn argv_strings() -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    env::args_os()
+        .map(|a| zsh::script_bytes::decode_script_bytes(a.as_bytes()))
+        .collect()
+}
+
+/// Main entry point — extracted so the fat binary can call it after
+/// registering the stryke handler.
+pub fn zshrs_main() {
+    // Once per process; see `process_entry_init`.
+    static ENTRY_INIT: std::sync::Once = std::sync::Once::new();
+    ENTRY_INIT.call_once(process_entry_init);
+    // Initialize logging first — everything after this can use tracing macros.
+    let startup_t0 = Instant::now();
+    zsh::startup_trace::init(startup_t0);
+    zsh::startup_trace::mark("main entry");
+
+    // Make sure ~/.zshrs exists with the default config files. Every
+    // binary (zshrs / zshrs-daemon / zshrs-recorder / zd) does this,
+    // so whoever runs first gets the user a fully-populated
+    // `~/.zshrs/` tree without manual intervention. Idempotent —
+    // never overwrites a user-edited file.
+    #[cfg(feature = "daemon")]
+    if let Ok(paths) = zshrs_daemon::paths::CachePaths::resolve() {
+        let _ = paths.ensure_dirs();
+        let _ = paths.ensure_default_configs();
+    }
+
+    // Hand the daemon-crate `zsync up --all` builtin a snapshot
+    // function it can call into the executor with. The shell crate
+    // owns ShellExecutor; the daemon crate (where the zsync builtin
+    // lives) doesn't link against it — this trampoline is the
+    // bridge. Idempotent — only the first registration sticks.
+    #[cfg(feature = "daemon")]
+    zshrs_daemon::zsync_builtin::register_overlay_enumerator(
+        zsh::overlay_snapshot::enumerate_all_overlays,
+    );
+
+    // Per-mode log file so the three server processes don't interleave
+    // their tracing output in `zshrs.log`:
+    //   * `zshrs --lsp` (spawned by IDE plugin) → `zshrs-lsp.log`
+    //   * `zshrs --dap HOST:PORT` (spawned per debug session) → `zshrs-dap.log`
+    //   * everything else (interactive shell, --version, --docs, …) → `zshrs.log`
+    // The plugin side has its own `zshrs-plugin.log` (ZshrsDebugLog).
+    // Daemon already routes through `zshrs-daemon.log` via daemon/log.rs.
+    // OnceLock semantics mean only the first init() call wins — must
+    // scan args BEFORE calling init so the right filename is picked.
+    // Default level: info. Override with ZSHRS_LOG=debug or ZSHRS_LOG=trace.
+    let log_name = {
+        let raw_args: Vec<String> = argv_strings();
+        if raw_args.iter().any(|a| a == "--lsp") {
+            "zshrs-lsp.log"
+        } else if raw_args.iter().any(|a| a == "--dap") {
+            "zshrs-dap.log"
+        } else {
+            "zshrs.log"
+        }
+    };
+    zsh::log::init_named(log_name);
+    zsh::startup_trace::mark("log init");
+
+    // Single-shot daemon-presence probe. Honors `[daemon].enabled` in
+    // ~/.config/zshrs/zshrs.toml (auto / off / require). After this,
+    // call sites use `zsh::daemon_presence::is_present()` for an
+    // O(1) atomic check before issuing IPC. Daemon absent = the
+    // shell runs in vanilla mode (re-evaluate every config per launch
+    // — "rebuilding your house every morning").
+    let _ = zsh::daemon_presence::probe();
+    zsh::startup_trace::mark("daemon probe");
+
+    // Arm the lineage engine when `[provenance] track_all` asks for it.
+    // Before this call the engine is inert whatever the config says —
+    // nothing has read it.
+    zsh::provenance::init_from_config();
+    zsh::startup_trace::mark("provenance init");
+
+    // Pre-warm any per-process caches that depend on knowing the
+    // current PID — pid lookup is cheap, but the call site here
+    // exists so the call appears in the trace.
+    let _ = std::process::id();
+    let pid = std::process::id();
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let path_count = env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .count();
+    let fpath_count = env::var("FPATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .count();
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    tracing::info!(
+        pid,
+        cwd = %cwd,
+        path_dirs = path_count,
+        fpath_dirs = fpath_count,
+        cpus,
+        "zshrs starting"
+    );
+
+    let args: Vec<String> = {
+        // Expand POSIX-style clumped short options BEFORE any flag check.
+        // `zshrs -fc 'pwd'` should behave identically to `zshrs -f -c 'pwd'`
+        // — real zsh accepts both forms (verified: `zsh -fc 'pwd'` and
+        // `zsh -cf 'pwd'` both run the command). Without expansion, our
+        // dispatch's literal `args[1] == "-c"` check missed the clumped
+        // form and the binary silently exited 0 with no command run,
+        // which broke ztst harnesses and any caller copying zsh syntax.
+        //
+        // Rule: any arg matching `-[A-Za-z]{2,}` (single dash, 2+ alpha
+        // chars, no `=`, not `--`) splits into individual `-X` tokens.
+        // Long options keep the `--` prefix; numeric/symbolic clumps
+        // are left alone. Argument-consuming flags like `-c` get their
+        // value from the next argv slot after expansion, same as zsh.
+        //
+        // Exception: a clump containing `o` is left intact. c:528-529
+        // (`if (!*++*argv) argv++;`) makes the REST of the word after
+        // `o` the option NAME, so `-onullglob` is `-o nullglob` — not
+        // nine separate letters. Splitting it produced `-o -n -u -l …`
+        // and lost the option entirely; the option-word walk below
+        // handles clumps natively via its own character loop.
+        let raw: Vec<String> = argv_strings();
+        let mut out: Vec<String> = Vec::with_capacity(raw.len());
+        for (i, a) in raw.iter().enumerate() {
+            // c:Src/init.c:277 — `argv0 = argzero = posixzero = *argv++;`
+            // consumes argv[0] as the shell's NAME before a single option
+            // word is looked at. It is never an option, and a LOGIN shell
+            // is invoked with a leading dash on that name: login(1) and
+            // sshd exec the shell as `-bash` / `-zsh`. Expanding it as a
+            // clump turned `-bash` into `-b -a -s -h`, which set `$0` to
+            // `-b`, silently enabled allexport (`-a`) and the rest, and
+            // left the `argv[0]` personality inference matching `b`
+            // instead of `bash` — so `zshrs` symlinked as the user's
+            // login shell came up in the wrong mode with a corrupt `$0`.
+            if i == 0 {
+                out.push(a.clone());
+                continue;
+            }
+            let bytes = a.as_bytes();
+            let is_clumped = bytes.len() >= 3
+                && bytes[0] == b'-'
+                && bytes[1] != b'-'
+                && bytes.iter().skip(1).all(|c| c.is_ascii_alphabetic())
+                && !bytes.iter().skip(1).any(|c| *c == b'o');
+            if is_clumped {
+                for c in bytes.iter().skip(1) {
+                    out.push(format!("-{}", *c as char));
+                }
+            } else {
+                out.push(a.clone());
+            }
+        }
+        out
+    };
+
+    zsh::fusevm_disasm::set_enabled(args.iter().any(|a| a == "--disasm"));
+
+    // AOT trailer probe: if this binary was produced by `zbuild`, the last
+    // 32 bytes contain a magic + length pair pointing at a zstd-compressed
+    // payload of one-or-more shell scripts appended to the executable.
+    // Detect, decode, and run each in input order under a single executor —
+    // globals + functions defined by file N are visible to file N+1.
+    // Without a trailer this is a no-op (all binaries get the same probe).
+    if let Ok(self_exe) = env::current_exe() {
+        if let Some(embedded) = zsh::aot::try_load_embedded(&self_exe) {
+            // Remove our argv[0] (the binary path); positional args remain
+            // for the entire bundle (every file sees the same $1..$N).
+            let script_args: Vec<String> = args.iter().skip(1).cloned().collect();
+            let mut executor = zsh::vm_helper::ShellExecutor::new();
+            executor.set_pparams(script_args);
+            let mut last_status = 0;
+            for file in &embedded.0 {
+                executor.set_scalar("0".to_string(), file.name.clone());
+                last_status = match executor.execute_script(&file.source) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if e != "__SILENCED__" {
+                            eprintln!("zshrs: {}: {}", file.name, e);
+                        }
+                        std::process::exit(1);
+                    }
+                };
+                // If a script called `exit N` (zsh's exit propagates via
+                // the `returning` field in subshell-snapshot scope, but
+                // here at top scope it terminates the process directly
+                // through builtin_exit's process::exit). If we reach this
+                // line the script ran to completion without calling exit;
+                // continue to the next file.
+                //
+                // c:Src/init.c:1663 — each bundled file is source-like:
+                // an errflag abort in file N must not poison file N+1's
+                // first list. Clear the flag at the file boundary, keep
+                // last_status (the aborted file's lastval).
+                zsh::ported::utils::errflag.fetch_and(
+                    !zsh::ported::zsh_h::ERRFLAG_ERROR,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            std::process::exit(last_status);
+        }
+    }
+
+    // Argv[0] inference — matches C zsh's behaviour at
+    // Src/init.c:1869+. Invoking via `ksh` / `sh` / `csh` / `bash`
+    // symlink selects the mode before explicit flags are parsed.
+    let argv0_basename: String = args
+        .first()
+        .map(|a| {
+            let bare = a.trim_start_matches('-'); // strip login-shell `-` prefix
+            std::path::Path::new(bare)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(bare)
+                .to_string()
+        })
+        .unwrap_or_default();
+    let argv0_inferred_mode: Option<ShellMode> = match argv0_basename.as_str() {
+        "ksh" | "ksh93" | "mksh" | "pdksh" => Some(ShellMode::Ksh),
+        "dash" | "ash" => Some(ShellMode::Dash),
+        "sh" => Some(ShellMode::Posix),
+        "bash" => Some(ShellMode::Bash),
+        "zsh" | "zsh-5.9" => Some(ShellMode::Zsh),
+        _ => None,
+    };
+
+    // Handle shell mode flags. Every parity mode (`--zsh`, `--bash`,
+    // `--ksh`, `--sh`, `--csh`, `--posix`) force-disables zshrs's
+    // caches and daemon by setting `ZSHRS_CACHE=0`. Explicit flags
+    // override argv[0] inference.
+    //
+    // `--emulate MODE` form is zsh-compat (Src/init.c:443) — looks at
+    // the next arg as the mode name; same final mapping.
+    // The zsh-STYLE cross-emulation combos — `--sh --zsh`, `--ksh --zsh`, … —
+    // mean "the X OPTION deltas applied ON TOP OF zsh's own parser/semantics",
+    // i.e. exactly what `emulate X` does INSIDE a real zsh (lenient brace parse,
+    // zsh base-digit case, `let` auto-typing, …), NOT the real-shell drop-in.
+    // So SHELL_MODE stays Zsh (keeping the zsh parser); `zsh_style_emu` names
+    // the option deltas to layer on. Only fires when `--zsh` accompanies a
+    // sub-mode flag — a bare `--sh` is still the strict real-shell drop-in.
+    // c:Src/init.c:461-472 —
+    //     if (!strcmp(*argv, "emulate")) {
+    //         ++argv;
+    //         if (!*argv) {
+    //             zerr("--emulate: argument required");
+    //             exit(1);
+    //         }
+    //         if (!emulate_required) {
+    //             zerr("--emulate: must precede other options");
+    //             exit(1);
+    //         }
+    //         top_emulation = *argv;
+    //         break;
+    //     }
+    // `emulate_required` is only still set while `--emulate` is the
+    // FIRST option word (c:441 also demands `*argv == args+1`), so
+    // `zsh -f --emulate sh` is a hard error. zshrs scanned for
+    // `--emulate` anywhere in argv and, when it appeared late,
+    // silently left it unconsumed — the mode word then reached the
+    // script-file slot and died with `can't open input file: sh`
+    // (B07emulate.ztst:17).
+    if let Some(emu_idx) = args.iter().position(|a| a == "--emulate") {
+        // c:Src/init.c:282 `argzero = *argv++` runs before parseargs, while
+        // `lineno` is still 0: zwarning's prefix is argv[0] and zerrmsg
+        // prints no line number (`zsh: --emulate: argument required`).
+        zsh::ported::utils::set_argzero(Some(args[0].clone()));
+        zsh::ported::lex::set_lineno(0);
+        if args.get(emu_idx + 1).is_none() {
+            zsh::ported::utils::zerr("--emulate: argument required"); // c:464
+            std::process::exit(1); // c:465
+        }
+        // `--zsh` / `--zsh-compat` select zshrs's own drop-in mode and are not
+        // zsh options, so they do not count as preceding `--emulate`.
+        let preceding = args[1..emu_idx]
+            .iter()
+            .filter(|a| *a != "--zsh" && *a != "--zsh-compat")
+            .count();
+        if preceding != 0 {
+            zsh::ported::utils::zerr("--emulate: must precede other options"); // c:468
+            std::process::exit(1); // c:469
+        }
+    }
+    let has_zsh = args.iter().any(|a| a == "--zsh" || a == "--zsh-compat");
+    // `--zsh` is the identical-behaviour drop-in, so the zshrs-only SYNTAX
+    // extensions go off with it — otherwise the compat entrypoint accepts
+    // input `/bin/zsh` rejects. Gates the `intercept … { … }` block body in
+    // the lexer; see `dash_mode::ZSH_DROPIN`.
+    zsh::extensions::dash_mode::set_zsh_dropin(has_zsh);
+    let zsh_style_emu: Option<&str> = if has_zsh {
+        if args.iter().any(|a| a == "--dash" || a == "--ash") {
+            Some("dash")
+        } else if args
+            .iter()
+            // bash shares the sh emulation base, so it selects the same mode.
+            .any(|a| a == "--posix" || a == "--sh" || a == "--bash")
+        {
+            Some("sh")
+        } else if args
+            .iter()
+            .any(|a| a == "--ksh" || a == "--mksh" || a == "--pdksh")
+        {
+            Some("ksh")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // c:Src/init.c:461-474 — `--emulate MODE` is zsh's own option: the shell
+    // stays zsh and runs `emulate(*argv, 1, &emulation, opts)`, a FULL
+    // emulation installed before any later option word is read (so `-f`
+    // after `--emulate sh` is read with kshletters).
+    let cli_emulate: Option<&str> = args
+        .iter()
+        .position(|a| a == "--emulate")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str());
+    let explicit_mode: Option<ShellMode> = if zsh_style_emu.is_some() || cli_emulate.is_some() {
+        // zsh-STYLE and `--emulate`: zsh parser/semantics; the option deltas
+        // apply via emu_name.
+        Some(ShellMode::Zsh)
+    } else if args.iter().any(|a| a == "--dash" || a == "--ash") {
+        // ash and dash are the same Almquist strict-POSIX shell family.
+        Some(ShellMode::Dash)
+    } else if args.iter().any(|a| a == "--posix" || a == "--sh") {
+        Some(ShellMode::Posix)
+    } else if args.iter().any(|a| a == "--bash") {
+        Some(ShellMode::Bash)
+    } else if args
+        .iter()
+        .any(|a| a == "--ksh" || a == "--mksh" || a == "--pdksh")
+    {
+        // mksh (MirBSD Korn shell) and pdksh (Public Domain Korn shell)
+        // use the same ksh emulation base.
+        Some(ShellMode::Ksh)
+    } else if args.iter().any(|a| a == "--csh") {
+        // csh emulation routes to Zsh mode (zshrs has no separate csh
+        // bucket; `emulate csh` flips the canonical option deltas via
+        // `crate::ported::options::emulate("csh", true)` below).
+        Some(ShellMode::Zsh)
+    } else if args.iter().any(|a| a == "--zsh" || a == "--zsh-compat") {
+        Some(ShellMode::Zsh)
+    } else {
+        None
+    };
+    let selected_mode = explicit_mode.or(argv0_inferred_mode);
+    let parity_mode_selected = if let Some(mode) = selected_mode {
+        unsafe {
+            SHELL_MODE = mode;
+        }
+        // Mirror the binary-side ShellMode into the library-side
+        // IS_ZSH_MODE atomic so bridge / dispatch sites in lib that
+        // need to gate bash-compat-vs-zsh behavior can read it
+        // without a binary-to-library reach-in. Bugs
+        // #475/#504/#555 in docs/BUGS.md.
+        zsh::IS_ZSH_MODE.store(
+            matches!(mode, ShellMode::Zsh),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        true
+    } else {
+        false
+    };
+
+    // Apply the canonical emulation option deltas via the ported
+    // `crate::ported::options::emulate` (port of Src/options.c:533).
+    // This is what `emulate ksh` / `emulate sh` / `emulate csh`
+    // builtin does at runtime; calling it here from the bin entry
+    // mirrors the C source's parseopts_setemulate (Src/init.c:348)
+    // path that runs during shell init for `--ksh` etc. The Zsh /
+    // Zshrs modes still go through this to set the canonical
+    // EMULATE_ZSH bitmap (idempotent — that's the default).
+    let emu_name = if let Some(sub) = zsh_style_emu {
+        // zsh-STYLE (`--X --zsh`): SHELL_MODE is Zsh, but the sub-mode's option
+        // deltas still layer on — this is what `emulate X` inside a real zsh does.
+        sub
+    } else if let Some(mode) = cli_emulate {
+        mode
+    } else {
+        match shell_mode() {
+            ShellMode::Ksh => "ksh",
+            ShellMode::Dash => "dash", // sh emulation + DASH_STRICT (see options::emulate)
+            ShellMode::Posix => "sh",
+            ShellMode::Bash => "sh", // bash ≈ sh emulation; bash-specific bits flagged via is_bash_mode()
+            ShellMode::Zsh | ShellMode::Zshrs => "zsh",
+        }
+    };
+    if argv0_basename == "csh" || args.iter().any(|a| a == "--csh") {
+        zsh::ported::options::emulate("csh", true);
+    } else if zsh_style_emu.is_none() {
+        // Drop-in mode (`--sh`, `--ksh`, …): the shell IS that shell, so the
+        // emulation is installed before the option words are read and it is a
+        // FULL one — c:Src/init.c:361 `emulate(nam, 1, &emulation, opts)` from
+        // `parseopts_setemulate`, whose second argument (`fully`) is 1.
+        zsh::ported::options::emulate(emu_name, true);
+    }
+    // The zsh-STYLE legs (`--sh --zsh`, `--ksh --zsh`) mean "a zsh that ran
+    // `emulate X`", and that is exactly how they are referenced by the parity
+    // matrix (`zsh -f -c 'emulate sh; …'`). Two things distinguish it from the
+    // drop-in path above, and BOTH were wrong here:
+    //   * depth — the `emulate` BUILTIN passes `fully` only for `emulate -R`
+    //     (c:Src/builtin.c bin_emulate → `emulate(*args, OPT_ISSET(ops,'R'),
+    //     …)`), so a plain `emulate sh` resets only the OPT_EMULATE options
+    //     (c:Src/options.c:516). Installing it FULLY also reset the OPT_ZSH /
+    //     OPT_NONBOURNE ones, so `$options[banghist]` read off (zsh: on),
+    //     `$options[promptsubst]` on (zsh: off) and `setopt` listed 2 lines
+    //     where zsh lists 8.
+    //   * timing — zsh parses `-f` BEFORE `emulate sh` runs, i.e. with
+    //     `zshletters` (`-f` ↔ NO_RCS, c:Src/options.c:346). Installing the
+    //     emulation first turned SHOPTIONLETTERS on, so `optlookupc('f')` hit
+    //     `kshletters` instead (`-f` ↔ NO_GLOB, c:Src/options.c:424) and the
+    //     leg ran with globbing off and rcs on — the exact inverse of zsh.
+    // Deferring to the end of `apply_cli_flags` fixes both: the flags are read
+    // as zsh's, then the emulation lands on top, as the reference does.
+    let deferred_zsh_style_emu = zsh_style_emu;
+
+    // Real-shell-faithful toggle: a bare POSIX-family drop-in
+    // (`--sh`/`--ksh`/`--dash`) makes zshrs match the ACTUAL shell rather
+    // than zsh's approximation of it (e.g. trailing-empty-field splitting).
+    // Adding `--zsh` (`zshrs --sh --zsh`) selects zsh-style emulation
+    // instead by clearing the flag. See extensions::dash_mode.
+    let posix_family = matches!(
+        shell_mode(),
+        ShellMode::Posix | ShellMode::Ksh | ShellMode::Dash | ShellMode::Bash
+    );
+    let zsh_style_requested = args.iter().any(|a| a == "--zsh" || a == "--zsh-compat");
+    zsh::extensions::dash_mode::set_posix_faithful(posix_family && !zsh_style_requested);
+    if zsh::extensions::dash_mode::dash_faithful() {
+        zsh::extensions::dash_mode::dash_hide_foreign_builtins();
+    }
+
+    // `--mksh` / `--pdksh` install the same `emulate ksh` preset as `--ksh`
+    // and are otherwise indistinguishable at run time, but the pdksh line
+    // has behavior ksh93 never had. Record which line was asked for so
+    // dash_mode can answer per-shell; see dash_mode::PDKSH_FAMILY.
+    zsh::extensions::dash_mode::set_pdksh_family(
+        !zsh_style_requested && args.iter().any(|a| a == "--mksh" || a == "--pdksh"),
+    );
+
+    // bash-specific option deltas on top of the shared `sh` emulation base.
+    // bash is a SUPERSET of POSIX sh: unlike `emulate sh` (which sets
+    // IGNOREBRACES), bash performs brace expansion by default
+    // (`printf %s {a,b}` → `a b`, `{1..3}` → `1 2 3`). Re-enable it for
+    // `--bash` so it matches /bin/bash.
+    if matches!(shell_mode(), ShellMode::Bash) && !zsh_style_requested {
+        // bash's startup-file flags. These are GNU long options with no
+        // zsh option behind them, so the faithful `optlookup` walk below
+        // would reject them ("no such option"); read them off the raw
+        // argv here, the same way the shell-mode scan above reads
+        // `--bash` itself, and record them for emulation_startup.
+        // `--rcfile` / `--init-file` take the NEXT word — bash rejects
+        // the `--rcfile=FILE` form ("invalid option"), so only the
+        // separated form is accepted here too.
+        let mut ai = 1usize;
+        while ai < args.len() {
+            match args[ai].as_str() {
+                "--norc" => zsh::emulation_startup::set_norc(true),
+                "--noprofile" => zsh::emulation_startup::set_noprofile(true),
+                "--rcfile" | "--init-file" => {
+                    let Some(file) = args.get(ai + 1) else {
+                        eprintln!("zshrs: {}: option requires an argument", args[ai]);
+                        std::process::exit(2);
+                    };
+                    zsh::emulation_startup::set_rcfile(file);
+                    ai += 1;
+                }
+                // `--` ends option processing; a later `--norc` is an operand.
+                "--" => break,
+                _ => {}
+            }
+            ai += 1;
+        }
+    }
+
+    // Record which shell this process is standing in for. `ShellMode`
+    // lumps the three Korn lines and the two Almquist spellings together
+    // (they share an option preset), but each reads DIFFERENT startup
+    // files — ksh93 defaults `$ENV` to `~/.kshrc`, mksh falls back to
+    // `~/.mkshrc`, pdksh has no default — so the personality is resolved
+    // from the flag words, not from `ShellMode` alone. It also survives
+    // `zsh_main`'s `parseopts_setemulate`, which re-derives the emulation
+    // bitmap from `argv[0]` and would otherwise reset a drop-in to zsh on
+    // the interactive path.
+    if !zsh_style_requested {
+        use zsh::emulation_startup::Personality;
+        let flag = |name: &str| args.iter().any(|a| a == name);
+        let personality = match shell_mode() {
+            ShellMode::Bash => Some(Personality::Bash),
+            ShellMode::Ksh if flag("--mksh") || argv0_basename == "mksh" => Some(Personality::Mksh),
+            ShellMode::Ksh if flag("--pdksh") || argv0_basename == "pdksh" => {
+                Some(Personality::Pdksh)
+            }
+            ShellMode::Ksh => Some(Personality::Ksh93),
+            ShellMode::Dash => Some(Personality::Dash),
+            ShellMode::Posix => Some(Personality::Sh),
+            // `--csh` routes to `ShellMode::Zsh` (zshrs has no separate
+            // csh bucket), so it is recognised from the flag / argv[0].
+            ShellMode::Zsh | ShellMode::Zshrs
+                if flag("--csh") || argv0_basename == "csh" || argv0_basename == "tcsh" =>
+            {
+                Some(Personality::Csh)
+            }
+            // A bare `--zsh` and the default zshrs mode both keep zsh's
+            // own startup files, which the faithful port already owns.
+            ShellMode::Zsh | ShellMode::Zshrs => None,
+        };
+        if let Some(p) = personality {
+            zsh::emulation_startup::set_personality(p);
+            // The drop-in's option deltas on top of the shared `emulate`
+            // preset. `parseopts_setemulate` re-applies them for the
+            // interactive path, which re-installs the emulation itself.
+            zsh::emulation_startup::apply_personality_option_deltas();
+            // The shell's own default aliases. bash / dash / sh define
+            // none, ksh93 defines 19 and mksh 11; zsh's two (`run-help`,
+            // `which-command`) belong to none of them.
+            zsh::emulation_startup::install_default_aliases();
+        }
+    }
+
+    // c:Src/init.c:268-269 — `if (**argv == '-') flags |= PARSEARGS_LOGIN;`
+    // then c:351 `opts[LOGINSHELL] = ((flags & PARSEARGS_LOGIN) != 0);`.
+    // A leading dash on argv[0] is the ONLY signal that this is a login
+    // shell: login(1) and sshd exec the user's shell as `-bash` / `-zsh`.
+    // `parseargs` applies it on the interactive path, but the `-c` and
+    // script-file dispatch below never reach that function, so without
+    // this a shell started as `-bash -c CMD` reported `shopt -q
+    // login_shell` false and read no `~/.bash_logout`. Applied before the
+    // option words are replayed so an explicit flag still wins.
+    //
+    // `explicit_login` records the OTHER half: whether `-l` / `--login`
+    // was actually typed. bash reads the profile chain for an interactive
+    // login shell or a non-interactive one with `--login`, but NOT for a
+    // non-interactive shell that is login-by-argv[0] alone — see
+    // `emulation_startup::EXPLICIT_LOGIN` for the measured table.
+    {
+        let raw: Vec<String> = argv_strings();
+        if raw.first().is_some_and(|a| a.starts_with('-')) {
+            zsh::ported::options::opt_state_set("loginshell", true);
+        }
+        // Scan only the leading option words, stopping at `--` or the
+        // first operand, so an `-l` that is a command argument is not
+        // mistaken for the flag.
+        let explicit = raw
+            .iter()
+            .skip(1)
+            .take_while(|a| a.starts_with('-') && a.as_str() != "--")
+            .any(|a| a == "-l" || a == "--login");
+        zsh::emulation_startup::set_explicit_login(explicit);
+    }
+
+    // Tell the library a parity mode is in force. The zshrs-original
+    // line-editor engines (autosuggestion ghost text, input syntax
+    // highlighting, history search, autopair) default OFF from here on:
+    // none of the shells zshrs stands in for have them, so leaving them
+    // on made a `--bash` login shell paint grey suggestions and colour
+    // the command line where bash prints plain text. `--zsh` counts too —
+    // real zsh has no ghost text either.
+    zsh::emulation_startup::set_emulating(parity_mode_selected);
+    zsh::emulation_startup::set_argv0_zsh(argv0_basename == "zsh");
+
+    if parity_mode_selected {
+        // Use the process-local AtomicBool override instead of
+        // exporting `ZSHRS_CACHE=0` in env. The env-var approach
+        // imported `ZSHRS_CACHE` into paramtab during the c:893
+        // env scan, leaking into `${(k)parameters}` and inflating
+        // the count vs reference zsh by 1.
+        zsh::extensions::script_cache::CACHE_DISABLED
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(mode = ?shell_mode(), "parity mode: cache disabled via override, daemon disabled, plugin_cache replay disabled");
+    }
+    tracing::info!(mode = ?shell_mode(), "shell mode selected");
+
+    // Handle --help (must be identical to zsh --help)
+    if args.iter().any(|a| a == "--help") {
+        print_help();
+        return;
+    }
+
+    // Handle --version
+    if args.iter().any(|a| a == "--version") {
+        if argv0_basename == "zsh" {
+            // Standing in for zsh: Src/init.c:445-454 — `zsh VERSION
+            // (MACHTYPE-VENDOR-OSTYPE)`, with `[PATCHLEVEL]` after the version
+            // unless the patchlevel is the tagged release's `zsh-VER-0-…`.
+            // Scripts and plugin managers parse this line.
+            use zsh::ported::config_h::{MACHTYPE, OSTYPE, VENDOR};
+            use zsh::ported::patchlevel::{ZSH_PATCHLEVEL, ZSH_VERSION};
+            let tagged = ZSH_PATCHLEVEL.starts_with(&format!("zsh-{ZSH_VERSION}-0-"));
+            if tagged {
+                println!("zsh {ZSH_VERSION} ({MACHTYPE}-{VENDOR}-{OSTYPE})");
+            } else {
+                println!("zsh {ZSH_VERSION} [{ZSH_PATCHLEVEL}] ({MACHTYPE}-{VENDOR}-{OSTYPE})");
+            }
+        } else {
+            println!("zshrs {}", env!("CARGO_PKG_VERSION"));
+        }
+        return;
+    }
+
+    // --ztest-worker: persistent test-worker subprocess for the
+    // --ztest pool runner. Reads JSON requests from stdin, forks per
+    // request, child runs the test in-process and writes one JSON
+    // response per line to stdout. Port of stryke's --test-worker
+    // mode (../strykelang/strykelang/cli_runners.rs:204). Must be
+    // checked BEFORE any thread spawns in this process — raw
+    // libc::fork inside the loop requires the main thread is alone.
+    if args.iter().any(|a| a == "--ztest-worker") {
+        std::process::exit(zsh::ztest::run_ztest_worker_loop());
+    }
+
+    // --ztest [paths...]: shell-level unit-test runner — worker-pool
+    // architecture mirroring `stryke test` (../strykelang README
+    // [0x0C-test]). Empty paths → discover `t/` then `tests/`. Each
+    // test file is a shell script that calls `zassert_*` and ends
+    // with `ztest_run`. Implementation: src/extensions/ztest.rs.
+    //
+    // Flags consumed:
+    //   -j N    — N worker processes (default: num_cpus)
+    //   -q      — quiet (suppress per-file banners)
+    if let Some(idx) = args.iter().position(|a| a == "--ztest") {
+        let rest = &args[idx + 1..];
+        let mut j_threads: Option<String> = None;
+        let mut quiet = false;
+        let mut targets: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i].as_str() {
+                "-j" => {
+                    if i + 1 < rest.len() {
+                        j_threads = Some(rest[i + 1].clone());
+                        i += 2;
+                        continue;
+                    }
+                }
+                "-q" | "--quiet" => {
+                    quiet = true;
+                }
+                t => targets.push(t.to_string()),
+            }
+            i += 1;
+        }
+        std::process::exit(zsh::ztest::run_ztests_pool(
+            &targets,
+            j_threads.as_deref(),
+            quiet,
+        ));
+    }
+
+    // (the `--daemon` arg is intercepted earlier in zshrs_main with a
+    // pointer at the install paths; no second handler here.)
+
+    // Handle --doctor (zshrs-exclusive, not available in --zsh or --posix)
+    if args.iter().any(|a| a == "--doctor") {
+        if is_zshrs_mode() {
+            run_doctor(args.iter().any(|a| a == "--json"));
+        } else {
+            eprintln!("zshrs: --doctor is only available in zshrs mode (not --zsh or --posix)");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Handle --banner: the `zbanner` builtin's output from outside a shell
+    // (zshrs-exclusive, like --doctor). No shell has started, so the live
+    // line reports the daemon alone.
+    if args.iter().any(|a| a == "--banner") {
+        if is_zshrs_mode() {
+            zsh::banner::print_banner(None);
+        } else {
+            eprintln!("zshrs: --banner is only available in zshrs mode (not --zsh or --posix)");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Handle --dump-zwc for debugging .zwc files
+    // `--csh-translate [--] FILE|-`: print the zsh translation of a csh
+    // script. Used by the `source` / `eval` functions the csh preamble defines.
+    if args.len() >= 3 && args[1] == "--csh-translate" {
+        // `--source` marks text that a csh `source` will run inside a
+        // function: its `exit` leaves only the sourced file.
+        let rest: Vec<&String> = args[2..].iter().filter(|a| a.as_str() != "--").collect();
+        if rest.first().is_some_and(|a| a.as_str() == "--source") {
+            zsh::csh::set_source_mode(true);
+        }
+        let operand = rest.iter().find(|a| a.as_str() != "--source").map(|a| (*a).clone());
+        let operand = operand.as_ref();
+        let src = match operand.map(String::as_str) {
+            Some("-") | None => {
+                let mut s = String::new();
+                let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s);
+                s
+            }
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    // tcsh: `file: No such file or directory.`
+                    let why = match e.kind() {
+                        std::io::ErrorKind::NotFound => "No such file or directory".to_string(),
+                        std::io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                        _ => e.to_string(),
+                    };
+                    eprintln!("{path}: {why}.");
+                    std::process::exit(1);
+                }
+            },
+        };
+        match zsh::csh::translate(&src) {
+            Ok(text) => print!("{text}"),
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
+
+    if args.len() >= 3 && args[1] == "--dump-zwc" {
+        if args.len() >= 4 {
+            // Dump specific function
+            if let Err(e) = zwc::dump_zwc_function(&args[2], &args[3]) {
+                eprintln!("zshrs: {}: {}", args[2], e);
+                std::process::exit(1);
+            }
+        } else {
+            // List all functions
+            if let Err(e) = zwc::dump_zwc_info(&args[2]) {
+                eprintln!("zshrs: {}: {}", args[2], e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Handle --dump-tokens / --dump-ast / --dump-wordcode for parser-pipeline
+    // debugging. Each takes one positional FILE arg (or `-` to read from
+    // stdin) and prints the corresponding IR to stdout in the same canonical
+    // format as the C-side `zshrs/zshrs_dump` module's `dumptokens` /
+    // `dumpwordcode` builtins (so output can be diff'd byte-for-byte against
+    // C zsh for parity verification).
+    for &(flag, dumper) in &[
+        (
+            "--dump-tokens",
+            zsh::dumpers::dump_tokens as fn(&str) -> String,
+        ),
+        ("--dump-ast", zsh::dumpers::dump_ast as fn(&str) -> String),
+        (
+            "--dump-wordcode",
+            zsh::dumpers::dump_wordcode as fn(&str) -> String,
+        ),
+    ] {
+        if args.len() >= 3 && args[1] == flag {
+            let path = &args[2];
+            let src = if path == "-" {
+                let mut buf = String::new();
+                if let Err(e) = io::stdin().read_to_string(&mut buf) {
+                    eprintln!("zshrs: stdin: {}", e);
+                    std::process::exit(1);
+                }
+                buf
+            } else {
+                match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("zshrs: {}: {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            };
+            print!("{}", dumper(&src));
+            return;
+        }
+    }
+
+    // --fmt: format zsh source (src/extensions/fmt.rs — the same
+    // engine the LSP's textDocument/formatting uses, so CLI and IDE
+    // Reformat agree byte-for-byte).
+    //   zshrs --fmt [-w] [-t] [-i N] [FILE…]
+    // No files → stdin to stdout. -w rewrites files in place.
+    // -i N sets the indent width (default 4); -t indents with tabs.
+    if let Some(fi) = args.iter().position(|a| a == "--fmt") {
+        let mut write_in_place = false;
+        let mut opts = zsh::fmt::FmtOptions::default();
+        let mut files: Vec<String> = Vec::new();
+        let mut j = fi + 1;
+        while j < args.len() {
+            match args[j].as_str() {
+                "-w" => write_in_place = true,
+                "-t" => opts.use_tabs = true,
+                "-i" => {
+                    if let Some(n) = args.get(j + 1).and_then(|s| s.parse().ok()) {
+                        opts.indent_width = n;
+                        j += 1;
+                    } else {
+                        eprintln!("zshrs: --fmt: -i requires a number");
+                        std::process::exit(1);
+                    }
+                }
+                f => files.push(f.to_string()),
+            }
+            j += 1;
+        }
+        let mut status = 0;
+        if files.is_empty() {
+            if write_in_place {
+                eprintln!("zshrs: --fmt: -w requires file arguments");
+                std::process::exit(1);
+            }
+            let mut src = String::new();
+            use std::io::Read as _;
+            if std::io::stdin().read_to_string(&mut src).is_err() {
+                eprintln!("zshrs: --fmt: stdin is not valid UTF-8");
+                std::process::exit(1);
+            }
+            print!("{}", zsh::fmt::format_source(&src, &opts));
+        } else {
+            for f in &files {
+                match std::fs::read_to_string(f) {
+                    Ok(src) => {
+                        let formatted = zsh::fmt::format_source(&src, &opts);
+                        if write_in_place {
+                            if formatted != src {
+                                if let Err(e) = std::fs::write(f, &formatted) {
+                                    eprintln!("zshrs: --fmt: {}: {}", f, e);
+                                    status = 1;
+                                }
+                            }
+                        } else {
+                            print!("{}", formatted);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("zshrs: --fmt: {}: {}", f, e);
+                        status = 1;
+                    }
+                }
+            }
+        }
+        std::process::exit(status);
+    }
+
+    // --prewarm-autoloads [DIR ...]: compile every `_*` completer on
+    // $fpath into ~/.zshrs/autoloads.rkyv, so the first `ls -<TAB>` of
+    // a fresh shell is an O(1) probe into the shard instead of a parse
+    // + compile of the completer's file.
+    //
+    // Its own process on purpose: `parse()` walks process-global lexer
+    // state, and doing this beside a live ZLE corrupted the prompt when
+    // it was tried inside `compinit`. Callers are the user, the
+    // recorder's end-of-run pass, and the daemon's `autoload_prewarm`
+    // op (which spawns exactly this).
+    if let Some(idx) = args.iter().position(|a| a == "--prewarm-autoloads") {
+        let dirs: Vec<std::path::PathBuf> = args[idx + 1..]
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(std::path::PathBuf::from)
+            .collect();
+        let dirs = if dirs.is_empty() {
+            zsh::autoload_prewarm::default_dirs()
+        } else {
+            dirs
+        };
+        let stats = zsh::autoload_prewarm::prewarm_fpath(&dirs);
+        // Explicitly requested output, like --doctor: a summary the
+        // caller asked for, machine-readable so the daemon op can just
+        // forward it.
+        println!(
+            "{{\"dirs\":{},\"seen\":{},\"compiled\":{},\"fresh\":{},\"failed\":{},\"bytes\":{},\"ms\":{}}}",
+            dirs.len(),
+            stats.seen,
+            stats.compiled,
+            stats.fresh,
+            stats.failed,
+            stats.bytes,
+            stats.elapsed_ms,
+        );
+        std::process::exit(0);
+    }
+
+    // --lsp: start the Language Server Protocol server on stdio.
+    // Used by the IntelliJ plugin (editors/intellij) and any other LSP
+    // client (Helix, Neovim, VS Code, etc.). Implementation lives in
+    // src/extensions/lsp.rs.
+    if args.iter().any(|a| a == "--lsp") {
+        std::process::exit(zsh::lsp::run_lsp());
+    }
+
+    // --dap [HOST:PORT]: serve the Debug Adapter Protocol.
+    //   --dap HOST:PORT  → connect back to the IDE's DAP listener over TCP
+    //                      (the path JetBrains uses; stdout stays free).
+    //   --dap            → serve DAP over stdio (for clients that spawn the
+    //                      adapter as an executable, e.g. VS Code).
+    // Implementation in src/extensions/dap.rs.
+    if let Some(i) = args.iter().position(|a| a == "--dap") {
+        // A following arg is the listener address only if it looks like one
+        // (HOST:PORT); otherwise it's a script/flag and we serve over stdio.
+        let addr = args
+            .get(i + 1)
+            .map(|s| s.as_str())
+            .filter(|s| s.contains(':'));
+        std::process::exit(zsh::dap::run_dap(addr));
+    }
+
+    // --tiers FILE: run the script, then report which fusevm execution tier
+    // took each of its chunks — asked of fusevm's own eligibility and cache
+    // predicates, so the answer comes from the compiler that would have done
+    // the work. The script's own output precedes the report.
+    if let Some(i) = args.iter().position(|a| a == "--tiers") {
+        let Some(path) = args.get(i + 1) else {
+            eprintln!("zshrs: --tiers: requires a script path");
+            std::process::exit(1);
+        };
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zshrs: --tiers: {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        match zsh::tiers::report(&src) {
+            Ok(r) => println!("{r}"),
+            Err(e) => {
+                eprintln!("zshrs: --tiers: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // --dump-reflection: emit the JSON consumed by the IntelliJ "zshrs"
+    // reflection tool window. One top-level key per category.
+    if args.iter().any(|a| a == "--dump-reflection") {
+        println!("{}", zsh::lsp::dump_reflection_json());
+        return;
+    }
+
+    // --dump-plugins: emit the JSON consumed by the IntelliJ External
+    // Libraries view. Groups every entry in the plugin_cache SQLite
+    // by inferred plugin manager (zinit / oh-my-zsh / prezto / antidote /
+    // antigen / zplug / zsh-more-completions / zpwr / loose). The daemon
+    // fills the table from each recorder shard it ingests
+    // (daemon/plugins_db.rs). Empty array until a shard has been ingested.
+    if args.iter().any(|a| a == "--dump-plugins") {
+        println!("{}", zsh::plugin_cache::dump_plugins_json());
+        return;
+    }
+
+    // --dump-reference-html: emit the HTML chapter sections that
+    // docs/reference.html splices between its LSP-REFERENCE markers.
+    // `scripts/update_reference_html.sh` calls this then rewrites the
+    // doc in place.
+    if args.iter().any(|a| a == "--dump-reference-html") {
+        print!("{}", zsh::lsp::dump_reference_html());
+        return;
+    }
+
+    // --docs [NAME | PAGE | OPTION]: `zshrs --docs NAME` prints the hover
+    // card the LSP returns for NAME (the IntelliJ docs popup, `zshrs --docs
+    // <TAB>` via completions/_zshrs); bare `zshrs --docs` opens the whole
+    // reference as a paged book (src/extensions/docs_book.rs).
+    //
+    // Colour is on when: `--color always`, or FORCE_COLOR / CLICOLOR_FORCE
+    // is set (how the IntelliJ docs popup asks for ANSI — it pipes stdout
+    // into an ANSI ConsoleView, so is_terminal() is false there), or stdout
+    // is a real TTY. Off when: `--color never`, or NO_COLOR is set
+    // (no-color.org), which outranks the TTY check. Without colour a topic
+    // card is the raw markdown `lsp::lookup_doc` produced, so machine
+    // consumers (`zshrs --docs X | glow`) get the `**name**` heading intact.
+    if let Some(i) = args.iter().position(|a| a == "--docs") {
+        use std::io::IsTerminal;
+        let color_at = args.iter().position(|a| a == "--color");
+        let color_flag = color_at.and_then(|j| args.get(j + 1).map(String::as_str));
+        let env_set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+        let want_color = match color_flag {
+            Some("always") => true,
+            Some("never") => false,
+            _ if env_set("NO_COLOR") => false,
+            _ => env_set("FORCE_COLOR") || env_set("CLICOLOR_FORCE") || std::io::stdout().is_terminal(),
+        };
+        let rest: Vec<String> = args
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+            .filter(|(j, _)| Some(*j) != color_at && Some(*j) != color_at.map(|c| c + 1))
+            .map(|(_, a)| a.clone())
+            .collect();
+        std::process::exit(zsh::docs_book::run(&rest, want_color));
+    }
+
+    // --gen-docs [PATH] [--out DIR]: walk a directory, find every
+    // shell-source file, emit per-file Markdown reference docs under
+    // --out (default `docs/`). Mirrors `stryke gen-docs` for the
+    // zshrs CLI. The output is a `.md` per source file with the same
+    // relative path under the output dir.
+    if let Some(i) = args.iter().position(|a| a == "--gen-docs") {
+        let rest: Vec<&str> = args.iter().skip(i + 1).map(String::as_str).collect();
+        std::process::exit(run_gen_docs_subcommand(&rest));
+    }
+
+    // --names: emit every canonical name across builtins / keywords /
+    // options / specials / compsys / extensions, one per line, sorted
+    // and de-duplicated. Drives `compadd ${(f)"$(zshrs --names)"}` in
+    // the `_zshrs` completer for `--docs <TAB>`. Fast path: iterates
+    // the in-memory const tables, no I/O, ~1 ms cold.
+    if args.iter().any(|a| a == "--names") {
+        for n in zsh::lsp::all_canonical_names() {
+            println!("{}", n);
+        }
+        return;
+    }
+
+    // ── c:Src/init.c:401-556 — `parseopts()` ───────────────────────────
+    //
+    // Walk the LEADING option words (`-…` / `+…`) the way C does and
+    // resolve every option through the same two lookups C uses:
+    //   * single letters      → `optlookupc` (Src/options.c:723) over the
+    //                           `zshletters` table (Src/options.c:292)
+    //   * `-o NAME`, `+o NAME`,
+    //     `--NAME`, `+-NAME`  → `optlookup`  (Src/options.c:686)
+    // Each resolution is recorded in argv order and replayed with
+    // `dosetopt(optno, action, toplevel)` inside `apply_cli_flags`.
+    // C applies inline at c:501 / c:526; the Rust bin has to defer
+    // because the emulation mode (`--zsh`, `--bash`, …) is installed
+    // into the option table by `enter_*_mode()` at that point and would
+    // otherwise overwrite whatever the command line asked for. This is
+    // the same ordering C gets from `parseopts_setemulate` (c:359)
+    // running before the first option character is consumed.
+    //
+    // Before this port the block recognised only `-f`, `-x`, `-v` and a
+    // separated `-o NAME`; every other option letter was dropped on the
+    // floor. `zshrs -e script.sh` ran the script WITHOUT errexit, `-u`
+    // never errored on an unset parameter, and `-n` executed the script
+    // instead of only parsing it. A per-letter differential against
+    // `zsh -f` showed 47 of the 57 letters in `zshletters` diverging.
+    //
+    // c:289-290 — the letter table C consults is `kshletters` when
+    // SHOPTIONLETTERS is set, which is an OPT_BOURNE default (sh/ksh
+    // emulation). C has the emulation installed before parseopts runs;
+    // raise the flag up-front for the Bourne modes so `optlookupc`
+    // picks the right table, and let `enter_*_mode()` re-establish the
+    // complete option set afterwards.
+    if matches!(
+        shell_mode(),
+        ShellMode::Ksh | ShellMode::Posix | ShellMode::Dash
+    ) {
+        zsh::ported::options::opt_state_set("shoptionletters", true);
+    }
+
+    // Resolved `(optno, action)` pairs in argv order. `action` is true
+    // for a `-` word (set) and false for a `+` word (unset); a negative
+    // `optno` carries the inverted-sense marker (`-n` ↔ EXECOPT), which
+    // `dosetopt` flips at c:739-741.
+    let mut option_actions: Vec<(i32, bool)> = Vec::new();
+    // c:400 — `*cmdp`: set when a `-c` option letter was consumed, so
+    // the dispatch below knows the first operand is the command string
+    // and not a script path. Tracked here rather than re-scanned out of
+    // the filtered argv because after `-b` (c:511-517, option break) a
+    // literal `-c` among the operands is NOT the flag.
+    let mut cmd_word_seen = false;
+    let args: Vec<String> = {
+        use zsh::ported::options::{optlookup, optlookupc};
+        use zsh::ported::zsh_h::{isset, OPT_INVALID, SHOPTIONLETTERS};
+
+        // c:411-417 — `WARN_OPTION` + `return 1`, which parseargs turns
+        // into `exit(1)` at c:291. Message text matches C's wording
+        // ("bad option: -%c" c:522, "no such option: %s" c:494) with
+        // zshrs's program prefix.
+        fn bad_option(msg: String) -> ! {
+            eprintln!("zshrs: {}", msg);
+            std::process::exit(1);
+        }
+
+        // zshrs-only long flags. These are NOT zsh options, so the
+        // faithful c:511 `optlookup` would reject them; they are
+        // consumed here after having been read off the raw argv by the
+        // shell-mode scan (line 1415) and `--disasm` (line 1286).
+        const ZSHRS_LONG_FLAGS: &[&str] = &[
+            "zsh-compat",
+            "zsh",
+            "bash",
+            "ksh",
+            "mksh",
+            "pdksh",
+            "sh",
+            "dash",
+            "ash",
+            "csh",
+            "posix",
+            "disasm",
+        ];
+        // bash startup-file flags, already read by the scan at the
+        // `--bash` option-delta site; consumed here so the faithful
+        // `optlookup` below never sees them. Recognised in bash mode
+        // ONLY — a `zshrs --norc` outside it must still fail with zsh's
+        // "no such option: norc", which is what the reference does.
+        const BASH_LONG_FLAGS: &[&str] = &["norc", "noprofile"];
+        // Same, but each takes the following word as its argument.
+        const BASH_LONG_FLAGS_WITH_ARG: &[&str] = &["rcfile", "init-file"];
+
+        let mut out: Vec<String> = Vec::new();
+        // c:277 — `argv0 = argzero = posixzero = *argv++;`
+        if let Some(a0) = args.first() {
+            out.push(a0.clone());
+        }
+        let mut i = 1usize;
+        let mut optionbreak = false; // c:403
+        'words: while i < args.len() {
+            // c:418 — `while (!optionbreak && *argv &&
+            //            (**argv == '-' || **argv == '+'))`
+            if optionbreak {
+                break;
+            }
+            let word = args[i].clone();
+            if !(word.starts_with('-') || word.starts_with('+')) {
+                break;
+            }
+            let action = word.starts_with('-'); // c:420
+                                                // c:421-422 — `if (!argv[0][1]) *argv = "--";`: a bare `-`
+                                                // or `+` is rewritten to `--`, which the character loop
+                                                // below immediately reads as the end-of-options marker.
+            let chars: Vec<char> = if word.chars().count() == 1 {
+                vec!['-', '-']
+            } else {
+                word.chars().collect()
+            };
+            let mut p = 1usize; // c:423 `while (*++*argv)`
+            while p < chars.len() {
+                let ch = chars[p];
+                if ch == '-' {
+                    // c:425-429 — the pseudo-option `--` ends options.
+                    if p + 1 == chars.len() {
+                        i += 1;
+                        break 'words;
+                    }
+                    // c:430-431 — `-` is only allowed immediately after
+                    // the leading `-`/`+`; anywhere else is a bad
+                    // option string.
+                    if p != 1 {
+                        bad_option(format!("bad option string: '{}'", word));
+                    }
+                    // c:432 — `++*argv` steps past the second dash.
+                    let long: String = chars[p + 1..].iter().collect();
+                    if ZSHRS_LONG_FLAGS.contains(&long.as_str()) {
+                        break;
+                    }
+                    if is_bash_mode() && BASH_LONG_FLAGS.contains(&long.as_str()) {
+                        break;
+                    }
+                    if is_bash_mode() && BASH_LONG_FLAGS_WITH_ARG.contains(&long.as_str()) {
+                        // Skip the flag AND its argument. The value was
+                        // already captured by the raw-argv scan above.
+                        i += 1;
+                        if i >= args.len() {
+                            bad_option(format!("--{long}: option requires an argument"));
+                        }
+                        break;
+                    }
+                    // c:447-455 `--version` / c:456-459 `--help` are
+                    // served by the earlier return-on-match blocks in
+                    // this bin, so they never reach here.
+                    // c:460-471 `--emulate MODE` — the mode name is read
+                    // by the shell-mode scan at line 1415; consume the
+                    // flag and its argument.
+                    if long == "emulate" {
+                        i += 1; // c:462 `++argv`
+                        if i >= args.len() {
+                            bad_option("--emulate: argument required".to_string());
+                        }
+                        break; // c:470
+                    }
+                    // c:473-475 — `-` characters are allowed in long
+                    // options; they map onto `_`.
+                    let name = long.replace('-', "_");
+                    // c:493-497 — `longoptions:` → optlookup + dosetopt.
+                    let optno = optlookup(&name);
+                    if optno == OPT_INVALID {
+                        bad_option(format!("no such option: {}", long));
+                    }
+                    option_actions.push((optno, action));
+                    break; // c:507
+                }
+                // c:511-517 — `-b` ends option processing at the end of
+                // this word, but only while SHOPTIONLETTERS is unset (in
+                // ksh/sh emulation `b` is an ordinary option letter).
+                if ch == 'b' && !isset(SHOPTIONLETTERS) {
+                    optionbreak = true; // c:516
+                    p += 1;
+                    continue;
+                }
+                // c:518-527 — `-c command`: the command string is the
+                // NEXT argv word, consumed at c:549 (`doneoptions`).
+                // Emit a normalised `-c` marker below so the dispatch
+                // finds it regardless of clumping (`-fc`, `-ic`).
+                if ch == 'c' {
+                    cmd_word_seen = true; // c:524 `*cmdp = *argv`
+                    p += 1;
+                    continue;
+                }
+                // c:528-533 — `-o NAME` / `-oNAME`: the option name is
+                // the rest of this word, or the next word when the rest
+                // is empty.
+                if ch == 'o' {
+                    let attached: String = chars[p + 1..].iter().collect();
+                    let name = if attached.is_empty() {
+                        i += 1; // c:529 `argv++`
+                        match args.get(i) {
+                            Some(n) => n.clone(),
+                            // c:531-532
+                            None => bad_option("string expected after -o".to_string()),
+                        }
+                    } else {
+                        attached
+                    };
+                    let optno = optlookup(&name); // c:493
+                    if optno == OPT_INVALID {
+                        bad_option(format!("no such option: {}", name)); // c:494
+                    }
+                    option_actions.push((optno, action)); // c:501
+                    break; // c:507
+                }
+                // c:509-516 — whitespace inside an option word is only
+                // legal if the whole remainder is whitespace.
+                if ch.is_whitespace() {
+                    if chars[p..].iter().any(|c| !c.is_whitespace()) {
+                        bad_option(format!("bad option string: '{}'", word));
+                    }
+                    break; // c:515
+                }
+                // c:517-534 — a single option letter.
+                let optno = optlookupc(ch); // c:520
+                if optno == OPT_INVALID {
+                    bad_option(format!("bad option: -{}", ch)); // c:521
+                }
+                option_actions.push((optno, action)); // c:526
+                p += 1;
+            }
+            i += 1;
+        }
+        // c:548-553 — `doneoptions:` — when `-c` was seen the command
+        // string is the first remaining word. Re-emit the `-c` marker
+        // so the dispatch below reads `args[1] = "-c"`, `args[2] = cmd`.
+        if cmd_word_seen {
+            if i >= args.len() {
+                // c:550-551 — `WARN_OPTION("string expected after -%s")`
+                bad_option("string expected after -c".to_string());
+            }
+            out.push("-c".to_string());
+        }
+        // Remaining words are the script / command string and operands.
+        while i < args.len() {
+            out.push(args[i].clone());
+            i += 1;
+        }
+        out
+    };
+
+    // Final requested state of a named option, derived from the ordered
+    // action list (last write wins, exactly as C's sequential `dosetopt`
+    // calls do). Used for the three flags that drive control flow in
+    // this bin rather than only the option table.
+    let final_opt_state = |name: &str| -> Option<bool> {
+        let target = zsh::ported::options::optlookup(name);
+        let mut state = None;
+        for &(optno, action) in &option_actions {
+            // c:739-741 — a negative optno inverts the requested value.
+            let (idx, value) = if optno < 0 {
+                (-optno, !action)
+            } else {
+                (optno, action)
+            };
+            if idx == target {
+                state = Some(value);
+            }
+        }
+        state
+    };
+    let enable_xtrace = final_opt_state("xtrace").unwrap_or(false);
+    let enable_verbose = final_opt_state("verbose").unwrap_or(false);
+    // `-f` / `+o rcs` / `--no-rcs` all resolve to RCS-off; that is the
+    // flag that suppresses the startup files, so read it back off the
+    // resolved actions rather than re-scanning argv text (which missed
+    // the clumped `-fc` and `-o norcs` spellings).
+    let no_rcs_flag = final_opt_state("rcs").map(|on| !on).unwrap_or(false);
+
+    /// Apply CLI flags and shell mode to executor
+    fn apply_cli_flags(
+        executor: &mut ShellExecutor,
+        xtrace: bool,
+        verbose: bool,
+        no_rcs: bool,
+        opt_actions: &[(i32, bool)],
+        zsh_style_emu: Option<&str>,
+    ) {
+        // Apply shell mode
+        executor.zsh_compat = is_zsh_mode();
+        executor.bash_compat = is_bash_mode();
+        if is_dash_mode() {
+            // dash is sh + strict subset; enter_dash_mode sets EMULATE_SH
+            // AND raises DASH_STRICT (enter_posix_mode would clear it).
+            executor.enter_dash_mode();
+        } else if is_posix_mode() {
+            executor.enter_posix_mode();
+        }
+        if is_ksh_mode() {
+            executor.enter_ksh_mode();
+        }
+        // The `emulate` calls above reset the whole option table, so the
+        // drop-in's own deltas (set once at mode selection) go back on top.
+        zsh::emulation_startup::apply_personality_option_deltas();
+        zsh::emulation_startup::apply_personality_param_deltas();
+        if xtrace {
+            zsh::ported::options::opt_state_set("xtrace", true);
+        }
+        if verbose {
+            zsh::ported::options::opt_state_set("verbose", true);
+        }
+        if no_rcs {
+            // Match zsh -f: RCS is turned off so `setopt` lists `norcs`.
+            // zsh keeps globalrcs on (only the user-rcs files are
+            // skipped). HASHDIRS is not touched here — it derives from
+            // INTERACTIVE below, the way c:314-315 does it.
+            zsh::ported::options::opt_state_set("rcs", false);
+        }
+        // c:Src/init.c:298 and c:526 — both the script-file dispatch
+        // (`opts[INTERACTIVE] &= 1`) and `-c` (`new_opts[INTERACTIVE]
+        // &= 1`) clear the default-on sentinel 2 → 0. Only an explicit
+        // `-i` (which writes 1) survives that mask, so establish OFF
+        // here and let the replayed option words below override it.
+        // `apply_cli_flags` only runs on those two dispatch paths; the
+        // no-script/no-command path goes through
+        // `ported::init::parseargs`, which keeps the full 0/1/2 model.
+        zsh::ported::options::opt_state_set("interactive", false);
+        // c:Src/init.c:368 — `opts[USEZLE] = 1;` in
+        // `parseopts_setemulate`, i.e. before the option words are read,
+        // so an explicit `-Z` / `+Z` overrides it and `init_io` gets the
+        // final say below.
+        zsh::ported::options::opt_state_set("zle", true);
+        // c:Src/init.c:501 / c:526 — `dosetopt(optno, action, toplevel,
+        // new_opts)` for every option word, in argv order. `force` is
+        // the C `toplevel` flag (1 here), so the startup-only options
+        // INTERACTIVE / SHINSTDIN / SINGLECOMMAND / USEZLE are settable
+        // from the command line exactly as they are in C's parseargs.
+        for &(optno, action) in opt_actions {
+            zsh::ported::options::dosetopt(optno, action as i32, 1);
+        }
+        // c:Src/init.c:312-315 — `if (opts[MONITOR] == 2)
+        //   opts[MONITOR] = opts[INTERACTIVE]; if (opts[HASHDIRS]
+        //   == 2) opts[HASHDIRS] = opts[INTERACTIVE];`. Both
+        // MONITOR and HASHDIRS auto-derive from INTERACTIVE state.
+        // Under `-c` mode, stdin is parsed from the cmd arg (not
+        // tty) so INTERACTIVE=false, which means HASHDIRS=false.
+        // Without this derivation, `setopt` no-args under `-c`
+        // emitted nothing because hashdirs stayed at its emulate-
+        // ZSH default ON, matching the no-divergence filter at
+        // Src/options.c:462. Bug #87 in docs/BUGS.md.
+        let interactive = zsh::ported::options::opt_state_get("interactive").unwrap_or(false);
+        zsh::ported::options::opt_state_set("monitor", interactive);
+        zsh::ported::options::opt_state_set("hashdirs", interactive);
+        // c:Src/init.c:703-710 — `init_io`:
+        //   if (interact) { init_shout();
+        //                   if (!SHTTY || !shout) opts[USEZLE] = 0; }
+        //   else opts[USEZLE] = 0;
+        // The comment above it says "only use zle if SHTTY != -1", but
+        // the code tests `!SHTTY`, i.e. SHTTY == 0 — and `movefd` never
+        // hands back fd 0. `!shout` cannot fire either: `init_shout`
+        // falls back to `shout = stderr` when SHTTY == -1 (c:735-740,
+        // "Since we're interactive, it's nice to have somewhere to
+        // write"). So the branch collapses to `USEZLE = interact`, which
+        // is why `zsh -f -i -c …` reports `zle` on even with no
+        // controlling terminal at all. Reproduce the observable rule,
+        // not the comment.
+        if !interactive {
+            zsh::ported::options::opt_state_set("zle", false); // c:707/710
+        }
+        // c:Src/init.c:715-718 — `if (opts[MONITOR]) { if (SHTTY == -1)
+        //   opts[MONITOR] = 0; … }`. MONITOR, unlike USEZLE, really does
+        // need a terminal. SHTTY is whatever `init_io` would have
+        // acquired: fd 0 or fd 1 when either is a tty (c:640, c:678),
+        // else `/dev/tty` (c:682). The `-c` / script dispatch never
+        // reaches `init_io` — only the no-command path does, through
+        // `ported::init::zsh_main` — so make the same call here and
+        // close the probe fd again, since this path never edits a line.
+        let has_shtty = unsafe {
+            libc::isatty(0) != 0 || libc::isatty(1) != 0 || {
+                let fd = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+                if fd >= 0 {
+                    libc::close(fd);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !has_shtty {
+            zsh::ported::options::opt_state_set("monitor", false); // c:718
+        }
+        // c:Src/init.c:1907-1908 + 716-722 — zsh_main runs init_io after the
+        // options are parsed, so an interactive shell with MONITOR acquires the
+        // terminal's process group (`origpgrp = GETPGRP(); acquire_pgrp();`).
+        // This path ran init_io before `-i` turned MONITOR on, which left
+        // `mypgrp` 0, and the first `attachtty(mypgrp)` after a foreground job
+        // failed with "can't set tty pgrp". init_io is idempotent.
+        if zsh::ported::options::opt_state_get("monitor").unwrap_or(false) {
+            zsh::ported::init::init_io(None);
+        }
+        // zsh-STYLE leg (`--sh --zsh` / `--ksh --zsh`): install the emulation
+        // HERE, last, and NOT fully — the reference is a zsh that finished
+        // startup and then ran `emulate X` as its first command, so the option
+        // words above were resolved with `zshletters` and only the OPT_EMULATE
+        // options get reset (c:Src/options.c:516). See the deferral note at the
+        // mode-selection site.
+        if let Some(sub) = zsh_style_emu {
+            zsh::ported::options::emulate(sub, false);
+        }
+    }
+
+    // c:Src/init.c:548-553 (`doneoptions:`) — `-c` takes the NEXT word
+    // as the command string. It is not required to be the first option:
+    // `zsh -i -c 'print hi'`, `zsh -l -c …` and the clumped `zsh -fic …`
+    // all run the command. The option walk above already decided this
+    // and re-emitted a normalised `-c` marker at index 1, so the index
+    // is fixed — no second scan of the filtered argv, which used to
+    // mistake a post-`-b` (option-break) `-c` operand for the flag.
+    let cmd_idx = if cmd_word_seen { Some(1) } else { None };
+    // Handle -c 'command' syntax
+    if let Some(ci) = cmd_idx.filter(|ci| ci + 1 < args.len()) {
+        let code = &args[ci + 1];
+
+        let mut executor = ShellExecutor::new();
+        apply_cli_flags(
+            &mut executor,
+            enable_xtrace,
+            enable_verbose,
+            no_rcs_flag,
+            &option_actions,
+            deferred_zsh_style_emu,
+        );
+        // c:Src/init.c:1427-1470 (`init_signals`) — C reaches it through
+        // `zsh_main` on EVERY invocation; this dispatch path never calls
+        // that function, so run the same sequence here. It must come
+        // AFTER `apply_cli_flags`, which is what settles INTERACTIVE and
+        // MONITOR, because C's gates read them.
+        zsh::startup_signals::init_dispatch_signals();
+        // c:Src/init.c:1455 — `install_handler(SIGCHLD);`, the one line
+        // of `init_signals` that `init_dispatch_signals` still leaves
+        // out. It lives here rather than there because it is not a
+        // disposition policy that could differ per emulation: it is the
+        // shell's ONLY reaper, and without it every background child of
+        // a `-c` run stays a zombie for the life of the shell, so the
+        // process table grows with each one. `sleep 0.2 & ; sleep 1; ps
+        // -o stat= -p $!` printed `Z` where zsh prints nothing.
+        //
+        // Arming it makes the reaper race the pipeline's own targeted
+        // `waitpid` for the forked stages; the reaped-status ring in
+        // `extensions/reaped_status.rs` is what keeps `$pipestatus` intact through
+        // that race (see `waitpid_eintr` in fusevm_bridge.rs).
+        zsh::ported::signals::install_handler(libc::SIGCHLD);
+        // The drop-ins' own arming (bash's termsig_handler shape); a no-op in zsh mode.
+        zsh::extensions::emulation_startup::init_dropin_signals();
+        // c:Src/init.c:1340 — `if (cmd)
+        //                       setsparam("ZSH_EXECUTION_STRING",
+        //                                 ztrdup_metafy(cmd));`
+        // ZSH_EXECUTION_STRING carries the -c argument so user scripts
+        // can introspect what they're running. p10k probes this for the
+        // initial prompt-deferral decision; pre-c-mode-aware tooling
+        // reads it to log invocations. Previously only setupvals() in
+        // ported/init.rs set the env var, but setupvals isn't wired
+        // into the bin entry path so the value was always empty.
+        zsh::ported::params::setsparam("ZSH_EXECUTION_STRING", code);
+        // c:Src/init.c:1315-1326 — `/* ZSH_EXEPATH */`, the same setupvals
+        // block this path skips: argv[0] resolved against the start-up cwd.
+        if let Some(p) = zsh::ported::init::getmypath(
+            Some(&args[0]),
+            zsh::ported::params::getsparam("PWD").as_deref(),
+        ) {
+            zsh::ported::params::setsparam("ZSH_EXEPATH", &p);
+        }
+        // c:Src/init.c:1535 — `execstring(cmd, 0, 1, "cmdarg")` pushes
+        // "cmdarg" onto the zsh_eval_context stack BEFORE running the
+        // -c command. ZSH_EVAL_CONTEXT is the `:`-joined view of that
+        // stack tied to the `zsh_eval_context` array. For a non-nested
+        // -c invocation the stack is just ["cmdarg"], so the readable
+        // form is the literal string "cmdarg". Plugins (zinit's
+        // `[[ $ZSH_EVAL_CONTEXT == *cmdarg* ]]` predicate, p10k's
+        // turbo-mode hooks) gate on this.
+        // ZSH_EVAL_CONTEXT carries PM_READONLY (declared at
+        // params.rs special_params:836), so setsparam would be
+        // rejected by assignstrvalue's PM_READONLY guard. Write
+        // u_str directly — same pattern BUILTIN_SET_LINENO uses
+        // for the LINENO bypass. C zsh's PM_SPECIAL GSU setfn
+        // handles this implicitly; the Rust port lacks the GSU
+        // vtable so internal writes bypass via direct paramtab
+        // mutation.
+        //
+        // Push "cmdarg" onto the static `zsh_eval_context` stack AND
+        // mirror into the tied `zsh_eval_context` array + the
+        // `ZSH_EVAL_CONTEXT` scalar so `${zsh_eval_context[*]}`
+        // expansion reads it. Bug #262 in docs/BUGS.md. Inlined here
+        // (formerly a shared vm_helper fn; relocated into doshfunc +
+        // this bin-entry callsite). No nested process below pops it —
+        // the `-c` invocation owns the stack for the whole run.
+        if let Ok(mut ctx) = zsh::ported::exec::zsh_eval_context.lock() {
+            ctx.push("cmdarg".to_string());
+            let joined = ctx.join(":");
+            if let Ok(mut tab) = zsh::ported::params::paramtab().write() {
+                if let Some(pm) = tab.get_mut("zsh_eval_context") {
+                    pm.u_arr = Some(ctx.clone());
+                    pm.node.flags &= !(zsh::ported::zsh_h::PM_UNSET as i32);
+                }
+                if let Some(pm) = tab.get_mut("ZSH_EVAL_CONTEXT") {
+                    pm.u_str = Some(joined);
+                    pm.node.flags &= !(zsh::ported::zsh_h::PM_UNSET as i32);
+                }
+            }
+        }
+        // POSIX `sh -c script [name [args...]]` semantics
+        // (Src/init.c:271 + 479): the next non-option arg AFTER the
+        // command string becomes $0; remaining args become $1, $2, …
+        // When no name is supplied, $0 falls back to argv[0] (the
+        // binary path) — matching `zsh -c '...'`'s behavior of
+        // exposing the full path of the shell binary.
+        let zero = if args.len() > ci + 2 {
+            // `zshrs [opts] -c 'cmd' name args...` — layout relative to the
+            // `-c` found above (`ci`), since the --zsh / -f / -x filter does
+            // not necessarily leave `-c` at index 1:
+            //   args[0]      = binary path
+            //   args[ci]     = "-c"
+            //   args[ci + 1] = the command string
+            //   args[ci + 2] = $0 name
+            //   args[ci + 3..] = $1, $2, …
+            executor.set_pparams(args[ci + 3..].to_vec());
+            args[ci + 2].clone()
+        } else {
+            // c:Src/init.c:271 — `posixzero = ztrdup(argv[0])`: `$0`
+            // in `-c` mode is the kernel-supplied argv[0] of THIS
+            // binary, in --zsh parity mode too. (A previous revision
+            // probed the system zsh install path and reported THAT as
+            // `$0` for byte-parity — faking the shell's identity.
+            // Parity tests that compare `$0` text must normalize the
+            // machine-specific binary path in the test row instead.)
+            args[0].clone()
+        };
+        executor.set_scalar("0".to_string(), zero.clone());
+        // Wire the GSU dispatch: `argzerogetfn` reads
+        // `utils::argzero()` which returns this value via
+        // `lookup_special_var("0")`. Without `set_argzero`, the GSU
+        // dispatch returns None and reads fall back to
+        // `executor.variables`, but the explicit-name case above
+        // depends on the GSU side knowing the value too.
+        zsh::ported::utils::set_argzero(Some(zero.clone()));
+        // c:Src/init.c:305-306 — `posixzero = *argv;` when a `-c` name word
+        // follows the command string; otherwise it stays argv[0] (c:282).
+        // `$0` reads it under POSIX_ARGZERO (argzerogetfn, params.c:4908).
+        zsh::ported::utils::set_posixzero(Some(zero.clone()));
+        zsh::extensions::dash_mode::set_dash_c_string(true);
+
+        // Per Src/init.c:479 — `-c` mode hardcodes
+        //   `scriptname = scriptfilename = ztrdup("zsh")`
+        // (literal short name, NOT argzero). In `--zsh` parity mode,
+        // match C zsh exactly so PS4 / `%N` / xtrace prefixes byte-
+        // match the reference. Plain zshrs `-c` keeps the binary
+        // basename for branding. `$0` is argv[0] either way.
+        let basename = if is_zsh_mode() {
+            "zsh".to_string()
+        } else {
+            // The name of the file that was executed, not argv[0]: `ARGV0=sh
+            // zshrs -c cd` hands the shell argv[0] "sh", and the prefix read
+            // `sh:cd:1:` where zsh prints its own name (B01cd.ztst:144).
+            std::path::Path::new(&executed_path().unwrap_or_else(|| zero.clone()))
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.trim_start_matches('-').to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "zshrs".to_string())
+        };
+        executor.scriptname = Some(basename.clone());
+        // scriptfilename mirrors C init.c:479 `scriptname =
+        // scriptfilename = ztrdup("zsh")` — both seeded to the
+        // basename in -c mode. scriptfilename stays put when we
+        // enter a function (only scriptname mutates), so PS4's
+        // %x continues to show the file basename inside function
+        // bodies.
+        executor.scriptfilename = Some(basename.clone());
+        // Propagate to the canonical `SCRIPTNAME` static read by
+        // prompt expansion (`%N`/`%x`) via `utils::scriptname_get`.
+        // Without this, `printprompt4` saw None and `%N`/`%x` fell
+        // back to argzero — the full binary path — making xtrace
+        // emit `/Users/.../zshrs` instead of `zsh`.
+        zsh::ported::utils::set_scriptname(Some(basename));
+
+        // Source zshenv per Src/init.c:1473 (GLOBAL_ZSHENV) +
+        // Src/init.c:1489 (`sourcehome(".zshenv")`). C zsh sources
+        // both /etc/zshenv (always) and ~/.zshenv (when RCS is set
+        // and not PRIVILEGED) BEFORE running the `-c` cmd through
+        // `execstring(cmd, …)` at init.c:1535. Skipping zshenv broke
+        // any user setup that exports env (PS4, PATH, locale, …)
+        // from .zshenv — a `zshrs -fx -c '…'` invocation showed the
+        // C-default `+%N:%i> ` prefix instead of the user's PS4.
+        //
+        // login + interactive RC files (zprofile / zshrc / zlogin)
+        // are sourced in `-c` mode only when `-i` / `-l` asked for them,
+        // which is exactly the C source's `if (islogin)` / `if (interact)`
+        // gates at init.c:1491, 1499, 1507. A bare `-c` is non-interactive
+        // and non-login and reads neither; `zsh -i -c` DOES read `.zshrc`
+        // and `zsh -l -c` DOES read `.zprofile` (verified against zsh
+        // 5.9). This used to pass `false, false` unconditionally, so every
+        // `zshrs -i -c` / `-l -c` ran with the user's rc files unread —
+        // caught by tests/startup_file_parity.rs.
+        //
+        // A DROP-IN reads a different set and is sensitive to `-l`/`-i`
+        // even under `-c`: bash 5.3.15 sources `~/.bash_profile` for
+        // `bash -l -c true`, `~/.bashrc` for `bash -i -c true`, and
+        // `$BASH_ENV` for a plain `bash -c true`; `ksh -i -c` reads
+        // `~/.kshrc`. Reading zsh's zshenv here instead left every one of
+        // those unread.
+        if zsh::emulation_startup::overrides_zsh_startup() {
+            source_emulation_startup_files(
+                &mut executor,
+                zsh::ported::options::opt_state_get("loginshell").unwrap_or(false),
+                zsh::ported::options::opt_state_get("interactive").unwrap_or(false),
+                no_rcs_flag,
+            );
+        } else if !replay_recording_for_c(&mut executor, no_rcs_flag) {
+            source_startup_files(
+                &mut executor,
+                zsh::ported::options::opt_state_get("loginshell").unwrap_or(false),
+                zsh::ported::options::opt_state_get("interactive").unwrap_or(false),
+                no_rcs_flag,
+            );
+        }
+
+        maybe_source_zshrs_startup_config(&mut executor, no_rcs_flag);
+
+        // Long-cmd-started watchdog (-c path mirrors the interactive loop).
+        #[cfg(feature = "daemon")]
+        let completed_c = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(feature = "daemon")]
+        {
+            let line_owned = code.clone();
+            let cwd_owned = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            let completed_c = std::sync::Arc::clone(&completed_c);
+            let threshold_secs: u64 = std::env::var("ZSHRS_LONG_CMD_PRE_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5);
+            zsh::signal_thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(threshold_secs));
+                if !completed_c.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = zsh::daemon::client::call_once_no_spawn(
+                        "cmd_started",
+                        serde_json::json!({
+                            "line": line_owned,
+                            "cwd": cwd_owned,
+                            "shell_id": 0u64,
+                        }),
+                    );
+                }
+            });
+        }
+
+        // c:Src/init.c:1563-1566 — init_misc, after the init scripts and
+        // before `execstring(cmd, 0, 1, "cmdarg")`:
+        //     if (SHIN >= 10) close(SHIN);
+        //     SHIN = movefd(open("/dev/null", O_RDONLY | O_NOCTTY));
+        // The descriptor is the shell's input for a `-c` run and occupies the
+        // first internal slot, so the first `exec {fd}>file` gets 11, as in zsh.
+        {
+            let old_shin = zsh::ported::input::SHIN.with(|s| s.get());
+            if old_shin >= 10 {
+                let _ = zsh::ported::utils::zclose(old_shin); // c:1565
+            }
+            let devnull = unsafe {
+                libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_NOCTTY)
+            };
+            let shin = zsh::ported::utils::movefd(devnull); // c:1566
+            zsh::ported::input::SHIN.with(|s| s.set(shin));
+        }
+        let start = Instant::now();
+        // c:Src/init.c:1568 — `execstring(cmd, 0, 1, "cmdarg")`, exiting.
+        let result = match csh_input(code) {
+            Ok(text) => executor.execute_cmdarg(&text),
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        };
+        #[cfg(feature = "daemon")]
+        completed_c.store(true, std::sync::atomic::Ordering::SeqCst);
+        let duration_ns_total = start.elapsed().as_nanos() as i64;
+        // No history entry for a `-c` string: zsh stops history for any
+        // non-interactive input (c:Src/hist.c:1120 — `stophist = (!interact
+        // || unset(SHINSTDIN)) ? 2 : 0`). Recording it here put every test
+        // and script invocation into the user's history store.
+
+        // Daemon history_append (broadcasts long_cmd_complete on its end).
+        #[cfg(feature = "daemon")]
+        {
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            let _ = zsh::daemon::client::call_once_no_spawn(
+                "history_append",
+                serde_json::json!({
+                    "line": code,
+                    "exit_code": executor.last_status() as i64,
+                    "cwd": cwd,
+                    "duration_ns": duration_ns_total,
+                }),
+            );
+        }
+
+        if let Err(e) = result {
+            // c:Src/init.c — `__SILENCED__` sentinel from
+            // `execute_script_zsh_pipeline` means the parser already
+            // emitted the diagnostic via zerr; binary-side print
+            // would double it. Bug #142 in docs/BUGS.md.
+            if e != "__SILENCED__" {
+                eprintln!("zshrs: {}", e);
+            }
+            std::process::exit(zsh::extensions::dash_mode::fatal_error_status().unwrap_or(if zsh::extensions::dash_mode::bash_mode() { 2 } else { 1 })); // bash: a syntax error exits 2
+        }
+        // !!! DASH-FAMILY GATE — see dash_mode::fatal_error_status !!!
+        // The end of a `-c` script is the second place dash's
+        // `exraise(EXERROR)` unwind lands (the other is the `( … )`
+        // boundary, handled in fusevm_bridge::subshell_end). dash reports 2
+        // for a fatal expansion / assignment / arithmetic error; zsh reports
+        // `lastval == ERRFLAG_ERROR == 1`. No-op in every other mode.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let ef = zsh::ported::utils::errflag.load(Relaxed);
+            let fatal = zsh::ported::zsh_h::ERRFLAG_ERROR | zsh::ported::zsh_h::ERRFLAG_HARD;
+            if ef & fatal != 0 {
+                if let Some(st) = zsh::extensions::dash_mode::fatal_error_status() {
+                    std::process::exit(st);
+                }
+                // A zsh-STYLE leg stands in for `zsh -c 'emulate X -c "$script"'`: `emulate` is a
+                // builtin, and a builtin that leaves an error pending reports 1
+                // (c:Src/builtin.c bin_eval: `if (errflag && !lastval) lastval = errflag`) even though the script's own status was 0.
+                if deferred_zsh_style_emu.is_some() && executor.last_status() == 0 {
+                    std::process::exit(1);
+                }
+            }
+        }
+        std::process::exit(executor.last_status());
+        #[allow(unreachable_code)]
+        return;
+    }
+
+    // Handle script file argument.
+    // c:Src/init.c:296-303 — after `doneoptions:` the first remaining
+    // word is the script, with NO leading-dash test: `--` and `-b` end
+    // option processing, so `zsh -- -c` runs a FILE named `-c` (and
+    // reports "can't open input file: -c"). The old `!starts_with('-')`
+    // guard silently fell through to the interactive shell instead.
+    // Every genuine option word has already been consumed — and an
+    // unrecognised one exits at c:521 — so anything left here is an
+    // operand whatever it looks like.
+    if args.len() >= 2 {
+        let mut executor = ShellExecutor::new();
+        apply_cli_flags(
+            &mut executor,
+            enable_xtrace,
+            enable_verbose,
+            no_rcs_flag,
+            &option_actions,
+            deferred_zsh_style_emu,
+        );
+        // c:Src/init.c:1427-1470 (`init_signals`) — same bypass as the
+        // `-c` dispatch above: run the whole sequence here, after
+        // `apply_cli_flags` has settled the INTERACTIVE and MONITOR
+        // gates C's branches read.
+        zsh::startup_signals::init_dispatch_signals();
+        // c:Src/init.c:1455 — `install_handler(SIGCHLD);`. Same reason
+        // as the `-c` site above: this is the shell's only reaper, and a
+        // script file that backgrounds anything left every one of those
+        // children a zombie.
+        zsh::ported::signals::install_handler(libc::SIGCHLD);
+        // The drop-ins' own arming (bash's termsig_handler shape); a no-op in zsh mode.
+        zsh::extensions::emulation_startup::init_dropin_signals();
+        // Port from Src/init.c:295-306 + Src/init.c:1368-1370.
+        // In script mode the parsed argv is split as:
+        //   argv[0] = shell binary       (from init.c:271)
+        //   argv[1] = runscript          (from init.c:301: `*runscript = *argv`)
+        //   argv[2..] = paramlist        (from init.c:305-306, becomes pparams)
+        // Before running the script, init.c:1369 does
+        //   `argzero = ztrdup(runscript)` — i.e. `$0` becomes the
+        // verbatim script path the user passed (NOT canonicalized).
+        // c:Src/init.c:1372-1401 `setupshin(char *runscript)` — open the
+        // script BEFORE anything else so a missing file is reported the way
+        // zsh reports it and exits 127:
+        //   funmeta = unmeta(runscript);
+        //   /* Always search the current directory first. */
+        //   if (access(funmeta, F_OK) == 0 && stat(funmeta, &st) >= 0 &&
+        //       !S_ISDIR(st.st_mode))
+        //       sfname = runscript;
+        //   else if (isset(PATHSCRIPT) && !strchr(runscript, '/'))
+        //       funmeta = pathprog(runscript, &sfname);
+        //   if (!sfname || (SHIN = movefd(open(funmeta, …))) == -1) {
+        //       zerr("can't open input file: %s", runscript);
+        //       exit(127);
+        //   }
+        // The diagnostic goes out under `scriptname`, which is still
+        // argv[0] here — c:1400-1402 only swaps in the script path AFTER
+        // the open succeeds — and `lineno` is still 0 (set at c:1406), so
+        // zerrmsg emits the bare "<argv0>: " prefix with no line number.
+        let runscript = args[1].clone();
+        // c:1385-1386 — `access(F_OK) == 0 && stat(…) >= 0 && !S_ISDIR(…)`
+        let is_readable_file = |p: &str| std::fs::metadata(p).map(|m| !m.is_dir()).unwrap_or(false);
+        let mut sfname: Option<String> = None; // c:1375
+        if is_readable_file(&runscript) {
+            sfname = Some(runscript.clone()); // c:1387
+        } else if zsh::ported::zsh_h::isset(zsh::ported::zsh_h::PATHSCRIPT)
+            && !runscript.contains('/')
+        {
+            // c:1388-1393 — `funmeta = pathprog(runscript, &sfname);`
+            // c:Src/utils.c:757-781 pathprog — walk $path in order, first
+            // `<dir>/<prog>` that exists and is not a directory wins.
+            let path_dirs: Vec<String> = zsh::ported::params::getaparam("path").unwrap_or_default();
+            for pp in &path_dirs {
+                let buf = format!("{}/{}", pp, runscript); // c:770
+                if is_readable_file(&buf) {
+                    // c:772-777
+                    sfname = Some(buf);
+                    break;
+                }
+            }
+        }
+        // c:1394 — `SHIN = movefd(open(funmeta, O_RDONLY | O_NOCTTY))`. The
+        // descriptor stays open for the whole run and occupies the first
+        // internal slot, so a script's first `exec {fd}>file` gets 11, as
+        // in zsh (and as the `-c` path's /dev/null SHIN already does).
+        let shin = sfname.as_deref().map_or(-1, |p| {
+            let c = std::ffi::CString::new(zsh::ported::utils::unmeta(p)).unwrap_or_default();
+            zsh::ported::utils::movefd(unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NOCTTY) })
+        });
+        let runscript_open = match sfname {
+            // c:1394-1399 — `if (!sfname || (SHIN = … open(…)) == -1)`
+            Some(p) if shin != -1 => {
+                zsh::ported::input::SHIN.with(|s| s.set(shin));
+                p
+            }
+            _ => {
+                eprintln!(
+                    "{}: can't open input file: {}", // c:1397
+                    std::env::args_os()
+                        .next()
+                        .map_or_else(|| "zsh".to_string(), |a| a.to_string_lossy().into_owned()),
+                    runscript
+                );
+                std::process::exit(127); // c:1398
+            }
+        };
+        executor.set_scalar("0".to_string(), args[1].clone());
+        // c:Src/init.c:305 — `posixzero = *argv;`: the script path, which
+        // `$0` reads under POSIX_ARGZERO even inside a function.
+        zsh::ported::utils::set_posixzero(Some(args[1].clone()));
+        executor.set_pparams(args.iter().skip(2).cloned().collect());
+        // c:Src/init.c:1330 — `if (runscript) setsparam("ZSH_SCRIPT",
+        // ztrdup(runscript));`. Also bug #25 in docs/BUGS.md.
+        // setupshin in ported/init.rs runs at a different init path
+        // (it's currently dead code via init_exec which the bin entry
+        // doesn't call); set ZSH_SCRIPT here at the bin-level
+        // script-dispatch site so user scripts can introspect their
+        // own path. Mirrors the -c branch above which sets
+        // ZSH_EXECUTION_STRING.
+        zsh::ported::params::setsparam("ZSH_SCRIPT", &args[1]);
+        // c:Src/init.c:1315-1326 — `/* ZSH_EXEPATH */`, as for -c above.
+        if let Some(p) = zsh::ported::init::getmypath(
+            Some(&args[0]),
+            zsh::ported::params::getsparam("PWD").as_deref(),
+        ) {
+            zsh::ported::params::setsparam("ZSH_EXEPATH", &p);
+        }
+        // c:Src/init.c:1572 — `scriptname = ztrdup(runscript);` updates
+        //   the C global `scriptname` to the script path; PS4's `%N`
+        //   reads this (Src/prompt.c:555 promptpath(scriptname, ...))
+        //   so xtrace prefixes show the script name at top level and
+        //   switch to function names inside fns (via exec.c:5903 stash/
+        //   restore). Bug #318 in docs/BUGS.md — script mode left
+        //   SCRIPTNAME=None so `%N` fell back to ZSH_NAME ("zsh").
+        zsh::ported::utils::set_scriptname(Some(args[1].clone()));
+        // c:Src/init.c:1573 — `scriptfilename = ztrdup(runscript);`
+        // — PS4's `%x` reads this (Src/prompt.c:931 path). Without
+        // the matching write, `zshrs -x script.zsh` left the
+        // scriptfilename TLS at "zsh" (the executor seed at
+        // vm_helper.rs:1318), so xtrace col 1 showed "zsh" instead
+        // of the script path for top-level lines.
+        zsh::ported::utils::set_scriptfilename(Some(args[1].clone()));
+        // c:Src/init.c:965 — `setsparam("ZSH_ARGZERO", ztrdup(posixzero));`
+        // posixzero is the script path under script mode (or the
+        // shell binary path under -c/interactive). In zshrs's script
+        // dispatch posixzero is the script path (args[1]); the bin
+        // entry's setupvals in ported/init.rs only runs through
+        // init_exec which isn't reached on this code path, so set
+        // ZSH_ARGZERO directly. Without this, ZSH_ARGZERO carried
+        // argv[0] (the zshrs binary path) instead of the script path.
+        // c:Src/init.c:220 — `execode(prog, 0, 0, toplevel ? "toplevel" : "file");`
+        // The main input loop names its context "toplevel", so a SCRIPT FILE
+        // (and stdin) runs with `ZSH_EVAL_CONTEXT=toplevel` where `-c` uses
+        // "cmdarg" (c:init.c:1535). zshrs pushed "cmdarg" only on the `-c`
+        // path and pushed NOTHING here, so a script file saw an EMPTY context
+        // and every nested construct lost its base too — `shfunc` instead of
+        // `toplevel:shfunc`, `cmdsubst` instead of `toplevel:cmdsubst`.
+        // No pop: like the `-c` push, the script invocation owns the stack for
+        // the whole run. Bug #1067.
+        if let Ok(mut ctx) = zsh::ported::exec::zsh_eval_context.lock() {
+            if ctx.is_empty() {
+                ctx.push("toplevel".to_string());
+                let joined = ctx.join(":");
+                if let Ok(mut tab) = zsh::ported::params::paramtab().write() {
+                    if let Some(pm) = tab.get_mut("zsh_eval_context") {
+                        pm.u_arr = Some(ctx.clone());
+                        pm.node.flags &= !(zsh::ported::zsh_h::PM_UNSET as i32);
+                    }
+                    if let Some(pm) = tab.get_mut("ZSH_EVAL_CONTEXT") {
+                        pm.u_str = Some(joined);
+                        pm.node.flags &= !(zsh::ported::zsh_h::PM_UNSET as i32);
+                    }
+                }
+            }
+        }
+        zsh::ported::params::setsparam("ZSH_ARGZERO", &args[1]);
+        // Drop-in script dispatch. bash reads `$BASH_ENV` before a script
+        // runs ("if [ -n \"$BASH_ENV\" ]; then . \"$BASH_ENV\"; fi",
+        // bash(1) INVOCATION), and additionally the `~/.bash_profile`
+        // chain when `--login` was given — verified against bash 5.3.15,
+        // where `bash -l script.sh` sources `.bash_profile` then
+        // `$BASH_ENV`. `--csh` reads `~/.cshrc` for a script too; the
+        // Korn and Bourne drop-ins read nothing unless `--login`. Runs
+        // after `$0`/`$@` are seeded so the sourced file sees the
+        // script's own identity, as bash's does.
+        if zsh::emulation_startup::overrides_zsh_startup() {
+            source_emulation_startup_files(
+                &mut executor,
+                zsh::ported::options::opt_state_get("loginshell").unwrap_or(false),
+                zsh::ported::options::opt_state_get("interactive").unwrap_or(false),
+                no_rcs_flag,
+            );
+        } else {
+            // c:Src/init.c:1473 + 1489 — `/etc/zshenv` (always) and
+            // `$ZDOTDIR/.zshenv` (RCS, non-PRIVILEGED) are read for EVERY
+            // invocation, a script file included: `zsh script.sh` sources
+            // `~/.zshenv` before the script's first line. This branch
+            // sourced nothing at all, so a script run under zshrs started
+            // without the user's exported environment — caught by
+            // tests/startup_file_parity.rs. The login / interactive files
+            // stay behind their own gates inside `source_startup_files`.
+            source_startup_files(
+                &mut executor,
+                zsh::ported::options::opt_state_get("loginshell").unwrap_or(false),
+                zsh::ported::options::opt_state_get("interactive").unwrap_or(false),
+                no_rcs_flag,
+            );
+        }
+        // c:1401 — `scriptfilename = sfname;` — the PATHSCRIPT search may
+        // have resolved the name to a $path entry; that resolved path is
+        // what SHIN was opened on, while `$0` / ZSH_SCRIPT / scriptname
+        // above keep the verbatim operand (c:1402-1403).
+        let script_result = if zsh::emulation_startup::personality()
+            == zsh::emulation_startup::Personality::Csh
+        {
+            // csh text cannot take the bytecode-cache path: translate first.
+            match std::fs::read_to_string(&runscript_open) {
+                Ok(src) => match csh_input(&src) {
+                    Ok(text) => executor.execute_script(&text),
+                    Err(msg) => {
+                        eprintln!("{msg}");
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => Err(e.to_string()),
+            }
+        } else {
+            executor.execute_script_file(&runscript_open)
+        };
+        match script_result {
+            Err(e) => {
+                if e != "__SILENCED__" {
+                    eprintln!("zshrs: {}: {}", args[1], e);
+                }
+                std::process::exit(zsh::extensions::dash_mode::fatal_error_status().unwrap_or(if zsh::extensions::dash_mode::bash_mode() { 2 } else { 1 })); // bash: a syntax error exits 2
+            }
+            // c:Src/init.c:234 — loop() breaks on errflag in a
+            // non-interactive shell and zsh_main exits with the
+            // UNTOUCHED lastval; a clean run also exits with the
+            // last command's status. The previous bare `return;`
+            // here exited 0 even when the script aborted on a
+            // readonly reassign (zsh 5.9 exits 1) — same driver bug
+            // for any script whose final command fails.
+            Ok(status) => std::process::exit(status),
+        }
+    }
+
+    tracing::info!(
+        startup_ms = startup_t0.elapsed().as_millis() as u64,
+        "startup complete, entering main loop"
+    );
+    zsh::startup_trace::mark("arg/mode dispatch done");
+
+    // Recording-staleness oracle: the startup path ignores rc files and
+    // replays the recorder shard, so an edited `.zshrc` is invisible until
+    // `zshrs-recorder` re-runs. Log it (never printed to the tty — see the
+    // no-startup-chatter rule) so the "I edited config and forgot" case is
+    // discoverable via `~/.cache/zshrs/zshrs.log` + `--doctor` instead of
+    // silently serving yesterday's environment. One directory listing + a
+    // few stats; no IPC, no re-source.
+    zsh::startup_trace::mark("before staleness check");
+    if let Some(stale_rc) = zsh::daemon_presence::recording_staleness() {
+        tracing::warn!(
+            rc = %stale_rc,
+            "recording is stale: {} is newer than the recorded environment — run `zshrs-recorder` to refresh",
+            stale_rc
+        );
+    }
+
+    // Check if stdin is a TTY
+    // Faithful entry: zsh's `main()` (Src/main.c:114) is just
+    // `return zsh_main(argc, argv)` — there is NO tty/non-tty branch and
+    // NO separate non-interactive driver. `zsh_main` (Src/init.c:1855)
+    // decides interactivity internally via `parseargs` (isatty → the
+    // `interactive`/`SHINSTDIN` options), and `loop()` reads SHIN
+    // identically whether stdin is a terminal, a pipe, or a redirected
+    // file. So a single call covers both `zshrs` at a terminal and
+    // `cmd | zshrs` / `zshrs < file`.
+    //
+    // Create the long-lived session executor and register it so loop()'s
+    // `execode` (init.c:220) runs each parsed program through the fusevm
+    // VM. The executor must outlive zsh_main; it never drops because
+    // zsh_main exits the process from inside loop().
+    zsh::startup_trace::mark("staleness check done");
+    let executor = Box::leak(Box::new(ShellExecutor::new()));
+    zsh::startup_trace::mark("ShellExecutor::new");
+    zsh::ported::exec::install_session_executor(executor);
+    let argv: Vec<String> = argv_strings();
+    zsh::startup_trace::mark("entering zsh_main");
+    std::process::exit(zsh::ported::init::zsh_main(argv.len() as i32, &argv));
+}
+
+/// zshrs --doctor [--json]: full diagnostic report of shell health, caches, and performance.
+fn run_doctor(json: bool) {
+    let t0 = Instant::now();
+    let mut executor = ShellExecutor::new();
+    let init_ms = t0.elapsed().as_millis() as u64;
+    let t1 = Instant::now();
+    executor.drain_compinit_bg();
+    let drain_ms = t1.elapsed().as_millis() as u64;
+    let report = zsh::doctor_report::gather(Some((init_ms, drain_ms)));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        render_doctor(&report);
+    }
+}
+
+/// Human-readable rendering of [`zsh::doctor_report::gather`].
+fn render_doctor(r: &serde_json::Value) {
+    let green = |s: &str| format!("\x1b[32m{}\x1b[0m", s);
+    let red = |s: &str| format!("\x1b[31m{}\x1b[0m", s);
+    let yellow = |s: &str| format!("\x1b[33m{}\x1b[0m", s);
+    let bold = |s: &str| format!("\x1b[1m{}\x1b[0m", s);
+    let dim = |s: &str| format!("\x1b[2m{}\x1b[0m", s);
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let n = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+
+    println!("{}", bold("zshrs doctor"));
+    println!("{}", dim(&"=".repeat(60)));
+    println!();
+
+    let e = &r["environment"];
+    println!("{}", bold("Environment"));
+    println!("  version:    zshrs {}", s(&e["version"]));
+    println!("  pid:        {}", n(&e["pid"]));
+    println!("  cwd:        {}", s(&e["cwd"]));
+    println!("  shell:      {}", s(&e["shell"]));
+    println!("  cpus:       {}", n(&e["cpus"]));
+    println!("  pool size:  {}", n(&e["pool_size"]));
+    println!();
+
+    let p = &r["path"];
+    let path_missing = p["missing"].as_array().map(|a| a.len()).unwrap_or(0);
+    println!("{}", bold("PATH"));
+    println!(
+        "  directories: {} total, {} {}, {} {}",
+        n(&p["total"]),
+        n(&p["valid"]),
+        green("valid"),
+        path_missing,
+        if path_missing > 0 { red("missing") } else { green("missing") },
+    );
+    println!("  commands:    ~{}", n(&p["commands"]));
+    for dir in p["missing"].as_array().into_iter().flatten() {
+        println!("  {} PATH entry does not exist: {}", red("!"), s(dir));
+    }
+    println!();
+
+    let f = &r["fpath"];
+    let fpath_missing = f["missing"].as_array().map(|a| a.len()).unwrap_or(0);
+    println!("{}", bold("FPATH"));
+    println!(
+        "  directories:   {} total, {} {}, {} {}",
+        n(&f["total"]),
+        n(&f["valid"]),
+        green("valid"),
+        fpath_missing,
+        if fpath_missing > 0 { red("missing") } else { green("missing") },
+    );
+    println!("  function files: {}", n(&f["function_files"]));
+    println!();
+
+    let c = &r["caches"];
+    println!("{}", bold("Caches (rkyv-mmapped)"));
+    let idx = &c["index"];
+    if idx["present"].as_bool() == Some(true) {
+        println!(
+            "  index:       {} {}  {}",
+            s(&idx["path"]),
+            format_bytes(n(&idx["bytes"])),
+            green("OK")
+        );
+    } else {
+        println!(
+            "  index:       {} {}",
+            s(&idx["path"]),
+            yellow("(absent — daemon has not built shards yet)")
+        );
+    }
+    let im = &c["images"];
+    if im["present"].as_bool() == Some(true) {
+        let shards = im["shards"].as_array().cloned().unwrap_or_default();
+        println!(
+            "  images/:     {} shards, {} total",
+            shards.len(),
+            format_bytes(n(&im["total_bytes"]))
+        );
+        for sh in &shards {
+            println!("               {} {}", format_bytes(n(&sh["bytes"])), s(&sh["name"]));
+        }
+    } else {
+        println!("  images/:     {} {}", s(&im["path"]), yellow("(absent)"));
+    }
+    if !c["scripts"].is_null() {
+        println!(
+            "  scripts:     {} entries, {}  {}",
+            n(&c["scripts"]["entries"]),
+            format_bytes(n(&c["scripts"]["bytes"])),
+            dim(&s(&c["scripts"]["path"]))
+        );
+    }
+    if !c["autoloads"].is_null() {
+        println!(
+            "  autoloads:   {} functions  {}",
+            n(&c["autoloads"]["functions"]),
+            dim(&s(&c["autoloads"]["path"]))
+        );
+    }
+    println!();
+
+    if !r["recorded_state"].is_null() {
+        println!("{}", bold("Recorded state (authoritative)"));
+        println!("  {}", dim(&s(&r["recorded_state"]["shard"])));
+        for row in r["recorded_state"]["counts"].as_array().into_iter().flatten() {
+            println!("  {:<17}{}", format!("{}:", s(&row["label"])), n(&row["count"]));
+        }
+        println!();
+    }
+
+    println!("{}", bold("SQLite (read-only mirrors)"));
+    println!(
+        "  {}",
+        dim("daemon-maintained; not read on cache lookup / hot path")
+    );
+    let cs = &r["sqlite"]["compsys"];
+    if cs["present"].as_bool() == Some(true) {
+        println!(
+            "  compsys.db:  {} completions, {}  {}",
+            n(&cs["completions"]),
+            format_bytes(n(&cs["bytes"])),
+            dim("mirror"),
+        );
+    } else {
+        println!(
+            "  compsys.db:  {}",
+            yellow("not found — run compinit to create the mirror")
+        );
+    }
+    if let Some(pl) = r["sqlite"].get("plugins") {
+        match pl.as_u64() {
+            Some(count) => println!("  plugins:     {} plugins  {}", count, dim("mirror")),
+            None => println!("  plugins:     {}", yellow("no mirror — start the daemon to hydrate it")),
+        }
+    }
+    println!();
+
+    let h = &r["history"];
+    println!("{}", bold("History"));
+    if h["present"].as_bool() == Some(true) {
+        println!(
+            "  {}  {} entries, {}  {}",
+            s(&h["path"]),
+            n(&h["entries"]),
+            format_bytes(n(&h["bytes"])),
+            green("OK"),
+        );
+    } else {
+        println!("  {}  {}", s(&h["path"]), yellow("not found"));
+    }
+    println!();
+
+    let l = &r["log"];
+    println!("{}", bold("Log"));
+    if l["present"].as_bool() == Some(true) {
+        println!(
+            "  {}  {} lines, {}",
+            s(&l["path"]),
+            n(&l["lines"]),
+            format_bytes(n(&l["bytes"]))
+        );
+    } else {
+        println!("  {}", dim("no log file yet"));
+    }
+    println!();
+
+    println!("{}", bold("Startup Files"));
+    for sf in r["startup_files"].as_array().into_iter().flatten() {
+        if sf["present"].as_bool() == Some(true) {
+            let cache_status = if sf["cached"].as_bool() == Some(true) {
+                green("cached")
+            } else {
+                yellow("uncached")
+            };
+            println!(
+                "  {} {} {}  [{}]",
+                green("*"),
+                s(&sf["path"]),
+                dim(&format!("({})", format_bytes(n(&sf["bytes"])))),
+                cache_status,
+            );
+        } else {
+            println!("  {} {}", dim("-"), dim(&s(&sf["path"])));
+        }
+    }
+    let rec = &r["recording"];
+    if rec["present"].as_bool() != Some(true) {
+        println!("  {} recording: {}", dim("-"), dim("none (rc files sourced normally)"));
+    } else if let Some(rc) = rec["stale_rc"].as_str() {
+        println!(
+            "  {} recording: {} ({} is newer — run `zshrs-recorder`)",
+            yellow("!"),
+            yellow("STALE"),
+            rc,
+        );
+    } else {
+        println!("  {} recording: {}", green("*"), green("up to date"));
+    }
+    println!();
+
+    let pr = &r["profiling"];
+    println!("{}", bold("Profiling Features"));
+    let feature = |on: &serde_json::Value, flag: &str| {
+        if on.as_bool() == Some(true) {
+            green("enabled")
+        } else {
+            dim(&format!("disabled (build with --features {flag})"))
+        }
+    };
+    println!("  chrome tracing: {}", feature(&pr["chrome_tracing"], "profiling"));
+    println!("  flamegraph:     {}", feature(&pr["flamegraph"], "flamegraph"));
+    println!("  prometheus:     {}", feature(&pr["prometheus"], "prometheus"));
+    println!(
+        "  ZSHRS_LOG:      {}",
+        pr["zshrs_log"].as_str().unwrap_or("info (default)")
+    );
+    println!();
+
+    let b = &r["startup_benchmark"];
+    let total = n(&b["total_ms"]);
+    println!("{}", bold("Startup Benchmark"));
+    println!("  executor init:  {}ms", n(&b["executor_init_ms"]));
+    println!("  compinit drain: {}ms", n(&b["compinit_drain_ms"]));
+    let status = if total < 30 {
+        green(&format!("{}ms — excellent", total))
+    } else if total < 100 {
+        yellow(&format!("{}ms — good", total))
+    } else {
+        red(&format!("{}ms — slow", total))
+    };
+    println!("  total:          {}", status);
+    println!();
+
+    println!("{}", bold("Summary"));
+    let issues = r["issues"].as_array().cloned().unwrap_or_default();
+    for issue in &issues {
+        let text = s(issue);
+        // Missing PATH/FPATH entries and slow startup are errors; absent caches are warnings.
+        let mark = if text.contains("missing") || text.contains("startup") {
+            red("!")
+        } else {
+            yellow("!")
+        };
+        println!("  {} {}", mark, text);
+    }
+    if issues.is_empty() {
+        println!("  {} all checks passed", green("*"));
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn get_zdotdir() -> PathBuf {
+    std::env::var("ZDOTDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")))
+}
+
+/// The system-wide startup file for `name`, resolved through
+/// [`zsh::global_rc::global_rc_path`] so the Debian/Ubuntu
+/// `/etc/zsh/…` layout is picked up on those platforms.
+fn global_rc(name: &str) -> PathBuf {
+    PathBuf::from(zsh::global_rc::global_rc_path(&format!("/etc/{name}")))
+}
+
+/// Source the selected drop-in's startup files (`--bash`, `--ksh`,
+/// `--mksh`, `--pdksh`, `--sh`, `--dash`, `--csh`).
+///
+/// The ordered list comes from [`zsh::emulation_startup::startup_files`],
+/// the same one the library-side `run_init_scripts` hook drives for an
+/// interactive shell, so the `-c` and script-file dispatch paths in this
+/// binary cannot drift from it. See that module for the per-shell table
+/// and the reference-binary runs each row was verified against.
+fn source_emulation_startup_files(
+    executor: &mut ShellExecutor,
+    is_login: bool,
+    is_interactive: bool,
+    no_rcs: bool,
+) {
+    if no_rcs || !zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+        return;
+    }
+    let privileged = zsh::ported::options::opt_state_get("privileged").unwrap_or(false);
+    for path in zsh::emulation_startup::startup_files(is_login, is_interactive, privileged) {
+        // `source_from_memory`, NOT `source_file_with_zwc`: the latter
+        // walks the file line by line with a brace/paren balance
+        // heuristic, which cannot parse a multi-line `if … fi`. macOS's
+        // own `/etc/profile` is exactly that, so routing the drop-in
+        // files through it made `zshrs` symlinked as a login shell print
+        // four "parse error near `if'" lines before the prompt.
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(contents) = csh_input(&contents) else {
+            continue;
+        };
+        source_from_memory(executor, &path, &contents);
+    }
+}
+
+/// The path the kernel executed this process from, as given to `execve`
+/// — before symlink resolution and independent of `argv[0]`, which `ARGV0`
+/// or `exec -a` can set to anything. `None` when the platform cannot say;
+/// the caller falls back to `argv[0]`.
+/// !!! RUST-ONLY — no C counterpart. C's `-c` prefix is the literal
+/// "zsh" (Src/init.c:497); zshrs names itself after the file it runs as.
+fn executed_path() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // AT_EXECFN: the filename argument of execve, unresolved, so the
+        // test harness's `Src/zsh -> zshrs` symlink still reads as `zsh`.
+        // SAFETY: getauxval returns 0 or a pointer to a NUL-terminated
+        // string in the process's auxiliary vector, valid for its life.
+        let p = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+        if !p.is_null() {
+            let s = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned();
+            return (!s.is_empty()).then_some(s);
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)] // libc points at the `mach2` crate; same call as init.rs getmypath
+    {
+        let mut n: u32 = libc::PATH_MAX as u32;
+        let mut buf = vec![0u8; n as usize];
+        // SAFETY: _NSGetExecutablePath writes at most `n` bytes, NUL-
+        // terminated, and reports the needed size when `buf` is short.
+        let mut rc = unsafe { libc::_NSGetExecutablePath(buf.as_mut_ptr().cast(), &mut n) };
+        if rc < 0 {
+            buf.resize(n as usize, 0);
+            rc = unsafe { libc::_NSGetExecutablePath(buf.as_mut_ptr().cast(), &mut n) };
+        }
+        if rc != 0 {
+            return None;
+        }
+        let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr().cast()) }.to_string_lossy().into_owned();
+        (!s.is_empty()).then_some(s)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// The `-c` driver's half of `run_init_scripts`' recording replay: a
+/// recorder shard stands in for the startup files only where `.zshrc`
+/// would be read — `-i -c`, RCS set, not the `--zsh` parity mode. A plain
+/// `zshrs -c` reads `.zshenv` alone (Src/init.c:1473, 1489), which the
+/// interactive recording does not describe, so it sources normally.
+/// Returns `true` when the shard replaced the files.
+/// !!! RUST-ONLY — no C counterpart.
+fn replay_recording_for_c(executor: &mut ShellExecutor, no_rcs: bool) -> bool {
+    #[cfg(feature = "daemon")]
+    {
+        let interactive = zsh::ported::options::opt_state_get("interactive").unwrap_or(false);
+        if interactive && !no_rcs && !zsh::emulation_startup::emulating() {
+            return zsh::canonical_apply::replay_startup_into(executor);
+        }
+    }
+    let _ = (executor, no_rcs);
+    false
+}
+
+/// Source zsh startup files in correct order per zshall(1) STARTUP/SHUTDOWN FILES
+///
+/// Behavior is controlled by RCS and GLOBAL_RCS options:
+/// - RCS (default: on) - if unset, no startup files are read
+/// - GLOBAL_RCS (default: on) - if unset, the system-wide files are skipped
+///
+/// The system-wide paths below are written `/etc/…` for brevity; they are
+/// resolved through [`global_rc`], which picks the Debian `/etc/zsh/…`
+/// layout when that is what the platform uses.
+///
+/// Order for login shell:
+///   1. /etc/zshenv (always, cannot be overridden - even with -f)
+///   2. $ZDOTDIR/.zshenv
+///   3. /etc/zprofile (login only)
+///   4. $ZDOTDIR/.zprofile (login only)
+///   5. /etc/zshrc (interactive only)
+///   6. $ZDOTDIR/.zshrc (interactive only)
+///   7. /etc/zlogin (login only)
+///   8. $ZDOTDIR/.zlogin (login only)
+///
+/// If file.zwc exists and is newer than file, the compiled version is used.
+///
+/// Optimization: all startup file contents are read into memory in parallel
+/// (overlapping disk I/O), then executed sequentially in the correct order.
+fn source_startup_files(
+    executor: &mut ShellExecutor,
+    is_login: bool,
+    is_interactive: bool,
+    no_rcs: bool,
+) {
+    let zdotdir = get_zdotdir();
+
+    // Build the ordered list of candidate startup files.
+    // We read ALL of them in parallel to overlap disk latency, but execute
+    // sequentially and honor RCS/GLOBAL_RCS checks between phases.
+    let mut candidates: Vec<PathBuf> = Vec::with_capacity(8);
+
+    // Phase 0: /etc/zshenv — always read
+    candidates.push(global_rc("zshenv"));
+
+    if !no_rcs {
+        // Phase 1: user .zshenv
+        candidates.push(zdotdir.join(".zshenv"));
+
+        // Phase 2: login profile files
+        if is_login {
+            candidates.push(global_rc("zprofile"));
+            candidates.push(zdotdir.join(".zprofile"));
+        }
+
+        // Phase 3: interactive rc files
+        if is_interactive {
+            candidates.push(global_rc("zshrc"));
+            candidates.push(zdotdir.join(".zshrc"));
+        }
+
+        // Phase 4: login files (after zshrc)
+        if is_login {
+            candidates.push(global_rc("zlogin"));
+            candidates.push(zdotdir.join(".zlogin"));
+        }
+    }
+
+    // --- Parallel read phase: read all files at once on background threads ---
+    let read_start = std::time::Instant::now();
+    let file_count = candidates.len();
+
+    let handles: Vec<std::thread::JoinHandle<(PathBuf, Option<String>)>> = candidates
+        .into_iter()
+        .map(|path| {
+            zsh::signal_thread::spawn(move || {
+                let contents = if path.exists() {
+                    std::fs::read_to_string(&path).ok()
+                } else {
+                    None
+                };
+                (path, contents)
+            })
+        })
+        .collect();
+
+    // Collect results in order (handles are in insertion order)
+    let preloaded: Vec<(PathBuf, Option<String>)> = handles
+        .into_iter()
+        .map(|h| h.join().unwrap_or_else(|_| (PathBuf::new(), None)))
+        .collect();
+
+    tracing::debug!(
+        files = file_count,
+        read_ms = read_start.elapsed().as_millis() as u64,
+        "startup files parallel read complete"
+    );
+
+    // --- Sequential execution phase: execute in correct order with RCS checks ---
+
+    // Phase 0: /etc/zshenv — always
+    if let Some((path, Some(text))) = preloaded.first() {
+        source_from_memory(executor, path, text);
+    }
+
+    if no_rcs {
+        return;
+    }
+
+    // Check RCS after /etc/zshenv
+    if !zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+        return;
+    }
+
+    // Phase 1: $ZDOTDIR/.zshenv
+    let mut idx = 1;
+    if idx < preloaded.len() {
+        if let Some(ref text) = preloaded[idx].1 {
+            source_from_memory(executor, &preloaded[idx].0, text);
+        }
+        idx += 1;
+    }
+
+    // Re-check RCS after .zshenv
+    if !zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+        return;
+    }
+
+    // Phase 2: login profile files
+    if is_login {
+        // /etc/zprofile
+        if idx < preloaded.len() {
+            if zsh::ported::options::opt_state_get("globalrcs").unwrap_or(true) {
+                if let Some(ref text) = preloaded[idx].1 {
+                    source_from_memory(executor, &preloaded[idx].0, text);
+                }
+            }
+            idx += 1;
+        }
+        // $ZDOTDIR/.zprofile
+        if idx < preloaded.len() {
+            if zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+                if let Some(ref text) = preloaded[idx].1 {
+                    source_from_memory(executor, &preloaded[idx].0, text);
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    // Re-check RCS
+    if !zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+        return;
+    }
+
+    // Phase 3: interactive rc files
+    if is_interactive {
+        // /etc/zshrc
+        if idx < preloaded.len() {
+            if zsh::ported::options::opt_state_get("globalrcs").unwrap_or(true) {
+                if let Some(ref text) = preloaded[idx].1 {
+                    source_from_memory(executor, &preloaded[idx].0, text);
+                }
+            }
+            idx += 1;
+        }
+        // $ZDOTDIR/.zshrc
+        if idx < preloaded.len() {
+            if zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+                if let Some(ref text) = preloaded[idx].1 {
+                    source_from_memory(executor, &preloaded[idx].0, text);
+                }
+            }
+            idx += 1;
+        }
+    }
+
+    // Re-check RCS
+    if !zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+        return;
+    }
+
+    // Phase 4: login files (after zshrc)
+    if is_login {
+        // /etc/zlogin
+        if idx < preloaded.len() {
+            if zsh::ported::options::opt_state_get("globalrcs").unwrap_or(true) {
+                if let Some(ref text) = preloaded[idx].1 {
+                    source_from_memory(executor, &preloaded[idx].0, text);
+                }
+            }
+            idx += 1;
+        }
+        // $ZDOTDIR/.zlogin
+        if idx < preloaded.len() {
+            if zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+                if let Some(ref text) = preloaded[idx].1 {
+                    source_from_memory(executor, &preloaded[idx].0, text);
+                }
+            }
+            // suppress unused assignment warning
+            let _ = idx;
+        }
+    }
+}
+
+/// `[shell].startup_config` from `zshrs.toml` — sourced once after
+/// dotfiles or `canonical_apply`, unless `-f` / `--no-rcs`.
+/// Interactive: runs before compsys PATH indexing and the prompt loop.
+fn maybe_source_zshrs_startup_config(executor: &mut ShellExecutor, no_rcs: bool) {
+    if no_rcs {
+        return;
+    }
+    let Some(path) = zsh::daemon_presence::startup_config_path() else {
+        return;
+    };
+    if !path.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "zshrs.toml [shell].startup_config: not a regular file"
+        );
+        return;
+    }
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        tracing::warn!(
+            path = %path.display(),
+            "zshrs.toml [shell].startup_config: read failed"
+        );
+        return;
+    };
+    source_from_memory(executor, path.as_path(), &contents);
+}
+
+/// Execute a startup file from pre-read memory contents.
+/// Mirrors source_file() logic but skips the fs::read_to_string.
+fn source_from_memory(executor: &mut ShellExecutor, path: &Path, contents: &str) {
+    tracing::trace!(path = %path.display(), "sourcing startup file from memory");
+
+    // Port of `bin_dot()` argzero-save/restore from
+    // Src/builtin.c:6076-6079 + 6139-6142: when FUNCTION_ARGZERO
+    // is set (default), `$0` becomes the sourced file path during
+    // the source and is restored afterwards. The C source uses
+    // ztrdup(arg0) to copy and zsfree on exit; Rust's String
+    // ownership handles both automatically.
+    let saved_argzero = if zsh::ported::options::opt_state_get("functionargzero").unwrap_or(true) {
+        let prev = executor.scalar("0");
+        executor.set_scalar("0".to_string(), path.to_string_lossy().to_string());
+        Some(prev)
+    } else {
+        None
+    };
+    // Port of `source()` scriptname swap from Src/init.c:1591-1592
+    // (`scriptname = s; scriptfilename = s;`). Drives `%N` / `%x`
+    // prompt expansion (and the corresponding xtrace prefix line)
+    // to show the sourced file path during the source body, then
+    // restore the prior value on exit. The C source pairs this
+    // with the argzero swap above — both are in flight together.
+    //
+    // Two stores per side: the canonical file-static
+    // `crate::ported::utils::{scriptname,scriptfilename}` that the
+    // prompt expander reads (prompt.rs:152-164 hydrates
+    // SCRIPTNAME/SCRIPTFILENAME TLS from these), AND the
+    // ShellExecutor.scriptname field used by some legacy callers.
+    // Previously only the latter was written, so PS4's `%x` / `%N`
+    // kept showing "zsh" (the initial set_scriptname value seeded
+    // at executor construction) all the way through .zshenv /
+    // .zshrc / .zprofile sourcing. Bug surfaced as
+    //   `zsh    zsh    1    export …`
+    // (zshrs) vs
+    //   `/Users/wizard/.zshenv    /Users/wizard/.zshenv    1    export …`
+    // (real zsh) in the user's PS4 parity screenshot.
+    let path_str = path.to_string_lossy().to_string();
+    let saved_scriptname_field = executor.scriptname.take();
+    executor.scriptname = Some(path_str.clone());
+    let saved_scriptname = zsh::ported::utils::scriptname_get();
+    let saved_scriptfilename = zsh::ported::utils::scriptfilename_get();
+    zsh::ported::utils::set_scriptname(Some(path_str.clone()));
+    zsh::ported::utils::set_scriptfilename(Some(path_str));
+
+    // Parse and execute the entire file as one stream — port of
+    // C `source()` → `loop(0, 0)` (Src/init.c:1551, 1627). The
+    // parser handles multi-line constructs (`if/then/fi`,
+    // `case/esac`, `for/done`, `while/done`, `function {…}`,
+    // heredocs, line continuations) natively because it reads the
+    // full token stream rather than discrete lines. The previous
+    // line-by-line implementation here split `if [[ -r FILE ]]; then`
+    // from its body, so the body executed unconditionally — broke
+    // /etc/zshrc:25 zkbd test, broke `case ARM) c1='…'; …;;` SQ
+    // assignments, broke any function defined across lines.
+    // c:Src/init.c:1606 / c:1644 — `sourcelevel++` around the file, so a
+    // top-level `return` in it leaves the FILE: bin_break's return arm
+    // (c:Src/builtin.c:5840-5841) only falls through to zexit when
+    // `sourcelevel` is zero. Without it Ubuntu's /etc/bash.bashrc
+    // (`[ -z "$PS1" ] && return`, line 1) exited `zshrs --bash -i -c CMD`
+    // with status 0 before CMD ran.
+    use std::sync::atomic::Ordering::Relaxed;
+    zsh::ported::init::sourcelevel.fetch_add(1, Relaxed);
+    if let Err(e) = executor.execute_script(contents) {
+        if e != "__SILENCED__" {
+            eprintln!("zshrs: {}: {}", path.display(), e);
+        }
+    }
+    zsh::ported::init::sourcelevel.fetch_sub(1, Relaxed);
+    // c:Src/init.c:1697-1698 — `if (!exit_pending) retflag = 0;`: the
+    // return has been serviced at the file boundary.
+    if zsh::ported::builtin::EXIT_PENDING.load(Relaxed) == 0 {
+        zsh::ported::builtin::RETFLAG.store(0, Relaxed);
+    }
+
+    // Restore `$0` per Src/builtin.c:6139-6142.
+    if let Some(prev) = saved_argzero {
+        match prev {
+            Some(v) => {
+                executor.set_scalar("0".to_string(), v);
+            }
+            None => {
+                executor.unset_scalar("0");
+            }
+        }
+    }
+    // Restore scriptname per Src/init.c source() exit path.
+    executor.scriptname = saved_scriptname_field;
+    zsh::ported::utils::set_scriptname(saved_scriptname);
+    zsh::ported::utils::set_scriptfilename(saved_scriptfilename);
+    // c:Src/init.c:1663 — `errflag &= ~ERRFLAG_ERROR;` on source()'s
+    // restore path. Sourcing is a containment boundary: an errflag
+    // abort inside one startup file must not poison the next file
+    // (or the interactive session) — zsh clears the flag when the
+    // sourced file unwinds.
+    zsh::ported::utils::errflag.fetch_and(
+        !zsh::ported::zsh_h::ERRFLAG_ERROR,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Source a file
+fn source_file_with_zwc(executor: &mut ShellExecutor, path: &PathBuf) {
+    source_file(executor, path);
+}
+
+/// Source a single file, handling multi-line constructs
+fn source_file(executor: &mut ShellExecutor, path: &PathBuf) {
+    if !path.exists() {
+        return;
+    }
+
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        // c:Src/init.c:1591-1592 — `scriptname = s; scriptfilename
+        // = s;` for the duration of the source body. Without these
+        // writes, PS4's %x / %N renders "zsh" instead of the file
+        // path. See source_from_memory for the longer comment.
+        let path_str = path.to_string_lossy().to_string();
+        let saved_scriptname = zsh::ported::utils::scriptname_get();
+        let saved_scriptfilename = zsh::ported::utils::scriptfilename_get();
+        zsh::ported::utils::set_scriptname(Some(path_str.clone()));
+        zsh::ported::utils::set_scriptfilename(Some(path_str));
+        let mut buffer = String::new();
+        let mut in_multiline = false;
+
+        for line in contents.lines() {
+            let trimmed = line.trim();
+
+            // Skip empty lines and comments (unless in multiline)
+            if !in_multiline && (trimmed.is_empty() || trimmed.starts_with('#')) {
+                continue;
+            }
+
+            // Check for line continuation
+            if let Some(stripped) = line.strip_suffix('\\') {
+                buffer.push_str(stripped);
+                buffer.push(' ');
+                in_multiline = true;
+                continue;
+            }
+
+            // Check for unclosed constructs (heredoc, quotes, braces)
+            if in_multiline {
+                buffer.push_str(line);
+                // Simple heuristic: if we have balanced braces/quotes, execute
+                let open_braces = buffer.matches('{').count();
+                let close_braces = buffer.matches('}').count();
+                let open_parens = buffer.matches('(').count();
+                let close_parens = buffer.matches(')').count();
+
+                if open_braces == close_braces && open_parens == close_parens {
+                    process_line(&buffer, executor);
+                    buffer.clear();
+                    in_multiline = false;
+                } else {
+                    buffer.push('\n');
+                }
+            } else {
+                process_line(line, executor);
+            }
+        }
+
+        // Process any remaining buffered content
+        if !buffer.is_empty() {
+            process_line(&buffer, executor);
+        }
+        // Restore scriptname/scriptfilename per Src/init.c source()
+        // exit path. Mirrors the equivalent restore in
+        // source_from_memory above.
+        zsh::ported::utils::set_scriptname(saved_scriptname);
+        zsh::ported::utils::set_scriptfilename(saved_scriptfilename);
+    }
+}
+
+/// Source logout files when shell exits (per zshall(1))
+/// Only for login shells, respects RCS and GLOBAL_RCS options
+#[allow(dead_code)]
+fn source_logout_files(executor: &mut ShellExecutor, is_login: bool) {
+    if !is_login {
+        return;
+    }
+
+    // Check RCS option
+    if !zsh::ported::options::opt_state_get("rcs").unwrap_or(true) {
+        return;
+    }
+
+    let zdotdir = get_zdotdir();
+
+    // $ZDOTDIR/.zlogout first
+    source_file_with_zwc(executor, &zdotdir.join(".zlogout"));
+
+    // /etc/zlogout (only if GLOBAL_RCS is set)
+    if zsh::ported::options::opt_state_get("globalrcs").unwrap_or(true) {
+        source_file_with_zwc(executor, &global_rc("zlogout"));
+    }
+}
+
+fn process_line(line: &str, executor: &mut ShellExecutor) {
+    // @ prefix: dispatch to stryke if fat binary registered a handler
+    if line.starts_with('@') {
+        let code = line.trim_start_matches('@').trim();
+        if !code.is_empty() {
+            if let Some(status) = zsh::try_stryke_dispatch(code) {
+                executor.set_last_status(status);
+                return;
+            }
+            // No handler registered (thin binary) — treat @ as normal shell input
+        }
+    }
+
+    let line = match csh_line(line) {
+        Some(text) => text,
+        None => return,
+    };
+    if let Err(e) = executor.execute_script(&line) {
+        if e != "__SILENCED__" {
+            eprintln!("zshrs: {}", e);
+        }
+    }
+}
+
+/// The `--csh` input boundary: csh text in, zsh text out. Every other
+/// personality passes its input through untouched. Errors carry the text
+/// tcsh prints for the same mistake. The translation, preamble and options
+/// live in `emulation_startup` so the library-side startup-file sourcing
+/// (an interactive shell) goes through the same boundary.
+fn csh_input(src: &str) -> Result<String, String> {
+    zsh::emulation_startup::csh_input(src, zsh::csh::translate)
+}
+
+/// One line of interactive or stdin input; see `emulation_startup::csh_line`.
+fn csh_line(line: &str) -> Option<String> {
+    zsh::emulation_startup::csh_line(line)
+}

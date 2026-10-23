@@ -1,0 +1,42 @@
+# parity-fuzz --mode loop baseline: normalized signatures of KNOWN gaps.
+# A divergence whose signature is here is allowed; a NEW one fails CI.
+# Regenerate: parity-fuzz --mode loop --count N --verify 3  (copy NEW-signature lines).
+#
+# EMPTY — the mode has no allowed gaps. Every divergence fails.
+#
+# It used to carry 36 signatures for one architectural gap: `break` /
+# `continue` inside a FUNCTION did not reach the CALLER's loop, because
+# `loops` is a GLOBAL counter in C (bin_break tests `if (!loops)`,
+# c:Src/builtin.c:5832) that zshrs's compiled for/while/until/repeat never
+# maintained — they lower to raw jumps, so bin_break always read loops == 0
+# and answered "not in while, until, select, or repeat loop". `while true;
+# do f; done` with `f(){ break }` did not terminate at all.
+#
+# Closed by giving the VM a real loop scope rather than bolting a counter
+# onto the jumps:
+#   - BUILTIN_LOOP_ENTER / BUILTIN_LOOP_EXIT bracket each construct
+#     (c:Src/loop.c:114/188, :427/491, :523/546), emitted once before
+#     `loop_top` and once at `loop_exit` so every in-chunk exit passes
+#     through exactly one decrement.
+#   - `break N` / `continue N` that jump PAST inner loops emit the skipped
+#     decrements first, and `run_chunk` restores the count the chunk
+#     started with, so a `return` / errflag abort out of a loop cannot leak.
+#   - BUILTIN_LOOP_BREAK_DRAIN after each body is c:Src/loop.c:529-534's
+#     `if (breaks) { breaks--; if (breaks || !contflag) break; contflag = 0; }`.
+#   - BUILTIN_BREAKS_PENDING after each list is c:Src/exec.c:1370's
+#     `while (… && !breaks && …)` gate, so the rest of the body — and of
+#     any intermediate function — is abandoned rather than run on.
+#   - `(…)` and pipeline stages contain the escape at SubshellEnd, and
+#     SubshellEnd restores loops/breaks/contflag: C forks, so a `break`
+#     inside a subshell dies with the child.
+#   - `break N` naming more levels than the CURRENT chunk has open now
+#     routes through bin_break, whose `num.min(loops)` (c:5837) clamps
+#     against the runtime global — the same function body must break its
+#     own loop only (top-level caller) or its own AND the caller's
+#     (called from a loop), which no compile-time clamp can express.
+#   - LOCAL_LOOPS' two `zwarn` lines (c:6106-6107) are in doshfunc.
+#
+# The no-enclosing-loop case is unchanged and must stay so:
+#     f(){ break; }; f   → "not in while, until, select, or repeat loop"
+#
+# Any divergence at all is a regression.

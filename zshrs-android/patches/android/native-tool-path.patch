@@ -1,0 +1,106 @@
+--- a/bins/parity-fuzz.rs
++++ b/bins/parity-fuzz.rs
+@@ -35,9 +35,10 @@ fn zshrs_bin() -> PathBuf {
+     if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+         return PathBuf::from(p);
+     }
+-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+-        .join("target")
+-        .join("debug")
++    std::env::current_exe()
++        .expect("locate parity fuzzer executable")
++        .parent()
++        .expect("parity fuzzer executable has a parent directory")
+         .join("zshrs")
+ }
+ 
+--- a/bins/zshrs-recorder.rs
++++ b/bins/zshrs-recorder.rs
+@@ -283,7 +283,8 @@ const SESSION_ENV: &[&str] = &[
+ /// shell replayed in a new terminal had no `$ZPWR_EXA_COMMAND` —
+ /// `zpwrClearList` listed nothing. Keeps [`SESSION_ENV`], `LC_*`, `XDG_*`
+ /// and `ZSHRS_*` (the recorder's own settings), and resets `PATH` to the
+-/// system default (`confstr(_CS_PATH)`) that `/etc/zprofile` builds on.
++/// system default (`confstr(_CS_PATH)`, or Termux's `_PATH_DEFPATH` on Android)
++/// that the login startup files build on.
+ fn scrub_environment() {
+     let keep = |name: &str| {
+         SESSION_ENV.contains(&name) || ["LC_", "XDG_", "ZSHRS_"].iter().any(|p| name.starts_with(p))
+@@ -295,13 +296,19 @@ fn scrub_environment() {
+             }
+         }
+     }
+-    let mut buf = vec![0u8; 1024];
+-    // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
+-    let n = unsafe { libc::confstr(libc::_CS_PATH, buf.as_mut_ptr().cast(), buf.len()) };
+-    if n > 0 && n <= buf.len() {
+-        let path = String::from_utf8_lossy(&buf[..n - 1]).into_owned();
+-        std::env::set_var("PATH", path);
++    #[cfg(not(target_os = "android"))]
++    {
++        let mut buf = vec![0u8; 1024];
++        // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
++        let n = unsafe { libc::confstr(libc::_CS_PATH, buf.as_mut_ptr().cast(), buf.len()) };
++        if n > 0 && n <= buf.len() {
++            let path = String::from_utf8_lossy(&buf[..n - 1]).into_owned();
++            std::env::set_var("PATH", path);
++        }
+     }
++    // Termux `<paths.h>` `_PATH_DEFPATH`; never inherit the caller's PATH.
++    #[cfg(target_os = "android")]
++    std::env::set_var("PATH", "/data/data/com.termux/files/usr/bin");
+ }
+ 
+ fn main() -> ExitCode {
+--- a/src/extensions/global_rc.rs
++++ b/src/extensions/global_rc.rs
+@@ -31,6 +31,9 @@ use crate::ported::config_h::{
+ /// The Debian/Ubuntu/Arch `--sysconfdir=/etc/zsh` directory.
+ const DEBIAN_SYSCONFDIR: &str = "/etc/zsh";
+ 
++/// Termux `--sysconfdir` (`$PREFIX/etc`); Android has no `/etc/zsh*`.
++const TERMUX_SYSCONFDIR: &str = "/data/data/com.termux/files/usr/etc";
++
+ /// Map one compile-time `GLOBAL_Z*` default onto the path the running
+ /// platform's zsh would actually read.
+ ///
+@@ -46,6 +49,12 @@ pub fn global_rc_path(default: &str) -> String {
+     let Some(base) = default.strip_prefix("/etc/") else {
+         return default.to_string();
+     };
++    if cfg!(target_os = "android") {
++        let termux = format!("{TERMUX_SYSCONFDIR}/{base}");
++        if std::path::Path::new(&termux).exists() {
++            return termux;
++        }
++    }
+     let debian = format!("{DEBIAN_SYSCONFDIR}/{base}");
+     if std::path::Path::new(&debian).exists() {
+         debian
+@@ -92,8 +101,9 @@ mod tests {
+             let stem = default.rsplit('/').next().expect("non-empty path");
+             assert!(
+                 default == format!("/etc/{stem}")
+-                    || default == format!("{DEBIAN_SYSCONFDIR}/{stem}"),
+-                "{default:?} is neither the upstream nor the Debian location"
++                    || default == format!("{DEBIAN_SYSCONFDIR}/{stem}")
++                    || default == format!("{TERMUX_SYSCONFDIR}/{stem}"),
++                "{default:?} is neither the upstream, Debian nor Termux location"
+             );
+         }
+     }
+--- a/src/extensions/terminfo_db.rs
++++ b/src/extensions/terminfo_db.rs
+@@ -483,8 +483,12 @@ fn search_dirs() -> Vec<PathBuf> {
+             "/usr/share/lib/terminfo",
+             "/usr/local/share/terminfo",
+         ];
++        // Termux ncurses' default terminfo dir; `$TERMINFO` is not exported.
++        let termux = ["/data/data/com.termux/files/usr/share/terminfo"];
+         let ordered: Vec<&str> = if cfg!(target_os = "macos") {
+             brew.into_iter().chain(system).collect()
++        } else if cfg!(target_os = "android") {
++            termux.into_iter().chain(system).chain(brew).collect()
+         } else {
+             system.into_iter().chain(brew).collect()
+         };

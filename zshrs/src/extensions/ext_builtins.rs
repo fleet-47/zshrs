@@ -1,0 +1,12330 @@
+//! Extension-only shell builtins (no zsh C counterpart).
+//!
+//! Every method here implements a builtin that does NOT exist in
+//! `src/zsh/Src/` — these are zshrs-specific additions: coreutils
+//! drop-ins, bash-only builtins (caller, shopt, readarray), zshrs
+//! features (async, await, barrier, doctor, profile, intercept),
+//! contrib autoloads exposed as builtins (compdef, compinit, zmv,
+//! zcalc, peach), etc.
+//!
+//! These methods previously lived on `ShellExecutor` in
+//! `src/ported/vm_helper`. They were bulk-moved here so that
+//! `src/ported/` only contains C-port code, satisfying the
+//! `port_purity` discipline described in `docs/PORT.md`.
+
+#![allow(unused_imports)]
+
+/// Canonical name list of every extension builtin defined in this
+/// module. Each entry maps to a `builtin_<NAME>` method on
+/// `ShellExecutor`. Kept hand-sorted for review-friendly diffs.
+///
+/// Used by `lsp::dump_reflection_json` (Extensions tab in the
+/// IntelliJ tool window) and `lsp::dump_reference_html`
+/// (`ch-lsp-extensions` chapter in `docs/reference.html`). When you
+/// add a `pub(crate) fn builtin_X` method below, ALSO add `X` here
+/// (sorted) so the inventory stays in sync.
+/// True when the shell's user-visible BUILTIN TABLE must omit
+/// [`EXT_BUILTIN_NAMES`] — the `builtins` magic assoc
+/// (`Src/Modules/parameter.c`'s `scanbuiltins` port) and the legacy
+/// compctl builtin namespace (`Src/Zle/compctl.c`'s `dumphashtable`
+/// port).
+///
+/// Two ways to turn on:
+///
+///   * `--zsh` strict emulation — those names do not exist in zsh, so
+///     the emulated namespace must not invent them.
+///   * `ZSHRS_HIDE_EXT_BUILTINS` set to any non-empty value — a
+///     MEASUREMENT knob for the byte-for-byte parity harnesses, so they
+///     can diff zshrs's zsh-compatible namespace against real zsh
+///     without ~145 zshrs-original builtins showing up as spurious
+///     diffs. It is NOT a compat mode: nothing else about the shell
+///     changes, and in particular DISPATCH is untouched — `peach`,
+///     `doctor`, `async` still run, and `whence -w`/`type`/`command -v`
+///     still resolve them as builtins.
+///
+/// The env read is cached: both callers are name-enumeration hot paths
+/// (`${(k)builtins}`, command-position completion). The `--zsh` half is
+/// read live because the mode flag is set during argument parsing.
+pub fn hide_ext_builtins() -> bool {
+    static HIDE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env_hide = *HIDE_ENV
+        .get_or_init(|| std::env::var_os("ZSHRS_HIDE_EXT_BUILTINS").is_some_and(|v| !v.is_empty()));
+    env_hide || crate::IS_ZSH_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The module each statically-linked builtin belongs to, or `None` for
+/// a `zsh/main` core builtin that is always present.
+///
+/// In C `builtintab` is a live hash table: a module's builtins are
+/// added by `addbuiltins()` when the module loads and removed when it
+/// unloads, so `builtintab` only ever holds names that are callable
+/// right now. zshrs links every module statically and keeps ONE flat
+/// `BUILTINS` slice (`src/ported/builtin.rs`), so the module→name
+/// association that C carries implicitly in table membership has to be
+/// spelled out here.
+///
+/// `"__zshrs_only"` marks entries in zshrs's `BUILTINS` table that have
+/// no upstream counterpart at all (debug/bytecode hooks); no `zmodload`
+/// can make them appear in a real zsh.
+pub fn builtin_owning_module(name: &str) -> Option<&'static str> {
+    match name {
+        // zsh/files (Src/Modules/files.c:806-824).
+        "chmod" | "chgrp" | "chown" | "ln" | "mkdir" | "mv" | "rm" | "rmdir" | "sync" => {
+            Some("zsh/files")
+        }
+        "zf_chmod" | "zf_chgrp" | "zf_chown" | "zf_ln" | "zf_mkdir" | "zf_mv" | "zf_rm"
+        | "zf_rmdir" | "zf_sync" => Some("zsh/files"),
+        // zsh/zftp (Src/Modules/zftp.c).
+        "zftp" => Some("zsh/zftp"),
+        // zsh/net/tcp (Src/Modules/tcp.c).
+        "ztcp" => Some("zsh/net/tcp"),
+        // zsh/net/socket (Src/Modules/socket.c).
+        "zsocket" => Some("zsh/net/socket"),
+        // zsh/stat (Src/Modules/stat.c).
+        "stat" | "zstat" => Some("zsh/stat"),
+        // zsh/zselect (Src/Modules/zselect.c).
+        "zselect" => Some("zsh/zselect"),
+        // zsh/zpty (Src/Modules/zpty.c).
+        "zpty" => Some("zsh/zpty"),
+        // zsh/zprof (Src/Modules/zprof.c).
+        "zprof" => Some("zsh/zprof"),
+        // zsh/system (Src/Modules/system.c).
+        "zsystem" | "syserror" | "sysopen" | "sysread" | "sysseek" | "syswrite" => {
+            Some("zsh/system")
+        }
+        // zsh/clone (Src/Modules/clone.c).
+        "clone" => Some("zsh/clone"),
+        // zsh/curses (Src/Modules/curses.c).
+        "zcurses" => Some("zsh/curses"),
+        // zsh/db/gdbm (Src/Modules/db_gdbm.c).
+        "ztie" | "zuntie" | "zgdbmpath" => Some("zsh/db/gdbm"),
+        // zsh/pcre (Src/Modules/pcre.c).
+        "pcre_compile" | "pcre_match" | "pcre_study" => Some("zsh/pcre"),
+        // zsh/example (Src/Modules/example.c).
+        "example" => Some("zsh/example"),
+        // zsh/cap (Src/Modules/cap.c).
+        "cap" | "getcap" | "setcap" => Some("zsh/cap"),
+        // zsh/attr (Src/Modules/attr.c).
+        "zgetattr" | "zsetattr" | "zdelattr" | "zlistattr" => Some("zsh/attr"),
+        // zsh/datetime (Src/Modules/datetime.c).
+        "strftime" => Some("zsh/datetime"),
+        // zsh/param/private — Src/Modules/param_private.c:217.
+        "private" => Some("zsh/param/private"),
+        // zsh/ksh93 — Src/Modules/ksh93.c:41.
+        "nameref" => Some("zsh/ksh93"),
+        // zshrs-only debug / bytecode hooks with no upstream builtin.
+        "hashinfo" | "mem" | "patdebug" | "__rust_compile" => Some("__zshrs_only"),
+        // zsh/main core builtins.
+        _ => None,
+    }
+}
+
+/// Would C's live `builtintab` currently contain `name`?
+///
+/// This is THE predicate for "is this builtin name visible to a
+/// namespace walk right now". Both walkers must agree or the shell
+/// reports one set through `${(k)builtins}` and a different one through
+/// command-position completion:
+///
+///   * `scanbuiltins` — the `builtins` / `dis_builtins` magic assocs
+///     (port of `Src/Modules/parameter.c:816-840`);
+///   * `makecomplistflags` — the compctl namespace dump
+///     (port of `Src/Zle/compctl.c:3654`, which walks `builtintab`).
+///
+/// They had drifted: only the first applied the module gate, so
+/// `rustup <TAB>` — which falls through `_default` to `compcall` — put
+/// 44 names (`strftime`, `zstat`, `zpty`, `zf_chmod`, `pcre_match`, …)
+/// into the match list that `${#builtins}` correctly reported as
+/// absent, and that a real zsh only exposes after the owning
+/// `zmodload`.
+///
+/// The gate is applied under `hide_ext_builtins()` — `--zsh` strict
+/// emulation and the `ZSHRS_HIDE_EXT_BUILTINS` parity knob. Default
+/// zshrs mode keeps the auto-load posture where every statically-linked
+/// module builtin is callable without an explicit `zmodload`, and
+/// dispatch is never affected either way.
+/// Would C's `builtintab` hold `name` right now, given which modules are
+/// loaded? This is the module gate ONLY — it says nothing about `disable`.
+///
+/// C adds a module's builtins to `builtintab` in `addbuiltins()` when the
+/// module loads (Src/module.c:551) and removes them on unload, so a name
+/// owned by an unloaded module simply is not there; names registered for
+/// AUTO-loading (Src/module.c:1265 `add_autobin`, seeded by Src/init.c:1708
+/// `init_bltinmods`) are present as stubs from the start. zshrs links every
+/// module statically into ONE flat table, so the gate has to be applied
+/// explicitly.
+///
+/// Every consumer must ask THIS question, or the shell answers differently
+/// depending on which one you ask. `whence`/`type` used to carry their own
+/// hand-maintained list of gated names, grown one bug report at a time
+/// (docs/BUGS.md #28, #532, #535), which covered zsh/files, zsh/stat,
+/// zsh/zselect, zsh/zpty, zsh/net/tcp, zsh/zftp and zsh/system — and nothing
+/// else. So `whence -w strftime` (zsh/datetime), `pcre_compile` (zsh/pcre),
+/// `clone`, `zcurses`, `ztie`, `cap`, `zgetattr`, `sysopen`, `zsocket`,
+/// `example` and `zprof` all answered `builtin` where zsh answers `none`,
+/// while `${+builtins[...]}` — which asks the generic question below —
+/// answered 0 for the very same names in the very same shell.
+pub fn module_builtin_available(name: &str) -> bool {
+    // c:Src/module.c:521 — `setbuiltins` DELETES the node from `builtintab`
+    // when the feature's enable bit is cleared, so a `zmodload -F MODULE
+    // -b:NAME` makes the name vanish even though the module stays loaded.
+    // zshrs's builtintab is immutable, so that half of the state lives in
+    // `DISABLED_MODULE_BUILTINS` (see its doc comment); consult it before
+    // the per-module load gate below.
+    if crate::ported::module::DISABLED_MODULE_BUILTINS
+        .lock()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    match builtin_owning_module(name) {
+        // A `zsh/main` core builtin (always in the table), or a
+        // zshrs-original entry that belongs to no module at all.
+        None | Some("__zshrs_only") => true,
+        Some(modname) => crate::ported::module::MODULESTAB
+            .lock()
+            .map(|t| {
+                // "Actually loaded" is C's `m->u.handle && !MOD_UNLOAD`
+                // (Src/module.c:1055); the static-link analogue is MOD_INIT_B
+                // set and MOD_UNLOAD clear — the same criterion `getpmmodule`
+                // uses to print `loaded` vs `autoloaded`. NOT `is_loaded()`,
+                // which keys off MOD_LINKED and is pre-seeded for every
+                // compiled-in module, so it answered "loaded" for zsh/datetime
+                // and zsh/pcre and made `whence -w strftime` /
+                // `${+builtins[pcre_compile]}` claim builtins that `zmodload`
+                // had never brought in.
+                let loaded = t.modules.get(modname).is_some_and(|md| {
+                    (md.node.flags & crate::ported::zsh_h::MOD_INIT_B) != 0
+                        && (md.node.flags & crate::ported::zsh_h::MOD_UNLOAD) == 0
+                });
+                // A name registered for AUTO-loading is a stub in builtintab
+                // from the start (Src/module.c:1265 `add_autobin`).
+                loaded || t.resolve_autoload_builtin(name).is_some()
+            })
+            .unwrap_or(false),
+    }
+}
+
+/// `compdef` / `compinit` are contrib FUNCTIONS in zsh, never builtins: until
+/// the user autoloads or defines one, the dispatcher answers 127 (see
+/// BUILTIN_COMPDEF / BUILTIN_COMPINIT in fusevm_bridge.rs), so every name
+/// lookup (`command -v`, `type`, `${builtins}`) must agree. `command -v compdef`
+/// printing `compdef` made spaceship-prompt's `spaceship::exists compdef` guard
+/// pass and then call a `compdef` that was command-not-found.
+pub fn is_undefined_contrib_function(name: &str) -> bool {
+    matches!(name, "compdef" | "compinit")
+        && !crate::ported::hashtable::shfunctab_lock()
+            .read()
+            .ok()
+            .is_some_and(|t| t.get(name).is_some())
+}
+
+pub fn builtin_in_builtintab(name: &str) -> bool {
+    // The gate used to apply ONLY under `hide_ext_builtins()`, on the theory
+    // that default zshrs mode should show every statically-linked module
+    // builtin as available. Dispatch never agreed: `zshrs -fc 'builtin chmod'`
+    // runs /bin/chmod and `whence -w chmod` says `command` with or without
+    // that flag. So in default mode `${(k)builtins}` listed 40 names —
+    // chmod, rm, mv, stat, zpty, zselect, sys*, cap/getcap, z*attr, zf_* —
+    // that `${+builtins[$name]}` reported as unset in the SAME shell, and
+    // that no `builtin NAME` call could reach. Ask the same question every
+    // other consumer asks.
+    //
+    // The one thing this walk adds on top: zshrs-original entries that no
+    // `zmodload` could ever produce in a real zsh (`hashinfo`, `mem`,
+    // `patdebug`, `__rust_compile`) must disappear from the
+    // NAMESPACE under `--zsh` / ZSHRS_HIDE_EXT_BUILTINS, even though they stay
+    // perfectly available (that flag never affects dispatch). The previous
+    // gate got this for free by asking `is_loaded("__zshrs_only")`, which is
+    // false because no such module exists.
+    if hide_ext_builtins() && matches!(builtin_owning_module(name), Some("__zshrs_only")) {
+        return false;
+    }
+    if is_undefined_contrib_function(name) {
+        return false;
+    }
+    module_builtin_available(name)
+}
+
+/// The ported builtin table's distinct names, sorted — what the
+/// reference's Compat Builtin Index lists and `zbanner` totals.
+pub fn compat_builtin_names() -> Vec<String> {
+    let mut names: Vec<String> = crate::ported::builtin::BUILTINS
+        .iter()
+        .map(|b| b.node.nam.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Every zshrs-only builtin — [`EXT_BUILTIN_NAMES`] plus the daemon-backed
+/// `z*` builtins — sorted and deduplicated. What the reference's Extension
+/// Builtin Index lists and `zbanner` totals.
+pub fn extension_builtin_names() -> Vec<String> {
+    let mut names: Vec<String> = EXT_BUILTIN_NAMES
+        .iter()
+        .chain(crate::daemon::builtins::ZSHRS_BUILTIN_NAMES.iter())
+        .map(|s| s.to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub const EXT_BUILTIN_NAMES: &[&str] = &[
+    "ai",
+    "arch",
+    "async",
+    "await",
+    "barrier",
+    "base64",
+    "basename",
+    "caller",
+    "cat",
+    "cdreplay",
+    "cksum",
+    "comm",
+    "compdef",
+    "compgen",
+    "compinit",
+    "complete",
+    "cut",
+    "date",
+    "dbview",
+    "dircolors",
+    "dirname",
+    "doctor",
+    "env",
+    "expand",
+    "expr",
+    "factor",
+    "find",
+    "fold",
+    "groups",
+    "head",
+    "help",
+    "hostname",
+    "id",
+    "intercept",
+    "intercept_proceed",
+    "link",
+    "logname",
+    "mkfifo",
+    "mktemp",
+    "nice",
+    "nl",
+    "nproc",
+    "pany",
+    "par_lines",
+    "par_walk",
+    "paste",
+    "peach",
+    "pfirst",
+    "pgrep",
+    "pmap",
+    "pmap_chunked",
+    "prewarm-autoloads",
+    "printenv",
+    "profile",
+    "provenance",
+    "psort",
+    "puniq",
+    "realpath",
+    "rev",
+    "run_tests",
+    "seq",
+    "sha256sum",
+    "shuf",
+    "sleep",
+    "sort",
+    "sum",
+    "tac",
+    "tail",
+    "tee",
+    "touch",
+    "tput",
+    "tr",
+    "tsort",
+    "tty",
+    "uname",
+    "unexpand",
+    "uniq",
+    "unlink",
+    "users",
+    "wc",
+    "whoami",
+    "yes",
+    "zassert_contains",
+    "zassert_dies",
+    "zassert_eq",
+    "zassert_err",
+    "zassert_false",
+    "zassert_ge",
+    "zassert_gt",
+    "zassert_le",
+    "zassert_lt",
+    "zassert_match",
+    "zassert_ne",
+    "zassert_near",
+    "zassert_ok",
+    "zassert_true",
+    "zbanner",
+    "zbuild",
+    "zsleep",
+    "ztest_run",
+    "ztest_skip",
+    // NOT listed here, deliberately, though both once were:
+    //   * `cp` — the dispatcher runs /usr/bin/cp (`cp --recursive` fails with
+    //     BSD cp's "illegal option", and `whence -w cp` says `command`), so
+    //     `cp_impl` is not what answers; zsh has no `cp` builtin either, and
+    //     zsh/files ships chmod/chown/ln/mkdir/mv/rm/rmdir/sync but no cp.
+    //   * `add_zsh_hook` — not callable at all (`command not found` with and
+    //     without -f); in zsh it is an autoloadable FUNCTION, not a builtin.
+    // Listing them made `${(k)builtins}` advertise two names that no
+    // `builtin NAME` call could reach and that `${+builtins[...]}` reported
+    // as unset.
+];
+
+/// Body of the `compdef` shell-function stub that `compinit` installs so
+/// `${+functions[compdef]}` is true (zinit's "compinit has loaded" probe)
+/// and `compdef` calls resolve to a function rather than command-not-found.
+/// The `BUILTIN_COMPDEF` opcode handler recognises this exact body and
+/// routes to the fast native `builtin_compdef`; a genuine user/compsys
+/// `compdef` function (any other body) still takes precedence. In real zsh
+/// `compdef` is a shell function defined inside `compinit`; zshrs's native
+/// `compinit` implements the scan in Rust and never sourced that function,
+/// which left `compdef` undefined and broke zinit's compdef-replay.
+pub(crate) const NATIVE_COMPDEF_MARKER: &str = ": zshrs-native-compdef-stub";
+
+use crate::parse::Redirect;
+use crate::ported::utils::{errflag, ERRFLAG_ERROR};
+use crate::ported::vm_helper::ShellExecutor;
+use crate::ported::vm_helper::*;
+use crate::ported::zsh_h::PM_UNDEFINED;
+use chrono::{Datelike, TimeZone};
+use rand::seq::SliceRandom;
+use rand::Rng;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
+use std::env;
+use std::ffi::CStr;
+use std::ffi::CString;
+use std::fs::OpenOptions;
+use std::io::Read as IoRead;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::ToSocketAddrs;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Component::*;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+impl ShellExecutor {
+    /// ai - call a language model from the shell
+    ///
+    /// The engine lives in `crate::ai` (`src/extensions/ai.rs`), which
+    /// is deliberately free of any dependency on the parameter table:
+    /// it streams to stdout on its own and returns anything destined
+    /// for a shell variable, because assignment is the one part of the
+    /// job that needs the executor.
+    ///
+    /// That split is what makes `ai -v reply "..."` a zero-fork
+    /// operation — the request and the assignment both happen inside
+    /// this process, where `$(curl ... | jq ...)` would cost two forks,
+    /// two execs and a command substitution.
+    ///
+    /// Exit status: 0 on success, 1 for a call that failed (no API key,
+    /// HTTP error, transport failure, cost ceiling), 2 for bad flags.
+    pub(crate) fn builtin_ai(&mut self, args: &[String]) -> i32 {
+        match crate::ai::run(args) {
+            Ok(crate::ai::Output::Printed) => 0,
+            Ok(crate::ai::Output::Scalar(name, text)) => {
+                self.set_scalar(name, text);
+                0
+            }
+            Ok(crate::ai::Output::Array(name, lines)) => {
+                self.set_array(name, lines);
+                0
+            }
+            Err(e) => {
+                // zsh-format, terse, stderr — no remediation hint.
+                eprintln!("zshrs: ai: {}", e.reason());
+                e.status()
+            }
+        }
+    }
+
+    /// zbanner — the ZSHRS logo, a boxed summary (version, builtin and
+    /// extension totals), and a live line: the daemon socket and whether it
+    /// answers, then this shell's functions, aliases, parameters and jobs.
+    /// `zshrs --banner` prints the same from outside a shell, without the
+    /// shell counts. Ported from ztmux's `banner` verb.
+    ///
+    /// Usage:
+    ///   zbanner
+    pub(crate) fn builtin_zbanner(&self, args: &[String]) -> i32 {
+        if let Some(arg) = args.first() {
+            eprintln!("zshrs: zbanner: bad argument: {arg}");
+            return 2;
+        }
+        crate::banner::print_banner(Some(crate::banner::ShellCounts::read()));
+        0
+    }
+
+    /// prewarm-autoloads — compile every `_*` completer on the given
+    /// directories (default: this shell's `$fpath`) into `autoloads.rkyv`,
+    /// so the first `<TAB>` of a fresh shell is a shard probe, not a parse.
+    /// The same pass as `zshrs --prewarm-autoloads`; the one-line JSON
+    /// summary it prints is the requested output.
+    ///
+    /// The pass runs in a one-shot child of this binary, not in the shell
+    /// executing the command: `parse()` walks process-global lexer state,
+    /// and the pass leaves `errflag` set under `noerrs` for a completer it
+    /// cannot parse, which would abort whatever script called it. The
+    /// directories are resolved HERE and handed over, because `$fpath` is a
+    /// shell array the child does not inherit.
+    ///
+    /// Usage:
+    ///   prewarm-autoloads [DIR ...]
+    pub(crate) fn builtin_prewarm_autoloads(&self, args: &[String]) -> i32 {
+        if let Some(opt) = args.iter().find(|a| a.starts_with('-')) {
+            eprintln!("zshrs: prewarm-autoloads: bad option: {opt}");
+            return 2;
+        }
+        let dirs: Vec<std::path::PathBuf> = if args.is_empty() {
+            crate::autoload_prewarm::default_dirs()
+        } else {
+            args.iter().map(std::path::PathBuf::from).collect()
+        };
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("zshrs: prewarm-autoloads: {e}");
+                return 1;
+            }
+        };
+        let out = std::process::Command::new(exe)
+            .arg("--prewarm-autoloads")
+            .args(&dirs)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .output();
+        match out {
+            Ok(o) => {
+                print!("{}", String::from_utf8_lossy(&o.stdout));
+                o.status.code().unwrap_or(1)
+            }
+            Err(e) => {
+                eprintln!("zshrs: prewarm-autoloads: {e}");
+                1
+            }
+        }
+    }
+
+    /// caller - display call stack (bash)
+    /// caller [N] — bash builtin returning the location of the
+    /// current frame N. With no arg or N=0: 'LINE FUNC' (or just
+    /// 'LINE main' at top level). With N>0: 'LINE FUNC FILE' for
+    /// frame N. Direct port of bash's bin_caller in builtins.def.
+    /// Reads from the existing $funcstack array we now maintain
+    /// (vm_helper:7828-7835).
+    pub(crate) fn builtin_caller(&self, args: &[String]) -> i32 {
+        // bash: `caller [N]` reads the BASH_LINENO / FUNCNAME / BASH_SOURCE frames.
+        if crate::dash_mode::bash_mode() {
+            let frames = |name: &str| crate::dash_mode::bash_special_array(name).unwrap_or_default();
+            let (lines, funcs, files) = (frames("BASH_LINENO"), frames("FUNCNAME"), frames("BASH_SOURCE"));
+            let file_at = |i: usize| files.get(i).cloned().unwrap_or_else(|| "NULL".to_string());
+            return match args.first().map(|a| a.parse::<usize>()) {
+                None => match lines.first() {
+                    Some(line) => {
+                        println!("{line} {}", file_at(1));
+                        0
+                    }
+                    None => 1,
+                },
+                Some(Ok(n)) => match (lines.get(n), funcs.get(n + 1)) {
+                    (Some(line), Some(func)) => {
+                        println!("{line} {func} {}", file_at(n + 1));
+                        0
+                    }
+                    _ => 1,
+                },
+                Some(Err(_)) => 1,
+            };
+        }
+        let depth: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let stack = self.array("funcstack").unwrap_or_default();
+        // funcstack[0] is the current (innermost) frame — caller 0
+        // refers to the immediate caller per bash semantics, which
+        // is funcstack[0] for us. With no args, just LINE FUNC; we
+        // don't track per-frame line numbers yet so emit `0` as
+        // line number until the VM pipes that through.
+        if stack.is_empty() {
+            // bash(1), `caller`: "The return value is 0 unless the shell is
+            // not executing a subroutine call". At the top level bash prints
+            // NOTHING and returns 1; the previous code printed the synthetic
+            // frame `0 main` and returned 0, so the common
+            // `caller || echo "not in a function"` idiom took the wrong
+            // branch and a stack-trace loop never terminated.
+            return 1;
+        }
+        // `$functrace[N]` is "caller:LINE" and `$funcfiletrace[N]` is
+        // "FILE:LINE" for the call site of frame N (modules/parameter).
+        let after_colon = |v: Vec<String>| -> Vec<(String, String)> {
+            v.into_iter()
+                .map(|e| match e.rsplit_once(':') {
+                    Some((a, b)) => (a.to_string(), b.to_string()),
+                    None => (e.clone(), "0".to_string()),
+                })
+                .collect()
+        };
+        let trace = after_colon(self.array("functrace").unwrap_or_default());
+        let filetrace = after_colon(self.array("funcfiletrace").unwrap_or_default());
+        let line_at = |n: usize| trace.get(n).map(|t| t.1.clone()).unwrap_or_else(|| "0".to_string());
+        if depth == 0 {
+            let func = stack.first().cloned().unwrap_or_else(|| "main".to_string());
+            println!("{} {}", line_at(0), func);
+            0
+        } else if depth < stack.len() {
+            let func = stack[depth].clone();
+            let file = filetrace
+                .get(depth)
+                .map(|t| t.0.clone())
+                .unwrap_or_else(|| "main".to_string());
+            println!("{} {} {}", line_at(depth), func, file);
+            0
+        } else {
+            // Bash returns 1 (no frame at that depth) silently.
+            1
+        }
+    }
+
+    /// doctor [--json] - diagnostic report of shell health, caches, and performance.
+    /// `--json` prints the same report `zshrs --doctor --json` does, minus the startup
+    /// benchmark (a running shell has no fresh executor to time).
+    pub(crate) fn builtin_doctor(&self, args: &[String]) -> i32 {
+        if args.iter().any(|a| a == "--json") {
+            let report = crate::doctor_report::gather(None);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+            );
+            return 0;
+        }
+        let green = |s: &str| format!("\x1b[32m{}\x1b[0m", s);
+        let red = |s: &str| format!("\x1b[31m{}\x1b[0m", s);
+        let yellow = |s: &str| format!("\x1b[33m{}\x1b[0m", s);
+        let bold = |s: &str| format!("\x1b[1m{}\x1b[0m", s);
+        let dim = |s: &str| format!("\x1b[2m{}\x1b[0m", s);
+        let format_bytes = |n: u64| -> String {
+            const KIB: u64 = 1024;
+            const MIB: u64 = 1024 * KIB;
+            const GIB: u64 = 1024 * MIB;
+            if n >= GIB {
+                format!("{:.2} GiB", n as f64 / GIB as f64)
+            } else if n >= MIB {
+                format!("{:.2} MiB", n as f64 / MIB as f64)
+            } else if n >= KIB {
+                format!("{:.1} KiB", n as f64 / KIB as f64)
+            } else {
+                format!("{} B", n)
+            }
+        };
+
+        println!("{}", bold("zshrs doctor"));
+        println!("{}", dim(&"=".repeat(60)));
+        println!();
+
+        // --- Environment ---
+        println!("{}", bold("Environment"));
+        println!("  version:    zshrs {}", env!("CARGO_PKG_VERSION"));
+        println!("  pid:        {}", std::process::id());
+        let cwd = env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        println!("  cwd:        {}", cwd);
+        println!(
+            "  shell:      {}",
+            env::var("SHELL").unwrap_or_else(|_| "?".to_string())
+        );
+        println!("  pool size:  {}", self.worker_pool.size());
+        println!(
+            "  pool done:  {} tasks completed",
+            self.worker_pool.completed()
+        );
+        println!("  pool queue: {} pending", self.worker_pool.queue_depth());
+        println!();
+
+        // --- Config ---
+        println!("{}", bold("Config"));
+        let config_path = crate::config::config_path();
+        if config_path.exists() {
+            println!("  {}  {}", green("*"), config_path.display());
+        } else {
+            println!(
+                "  {}  {} {}",
+                dim("-"),
+                config_path.display(),
+                dim("(using defaults)")
+            );
+        }
+        println!();
+
+        // --- PATH ---
+        println!("{}", bold("PATH"));
+        let path_var = env::var("PATH").unwrap_or_default();
+        let path_dirs: Vec<&str> = path_var.split(':').filter(|s| !s.is_empty()).collect();
+        let path_ok = path_dirs
+            .iter()
+            .filter(|d| std::path::Path::new(d).is_dir())
+            .count();
+        let path_missing = path_dirs.len() - path_ok;
+        println!(
+            "  directories: {} total, {} {}, {} {}",
+            path_dirs.len(),
+            path_ok,
+            green("valid"),
+            path_missing,
+            if path_missing > 0 {
+                red("missing")
+            } else {
+                green("missing")
+            },
+        );
+        println!(
+            "  hash table:  {} entries",
+            crate::ported::hashtable::cmdnamtab_lock()
+                .read()
+                .map(|t| t.len())
+                .unwrap_or(0)
+        );
+        println!();
+
+        // --- FPATH ---
+        println!("{}", bold("FPATH"));
+        println!("  directories: {}", self.fpath.len());
+        let fpath_ok = self.fpath.iter().filter(|d| d.is_dir()).count();
+        let fpath_missing = self.fpath.len() - fpath_ok;
+        if fpath_missing > 0 {
+            println!("  {} {} missing fpath directories", red("!"), fpath_missing);
+        }
+        println!();
+
+        // --- Caches (rkyv-mmapped) ---
+        // Per docs/DESIGN_GOALS.md:13 and docs/DAEMON.md:226, the only
+        // shell cache layer is rkyv-mmapped bytecode under
+        // `~/.zshrs/images/` with the top-level `~/.zshrs/index.rkyv`
+        // (fq_name → shard_id, generation, byte_offset). Hot lookups
+        // never hit SQLite — clients mmap rkyv exclusively.
+        println!("{}", bold("Caches (rkyv-mmapped)"));
+        let zshrs_dir = dirs::home_dir()
+            .map(|h| h.join(".zshrs"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/.zshrs"));
+        let index_rkyv = zshrs_dir.join("index.rkyv");
+        if index_rkyv.exists() {
+            let size = std::fs::metadata(&index_rkyv).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "  index:       {} {}  {}",
+                index_rkyv.display(),
+                format_bytes(size),
+                green("OK")
+            );
+        } else {
+            println!(
+                "  index:       {} {}",
+                index_rkyv.display(),
+                yellow("(absent — daemon not built shards yet)")
+            );
+        }
+        let images_dir = zshrs_dir.join("images");
+        if images_dir.is_dir() {
+            let mut shards: Vec<(String, u64)> = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&images_dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("rkyv") {
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let name = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        shards.push((name, size));
+                    }
+                }
+            }
+            shards.sort();
+            let total: u64 = shards.iter().map(|(_, s)| *s).sum();
+            println!(
+                "  images/:     {} shards, {} total",
+                shards.len(),
+                format_bytes(total)
+            );
+            for (name, size) in &shards {
+                println!("               {} {}", format_bytes(*size), name);
+            }
+        } else {
+            println!(
+                "  images/:     {} {}",
+                images_dir.display(),
+                yellow("(absent)")
+            );
+        }
+
+        // Recording staleness — startup replays the recorder shard and
+        // ignores rc files, so an edited `.zshrc` is invisible until
+        // `zshrs-recorder` re-runs. Same oracle as the `--doctor` flag +
+        // startup log: newest rc mtime vs newest `*-recorder.rkyv` mtime.
+        if !crate::daemon_presence::recording_present() {
+            println!("  recording:   {}", dim("none (rc files sourced normally)"));
+        } else {
+            match crate::daemon_presence::recording_staleness() {
+                Some(rc) => println!(
+                    "  recording:   {} ({} is newer — run `zshrs-recorder`)",
+                    yellow("STALE"),
+                    rc,
+                ),
+                None => println!("  recording:   {}", green("up to date")),
+            }
+        }
+
+        // Legacy single-file shards still in active shell-side use until
+        // they migrate under images/ in the daemon hydration path.
+        if let Some((count, bytes)) = crate::script_cache::stats() {
+            let path = crate::script_cache::default_cache_path();
+            println!(
+                "  scripts:     {} entries, {}  {}",
+                count,
+                format_bytes(bytes as u64),
+                dim(&format!("{}", path.display()))
+            );
+        }
+        let autoload_count = crate::autoload_cache::entry_count();
+        if autoload_count > 0 {
+            let path = crate::autoload_cache::default_cache_path();
+            println!(
+                "  autoloads:   {} functions  {}",
+                autoload_count,
+                dim(&format!("{}", path.display()))
+            );
+        }
+
+        // Bytecode coverage diagnostic: how many compsys-autoloaded
+        // functions have a parsed body in the SQLite inspection mirror
+        // but no compiled bytecode blob in the rkyv shard yet. A
+        // healthy daemon-hydrated cache reports 0 missing.
+        if let Some(cache) = self.compsys_cache() {
+            if let Ok(total_bodies) = cache.count_autoloads_with_body() {
+                let missing = total_bodies.saturating_sub(autoload_count);
+                if missing == 0 {
+                    println!(
+                        "  coverage:    {}",
+                        green("all autoload bodies have bytecode")
+                    );
+                } else {
+                    println!(
+                        "  coverage:    {} {}",
+                        missing,
+                        yellow("autoload bodies missing bytecode")
+                    );
+                }
+            }
+        }
+        println!();
+
+        // --- Recorded state (authoritative) ---
+        // The recorder shard is what startup replays, so ITS counts are the
+        // shell's real state. The SQLite files below are daemon-maintained
+        // copies; with no daemon running they stay empty or stale.
+        let recorded = recorded_state_counts();
+        if let Some((shard_name, counts)) = &recorded {
+            println!("{}", bold("Recorded state (authoritative)"));
+            println!("  {}", dim(shard_name));
+            for (label, n) in counts {
+                println!("  {:<17}{}", format!("{}:", label), n);
+            }
+            println!();
+        }
+        // --- SQLite (read-only mirrors) ---
+        // Same directory, different job: daemon-maintained copies you
+        // can query with SQL or `dbview`. They are NOT the bytecode
+        // cache and are NOT read when deciding cache hit/miss or when
+        // running compiled code. The numbers below are inspection-only.
+        println!("{}", bold("SQLite (read-only mirrors)"));
+        println!(
+            "  {}",
+            dim("daemon-maintained; not read on cache lookup / hot path")
+        );
+        if let Some(cache) = self.compsys_cache() {
+            let count = crate::compsys::cache_entry_count(cache);
+            println!(
+                "  compsys:     {} completions  {}",
+                count,
+                dim("mirror")
+            );
+        } else {
+            println!("  compsys:     {}", yellow("no mirror"));
+        }
+        #[cfg(feature = "daemon")]
+        let mirrored_plugins = crate::daemon::paths::CachePaths::resolve()
+            .ok()
+            .and_then(|p| crate::daemon::catalog::mirrored_plugin_count(&p.catalog_db));
+        #[cfg(not(feature = "daemon"))]
+        let mirrored_plugins: Option<i64> = None;
+        match mirrored_plugins {
+            Some(n) => println!("  plugins:     {} plugins  {}", n, dim("mirror")),
+            None => println!("  plugins:     {}", yellow("no mirror")),
+        }
+        match crate::script_cache::CACHE
+            .as_ref()
+            .and_then(|c| c.mirror_rows(""))
+        {
+            Some(rows) => println!("  scripts:     {} scripts  {}", rows.len(), dim("mirror (scripts.db)")),
+            None => println!("  scripts:     {}", yellow("no mirror")),
+        }
+        println!();
+
+        // --- History ---
+        // History is not a cache; it's a durable command record. Kept
+        // here because the doctor previously buried it under the
+        // (mis-labeled) "SQLite Caches" header.
+        println!("{}", bold("History"));
+        if let Some(engine) = self.history() {
+            let count = engine.count().unwrap_or(0);
+            println!("  entries:     {}  {}", count, green("OK"));
+        } else {
+            println!("  entries:     {}", yellow("not initialized"));
+        }
+        println!();
+
+        // --- Shell State ---
+        println!("{}", bold("Shell State"));
+        // shfunctab is what `${#functions}` counts; PM_UNDEFINED marks an
+        // autoload stub whose body has not been loaded yet.
+        let (defined, autoload) = crate::ported::hashtable::shfunctab_lock()
+            .read()
+            .map(|t| {
+                t.iter().fold((0, 0), |(d, a), (_, shf)| {
+                    if (shf.node.flags as u32 & PM_UNDEFINED) != 0 {
+                        (d, a + 1)
+                    } else {
+                        (d + 1, a)
+                    }
+                })
+            })
+            .unwrap_or((0, 0));
+        println!("  functions:   {} defined, {} autoload", defined, autoload);
+        println!("  aliases:     {}", self.alias_entries().len());
+        println!(
+            "  global:      {} aliases",
+            self.global_alias_entries().len()
+        );
+        println!(
+            "  suffix:      {} aliases",
+            self.suffix_alias_entries().len()
+        );
+        println!(
+            "  variables:   {}",
+            crate::ported::params::paramtab()
+                .read()
+                .map(|t| t.iter().filter(|(_, p)| p.u_arr.is_none()).count())
+                .unwrap_or(0)
+        );
+        println!(
+            "  arrays:      {}",
+            crate::ported::params::paramtab()
+                .read()
+                .map(|t| t.iter().filter(|(_, p)| p.u_arr.is_some()).count())
+                .unwrap_or(0)
+        );
+        println!(
+            "  assoc:       {}",
+            crate::ported::params::paramtab_hashed_storage()
+                .lock()
+                .map(|m| m.len())
+                .unwrap_or(0)
+        );
+        println!(
+            "  options:     {} set",
+            crate::ported::options::opt_state_snapshot()
+                .iter()
+                .filter(|(_, v)| **v)
+                .count()
+        );
+        println!(
+            "  traps:       {} active",
+            crate::ported::builtin::traps_table()
+                .lock()
+                .map(|t| t.len())
+                .unwrap_or(0)
+        );
+        // Count entries across all `<hook>_functions` arrays in paramtab.
+        let hook_count: usize = [
+            "chpwd",
+            "precmd",
+            "preexec",
+            "periodic",
+            "zshexit",
+            "zshaddhistory",
+        ]
+        .iter()
+        .map(|h| {
+            self.array(&format!("{}_functions", h))
+                .map_or(0, |a| a.len())
+        })
+        .sum();
+        println!("  hooks:       {} registered", hook_count);
+        println!();
+
+        // --- Log ---
+        println!("{}", bold("Log"));
+        let log_path = crate::log::log_path();
+        if log_path.exists() {
+            let size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+            println!("  {}  {} bytes", log_path.display(), size);
+        } else {
+            println!("  {}", dim("no log file yet"));
+        }
+        println!();
+
+        // --- Profiling ---
+        println!("{}", bold("Profiling"));
+        println!(
+            "  chrome tracing: {}",
+            if crate::log::profiling_enabled() {
+                green("enabled")
+            } else {
+                dim("disabled")
+            }
+        );
+        println!(
+            "  flamegraph:     {}",
+            if crate::log::flamegraph_enabled() {
+                green("enabled")
+            } else {
+                dim("disabled")
+            }
+        );
+        println!(
+            "  prometheus:     {}",
+            if crate::log::prometheus_enabled() {
+                green("enabled")
+            } else {
+                dim("disabled")
+            }
+        );
+        println!();
+
+        0
+    }
+
+    /// provenance — value lineage over bytecode execution.
+    ///
+    /// Usage:
+    ///   provenance                  — list every tracked parameter and function
+    ///   provenance NAME             — print NAME's lineage
+    ///   provenance -m NAME...       — start tracking NAME
+    ///   provenance -u NAME...       — stop tracking NAME, drop its lineage
+    ///   provenance -j NAME          — print NAME's lineage as JSON
+    ///   provenance -f ...           — act on shell functions instead of parameters
+    ///   provenance -a               — track everything from here on
+    ///   provenance -ua              — stop tracking everything (keeps what is recorded)
+    ///   provenance -c               — clear every lineage and disarm
+    ///
+    /// Flags bundle: `-mf NAME` arms a function, `-jf NAME` prints one
+    /// as JSON.
+    ///
+    /// The engine records nothing until the first `-m` or `-a` (or
+    /// `[provenance] track_all` at startup), and refuses to arm at all
+    /// when `[provenance] enabled = false` in `~/.zshrs/zshrs.toml` or
+    /// `ZSHRS_PROVENANCE=0` is set.
+    pub(crate) fn builtin_provenance(&self, args: &[String]) -> i32 {
+        use crate::provenance;
+
+        // ── flags, then names ───────────────────────────────────────
+        let (mut arm, mut disarm, mut json, mut list, mut clear) =
+            (false, false, false, false, false);
+        let (mut funcs, mut all) = (false, false);
+        let mut names: Vec<&String> = Vec::new();
+        let mut rest = args.iter();
+        for a in rest.by_ref() {
+            if a == "--" {
+                break;
+            }
+            if a.len() > 1 && a.starts_with('-') {
+                for c in a.chars().skip(1) {
+                    match c {
+                        'm' => arm = true,
+                        'u' => disarm = true,
+                        'j' => json = true,
+                        'l' => list = true,
+                        'c' => clear = true,
+                        'f' => funcs = true,
+                        'a' => all = true,
+                        _ => {
+                            eprintln!("zshrs: provenance: bad option: -{}", c);
+                            return 1;
+                        }
+                    }
+                }
+                continue;
+            }
+            names.push(a);
+            break;
+        }
+        names.extend(rest);
+
+        // ── the two namespaces, behind one set of verbs ─────────────
+        // `-f` picks the function namespace explicitly. WITHOUT it a bare
+        // name reads whichever namespace holds it, mirroring the way `-m NAME`
+        // arms whichever the name actually is: arming a function with a bare
+        // `provenance -m ff` and then reading it back with a bare
+        // `provenance ff` has to work, or the two halves of the same spelling
+        // disagree. A parameter still wins when both are tracked.
+        let tracked_as_func = |name: &str| !funcs && provenance::lookup_name(name).is_none();
+        let lookup = |name: &str| {
+            if funcs {
+                provenance::lookup_func(name)
+            } else {
+                provenance::lookup_name(name).or_else(|| provenance::lookup_func(name))
+            }
+        };
+        let label = |name: &str| {
+            if funcs || tracked_as_func(name) {
+                format!("{}()", name)
+            } else {
+                name.to_string()
+            }
+        };
+        let print_all = || {
+            for name in provenance::tracked_names() {
+                match provenance::lookup_name(&name) {
+                    Some(node) => print!("{}", provenance::render(&name, &node)),
+                    None => println!("{}", name),
+                }
+            }
+            for name in provenance::tracked_func_names() {
+                match provenance::lookup_func(&name) {
+                    Some(node) => print!("{}", provenance::render(&format!("{}()", name), &node)),
+                    None => println!("{}()", name),
+                }
+            }
+            let dropped = provenance::auto_dropped();
+            if dropped > 0 {
+                println!(
+                    "… {} more names not tracked (cap {})",
+                    dropped,
+                    provenance::MAX_AUTO_NAMES
+                );
+            }
+            0
+        };
+
+        if clear {
+            provenance::clear();
+            return 0;
+        }
+
+        // `-a` arms everything; `-ua` stops arming new names.
+        if all {
+            if disarm {
+                provenance::set_track_all(false);
+                return 0;
+            }
+            if !provenance::set_track_all(true) {
+                eprintln!("zshrs: provenance: disabled by config");
+                return 1;
+            }
+            return 0;
+        }
+
+        if arm {
+            if !provenance::enabled() {
+                eprintln!("zshrs: provenance: disabled by config");
+                return 1;
+            }
+            if names.is_empty() {
+                eprintln!(
+                    "zshrs: provenance: -m: missing {} name",
+                    if funcs { "function" } else { "parameter" }
+                );
+                return 1;
+            }
+            for name in names {
+                if funcs {
+                    let (file, line, body) = Self::shfunc_def_site(name);
+                    provenance::track_func(name, body.as_deref(), file.as_deref(), line);
+                } else {
+                    let current = crate::ported::params::getsparam(name);
+                    // Follow the name to whatever it actually IS. Without this,
+                    // `provenance -m ff` on a shell function armed a PARAMETER
+                    // named `ff` — an entry that can never record, because
+                    // nothing writes a parameter by that name. It then listed as
+                    // a bare `ff` with no origin and no ops no matter how many
+                    // times the function was defined or called, which reads as
+                    // "provenance is broken" rather than "you wanted -f".
+                    // An explicit `-f` still forces the function reading, and a
+                    // real parameter still wins when both exist.
+                    if current.is_none() && crate::ported::utils::getshfunc(name).is_some() {
+                        let (file, line, body) = Self::shfunc_def_site(name);
+                        provenance::track_func(name, body.as_deref(), file.as_deref(), line);
+                    } else {
+                        provenance::track_name(name, current.as_deref());
+                    }
+                }
+            }
+            return 0;
+        }
+
+        if disarm {
+            if names.is_empty() {
+                eprintln!(
+                    "zshrs: provenance: -u: missing {} name",
+                    if funcs { "function" } else { "parameter" }
+                );
+                return 1;
+            }
+            let mut status = 0;
+            for name in names {
+                let dropped = if funcs {
+                    provenance::untrack_func(name)
+                } else {
+                    // Mirror the `-m` rule above: a bare `-u NAME` drops
+                    // whichever of the two `-m NAME` would have armed.
+                    provenance::untrack_name(name) || provenance::untrack_func(name)
+                };
+                if !dropped {
+                    eprintln!("zshrs: provenance: not tracked: {}", label(name));
+                    status = 1;
+                }
+            }
+            return status;
+        }
+
+        if json {
+            let Some(name) = names.first() else {
+                eprintln!(
+                    "zshrs: provenance: -j: missing {} name",
+                    if funcs { "function" } else { "parameter" }
+                );
+                return 1;
+            };
+            return match lookup(name) {
+                Some(node) => {
+                    println!("{}", provenance::render_json(&label(name), &node));
+                    0
+                }
+                None => {
+                    eprintln!("zshrs: provenance: not tracked: {}", label(name));
+                    1
+                }
+            };
+        }
+
+        if list || names.is_empty() {
+            return print_all();
+        }
+
+        let mut status = 0;
+        for name in names {
+            match lookup(name) {
+                Some(node) => print!("{}", provenance::render(&label(name), &node)),
+                None => {
+                    eprintln!("zshrs: provenance: not tracked: {}", label(name));
+                    status = 1;
+                }
+            }
+        }
+        status
+    }
+
+    /// Defining file and line of shell function `name`, as `shfunctab`
+    /// recorded them at definition time (`Src/exec.c:5383-5388`).
+    /// `(None, 0)` when the function does not exist.
+    /// Definition site AND current body of a shell function. The body is
+    /// what `provenance -m` seeds the chain's origin with — arming an
+    /// already-defined function never reaches `on_func_define`, so
+    /// without it the origin can never show what the body was.
+    fn shfunc_def_site(name: &str) -> (Option<String>, i64, Option<String>) {
+        crate::ported::hashtable::shfunctab_lock()
+            .read()
+            .ok()
+            .and_then(|t| {
+                t.get_including_disabled(name)
+                    .map(|f| (f.filename.clone(), f.lineno, f.body.clone()))
+            })
+            .unwrap_or((None, 0, None))
+    }
+
+    /// dbview — browse zshrs SQLite cache tables without SQL.
+    ///
+    /// Usage:
+    ///   dbview                      — list all tables and row counts
+    ///   dbview autoloads             — dump the compsys.db autoloads mirror (name, source, body len)
+    ///   dbview autoloads _git        — show single row by name
+    ///   dbview comps [pattern]       — the live `_comps` table (command → completer)
+    ///   dbview history               — recent history entries
+    ///   dbview history <pattern>     — search history
+    ///   dbview plugins               — plugin cache entries (plugins.db)
+    ///   dbview scripts [pattern]     — compiled sourced scripts (scripts.rkyv): cached-at, KB, version, path
+    ///   dbview executables            — PATH executables (daemon catalog `command` rows)
+    ///   dbview <table> --count       — just the count
+    pub(crate) fn builtin_dbview(&self, args: &[String]) -> i32 {
+        let bold = |s: &str| format!("\x1b[1m{}\x1b[0m", s);
+        let dim = |s: &str| format!("\x1b[2m{}\x1b[0m", s);
+        let cyan = |s: &str| format!("\x1b[36m{}\x1b[0m", s);
+        let green = |s: &str| format!("\x1b[32m{}\x1b[0m", s);
+        let yellow = |s: &str| format!("\x1b[33m{}\x1b[0m", s);
+
+        if args.is_empty() {
+            // List all tables with row counts
+            println!("{}", bold("zshrs caches"));
+            println!();
+
+            // Bytecode lives in the rkyv shards; the SQLite files are a
+            // read-only mirror (and, for history/catalog, the daemon's own
+            // stores). Each line names the store it was read from.
+            if let Some((n, bytes)) = crate::autoload_cache::stats() {
+                println!("  {} {}", bold("autoloads.rkyv"), dim("(compiled autoload bytecode)"));
+                println!("    compiled:     {:>6} entries  ({} bytes)", n, bytes);
+                println!();
+            }
+
+            if let Some((n, bytes)) = crate::script_cache::stats() {
+                println!("  {} {}", bold("scripts.rkyv"), dim("(compiled sourced scripts)"));
+                println!("    scripts:      {:>6} entries  ({} bytes)", n, bytes);
+                println!();
+            }
+
+            if let Some(cache) = self.compsys_cache() {
+                println!("  {} {}", bold("compsys.db"), dim("(completion mirror)"));
+                for table in ["autoloads", "comps", "services", "patcomps"] {
+                    if let Ok(n) = cache.count_table(table) {
+                        println!("    {:<13} {:>6} rows", format!("{table}:"), n);
+                    }
+                }
+                println!();
+                let live = self.assoc("_comps").map(|m| m.len()).unwrap_or(0);
+                println!("  {} {}", bold("_comps"), dim("(live; what `dbview comps` lists)"));
+                println!("    entries:      {:>6}", live);
+                println!();
+            }
+
+            let zstyles = crate::ported::modules::zutil::zstyletab
+                .lock()
+                .map(|t| t.list(None).len())
+                .unwrap_or(0);
+            println!("  {} {}", bold("zstyles"), dim("(live zstyle table)"));
+            println!("    styles:       {:>6} entries", zstyles);
+            println!();
+
+            // plugins.db tracks the plugin SOURCE FILES (path + mtime). Nothing
+            // fills its per-plugin function table any more — what a plugin
+            // defined is recorded in the recorder shard, listed next.
+            if let Some(cache) = self.plugin_cache.get_or_init(crate::vm_helper::open_plugin_cache).as_ref() {
+                let (plugins, functions) = cache.stats();
+                println!("  {} {}", bold("plugins.db"), dim("(plugin source files tracked)"));
+                println!("    plugins:      {:>6} rows", plugins);
+                if functions > 0 {
+                    println!("    functions:    {:>6} rows", functions);
+                }
+                println!();
+            }
+
+            if let Some((shard, counts)) = recorded_state_counts() {
+                println!("  {} {}", bold("recorded state"), dim(&format!("({shard}; what the recorder saw)")));
+                for (label, n) in counts {
+                    println!("    {:<14}{:>6}", format!("{label}:"), n);
+                }
+                println!();
+            }
+
+            if let Ok(paths) = crate::daemon::paths::CachePaths::resolve() {
+                let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(&paths.catalog_db, read_only) {
+                    println!("  {} {}", bold("catalog.db"), dim("(daemon catalog)"));
+                    if let Ok(mut stmt) = conn
+                        .prepare("SELECT kind, COUNT(*) FROM entries GROUP BY kind ORDER BY 2 DESC")
+                    {
+                        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)));
+                        if let Ok(rows) = rows {
+                            for (kind, n) in rows.flatten() {
+                                println!("    {:<13} {:>6} rows", format!("{kind}:"), n);
+                            }
+                        }
+                    }
+                    println!();
+                }
+            }
+
+            println!("  {}", bold("history"));
+            if let Some(engine) = self.history() {
+                if let Ok(n) = engine.count() {
+                    println!("    session:      {:>6} rows  {}", n, dim("(zshrs_history.db)"));
+                }
+            }
+            if let Ok(paths) = crate::daemon::paths::CachePaths::resolve() {
+                let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+                if let Ok(conn) = rusqlite::Connection::open_with_flags(&paths.history_db, read_only) {
+                    if let Ok(n) = conn.query_row("SELECT COUNT(*) FROM history", [], |r| r.get::<_, i64>(0)) {
+                        println!("    daemon:       {:>6} rows  {}", n, dim("(history.db)"));
+                    }
+                }
+            }
+            println!();
+
+            println!("  Usage: {} <table> [name] [--count]", cyan("dbview"));
+            return 0;
+        }
+
+        let table = args[0].as_str();
+        let filter = args.get(1).map(|s| s.as_str());
+        let count_only = args.iter().any(|a| a == "--count" || a == "-c");
+
+        match table {
+            "autoloads" => {
+                let Some(cache) = self.compsys_cache() else {
+                    eprintln!("zshrs:dbview:1: no compsys cache");
+                    return 1;
+                };
+
+                if count_only {
+                    let n = cache.count_table("autoloads").unwrap_or(0);
+                    println!("{}", n);
+                    return 0;
+                }
+
+                if let Some(name) = filter {
+                    // Single row lookup
+                    match cache.get_autoload(name) {
+                        Ok(Some(stub)) => {
+                            println!("{}", bold(&format!("autoload: {}", name)));
+                            println!("  source:   {}", stub.source);
+                            println!(
+                                "  body:     {} bytes",
+                                stub.body.as_ref().map(|b| b.len()).unwrap_or(0)
+                            );
+                            match crate::autoload_cache::try_load(name) {
+                                Some(blob) => {
+                                    println!("  bytecode: {} {} bytes", green("YES"), blob.len())
+                                }
+                                None => println!("  bytecode: {}", yellow("NULL")),
+                            }
+                            // Show first few lines of body
+                            if let Some(ref body) = stub.body {
+                                println!("  preview:");
+                                for (i, line) in body.lines().take(10).enumerate() {
+                                    println!("    {:>3}: {}", i + 1, dim(line));
+                                }
+                                let total = body.lines().count();
+                                if total > 10 {
+                                    println!("    {} ({} more lines)", dim("..."), total - 10);
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!("zshrs:dbview:1: autoload '{}' not found", name);
+                            return 1;
+                        }
+                    }
+                    return 0;
+                }
+
+                // Dump all autoloads. Bytecode is not a column: it is the
+                // autoloads.rkyv shard, so "compiled" is a membership test.
+                let compiled = crate::autoload_cache::cached_names();
+                let conn = &cache.conn();
+                let mut stmt = match conn.prepare(
+                    "SELECT name, source, length(body) FROM autoloads ORDER BY name LIMIT 200",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("zshrs:dbview:1: query failed: {}", e);
+                        return 1;
+                    }
+                };
+                let rows: Vec<(String, String, Option<i64>)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .map(|it| it.flatten().collect())
+                    .unwrap_or_default();
+                println!(
+                    "{:<40} {:>8} {:>8}  {}",
+                    bold("NAME"),
+                    bold("BODY"),
+                    bold("COMPILED"),
+                    bold("SOURCE")
+                );
+                for (name, source, body_len) in &rows {
+                    let body_str = match body_len {
+                        Some(n) => format!("{:>8}", n),
+                        None => dim(&format!("{:>8}", "NULL")),
+                    };
+                    let compiled_str = if compiled.contains(name) {
+                        green(&format!("{:>8}", "yes"))
+                    } else {
+                        yellow(&format!("{:>8}", "no"))
+                    };
+                    // Truncate source path for display
+                    let src_short = if source.len() > 50 {
+                        format!("...{}", &source[source.len() - 47..])
+                    } else {
+                        source.clone()
+                    };
+                    println!("{:<40} {} {}  {}", name, body_str, compiled_str, dim(&src_short));
+                }
+                println!("\n{} rows shown (LIMIT 200)", rows.len());
+            }
+
+            "comps" => {
+                // The shell's own `_comps` (command -> completer, as `compdef`
+                // and `compinit` leave it) is the table completion reads. The
+                // compsys.db mirror is a copy a daemon fills in later and is
+                // usually a fraction of it, so list the live table; the mirror
+                // only answers when no `compinit` has run in this shell.
+                let live = self.assoc("_comps").unwrap_or_default();
+                let mut rows: Vec<(String, String)> = if live.is_empty() {
+                    let Some(cache) = self.compsys_cache() else {
+                        eprintln!("zshrs:dbview:1: no compsys cache");
+                        return 1;
+                    };
+                    let Ok(mut stmt) = cache
+                        .conn()
+                        .prepare("SELECT command, function FROM comps")
+                    else {
+                        eprintln!("zshrs:dbview:1: comps table unreadable");
+                        return 1;
+                    };
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                        .map(|it| it.flatten().collect())
+                        .unwrap_or_default()
+                } else {
+                    live.into_iter().collect()
+                };
+                // `filter` is the raw second word, so `comps --count` would
+                // otherwise filter on the text "--count".
+                if let Some(pat) = filter.filter(|f| !f.starts_with('-')) {
+                    rows.retain(|(cmd, _)| cmd.contains(pat));
+                }
+                if count_only {
+                    println!("{}", rows.len());
+                    return 0;
+                }
+                rows.sort();
+                println!("{:<40} {}", bold("COMMAND"), bold("FUNCTION"));
+                for (cmd, func) in &rows {
+                    println!("{:<40} {}", cmd, cyan(func));
+                }
+                println!("\n{} rows", rows.len());
+            }
+
+            "executables" => {
+                // PATH executables are the daemon catalog's `command` rows;
+                // compsys.db's `executables` table has no writer.
+                let Ok(paths) = crate::daemon::paths::CachePaths::resolve() else {
+                    eprintln!("zshrs:dbview:1: cannot resolve state root");
+                    return 1;
+                };
+                let read_only = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+                let conn = match rusqlite::Connection::open_with_flags(&paths.catalog_db, read_only) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("zshrs:dbview:1: {}: {}", paths.catalog_db.display(), e);
+                        return 1;
+                    }
+                };
+                if count_only {
+                    let n: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM entries WHERE kind = 'command'", [], |r| r.get(0))
+                        .unwrap_or(0);
+                    println!("{}", n);
+                    return 0;
+                }
+                let like = format!("%{}%", filter.unwrap_or(""));
+                let mut stmt = match conn.prepare(
+                    "SELECT fq_name, COALESCE(source_loc, '') FROM entries \
+                     WHERE kind = 'command' AND fq_name LIKE ?1 ORDER BY fq_name LIMIT 100",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("zshrs:dbview:1: {}", e);
+                        return 1;
+                    }
+                };
+                println!("{:<30} {}", bold("NAME"), bold("SOURCE"));
+                let rows: Vec<(String, String)> = stmt
+                    .query_map([&like], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map(|it| it.flatten().collect())
+                    .unwrap_or_default();
+                for (name, src) in rows {
+                    println!("{:<30} {}", name, dim(&src));
+                }
+            }
+
+            "history" => {
+                let Some(engine) = self.history() else {
+                    eprintln!("zshrs:dbview:1: no history engine");
+                    return 1;
+                };
+                if count_only {
+                    println!("{}", engine.count().unwrap_or(0));
+                    return 0;
+                }
+                if let Some(pat) = filter {
+                    if let Ok(entries) = engine.search(pat, 20) {
+                        for e in entries {
+                            println!(
+                                "  {} {} {}",
+                                dim(&e.timestamp.to_string()),
+                                cyan(&e.command),
+                                dim(&format!("[{}]", e.exit_code.unwrap_or(0)))
+                            );
+                        }
+                    }
+                } else if let Ok(entries) = engine.recent(20) {
+                    for e in entries {
+                        println!(
+                            "  {} {} {}",
+                            dim(&e.timestamp.to_string()),
+                            cyan(&e.command),
+                            dim(&format!("[{}]", e.exit_code.unwrap_or(0)))
+                        );
+                    }
+                }
+            }
+
+            "scripts" => {
+                // Sourced files are buffered until the next prompt or exit; show them.
+                crate::script_cache::try_flush_pending();
+                let Some(cache) = crate::script_cache::CACHE.as_ref() else {
+                    eprintln!("zshrs:dbview:1: no script cache");
+                    return 1;
+                };
+                let pat = filter.unwrap_or("");
+                // Read through scripts.db, the SQLite mirror beside the shard (the
+                // other tables are read the same way); refreshed from the shard
+                // when the shard changed. The shard itself is only the fallback
+                // for a mirror that cannot be opened.
+                let rows = cache.mirror_rows(pat).unwrap_or_else(|| {
+                    cache
+                        .list_scripts()
+                        .into_iter()
+                        .filter(|(path, ..)| path.contains(pat))
+                        .collect()
+                });
+                if count_only {
+                    println!("{}", rows.len());
+                    return 0;
+                }
+                println!("{}", bold(&format!("{:<19} {:>9} {:<10} {}", "CACHED", "KB", "VERSION", "PATH")));
+                for (path, kb, version, cached_at) in rows.iter().take(200) {
+                    println!("{:<19} {:>9.1} {:<10} {}", cached_at, kb, version, cyan(path));
+                }
+                println!("\n{} of {} rows shown (LIMIT 200)", rows.len().min(200), rows.len());
+            }
+
+            "plugins" => {
+                let Some(cache) = self.plugin_cache.get_or_init(crate::vm_helper::open_plugin_cache).as_ref() else {
+                    eprintln!("zshrs:dbview:1: no plugin cache");
+                    return 1;
+                };
+                let (plugins, functions) = cache.stats();
+                let recorded = recorded_state_counts()
+                    .and_then(|(_, c)| c.into_iter().find(|(l, _)| *l == "functions").map(|(_, n)| n));
+                match recorded {
+                    Some(n) => println!("{plugins} plugins tracked, {n} functions recorded"),
+                    None => println!("{plugins} plugins tracked, {functions} cached functions"),
+                }
+            }
+
+            _ => {
+                eprintln!("zshrs:dbview:1: unknown table '{}'. Available: autoloads, comps, executables, history, plugins, scripts", table);
+                return 1;
+            }
+        }
+
+        0
+    }
+
+    /// profile — in-process command profiling with nanosecond accuracy.
+    ///
+    /// Unlike `time` (which measures one command) or `zprof` (which only
+    /// profiles function calls), `profile` traces every execute_command,
+    /// expansion, glob, and builtin dispatch inside the block.
+    ///
+    /// Usage:
+    ///   profile { commands }     — profile a block
+    ///   profile -s 'script'     — profile a script string
+    ///   profile -f func         — profile a function call
+    ///   profile --clear         — clear accumulated profile data
+    ///   profile --dump          — show accumulated profile data
+    pub(crate) fn builtin_profile(&mut self, args: &[String]) -> i32 {
+        let bold = |s: &str| format!("\x1b[1m{}\x1b[0m", s);
+        let dim = |s: &str| format!("\x1b[2m{}\x1b[0m", s);
+        let cyan = |s: &str| format!("\x1b[36m{}\x1b[0m", s);
+        let yellow = |s: &str| format!("\x1b[33m{}\x1b[0m", s);
+
+        if args.is_empty() {
+            println!("Usage: profile {{ commands }}");
+            println!("       profile -s 'script string'");
+            println!("       profile -f function_name [args...]");
+            println!("       profile --clear");
+            println!("       profile --dump");
+            return 0;
+        }
+
+        if args[0] == "--clear" {
+            // Route through canonical dispatch_builtin → BUILTINS["zprof"]
+            // (zprof.c:139 entry) with the `-c` flag — clears
+            // CALLS/NCALLS/ARCS/NARCS tables per c:141-147.
+            crate::fusevm_bridge::dispatch_builtin("zprof", vec!["-c".to_string()]);
+            println!("profile data cleared");
+            return 0;
+        }
+
+        if args[0] == "--dump" {
+            // bin_zprof prints to stdout directly (matches C
+            // zprof.c:170+ printf chain); on empty state nothing is
+            // emitted, so check NCALLS for the "no data" hint.
+            if crate::zprof::NCALLS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                println!("{}", dim("no profile data"));
+            } else {
+                crate::fusevm_bridge::dispatch_builtin("zprof", Vec::new());
+            }
+            return 0;
+        }
+
+        // Determine what to profile
+        let code = if args[0] == "-s" {
+            // profile -s 'script string'
+            if args.len() < 2 {
+                eprintln!("zshrs:profile:1: -s requires a script string");
+                return 1;
+            }
+            args[1..].join(" ")
+        } else if args[0] == "-f" {
+            // profile -f func_name [args...]
+            if args.len() < 2 {
+                eprintln!("zshrs:profile:1: -f requires a function name");
+                return 1;
+            }
+            args[1..].join(" ")
+        } else {
+            // profile { commands } — args is the block body
+            args.join(" ")
+        };
+
+        // Enable profiling, run, collect results
+        let was_enabled = self.profiling_enabled;
+        self.profiling_enabled = true;
+        // Reset zprof state through canonical dispatch_builtin so the
+        // module-level CALLS/NCALLS/ARCS/NARCS tables start fresh.
+        crate::fusevm_bridge::dispatch_builtin("zprof", vec!["-c".to_string()]);
+
+        let t0 = std::time::Instant::now();
+        let result = self.execute_script(&code);
+        let elapsed = t0.elapsed();
+        let status = match result {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zshrs:profile:1: {}", e);
+                1
+            }
+        };
+
+        // Collect timing data
+        println!();
+        println!("{}", bold("profile results"));
+        println!("{}", dim(&"─".repeat(60)));
+        let dur_str = if elapsed.as_secs() > 0 {
+            format!("{:.3}s", elapsed.as_secs_f64())
+        } else if elapsed.as_millis() > 0 {
+            format!("{:.3}ms", elapsed.as_secs_f64() * 1000.0)
+        } else {
+            format!("{:.1}µs", elapsed.as_secs_f64() * 1_000_000.0)
+        };
+        println!("  total:     {}", cyan(&dur_str));
+        println!("  status:    {}", status);
+        println!();
+
+        // Show function-level breakdown from zprof (printed inline by
+        // the bin_zprof body — c:170+ printf chain). Suppress when no
+        // calls were profiled.
+        if crate::zprof::NCALLS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            println!("{}", bold("function breakdown"));
+            crate::fusevm_bridge::dispatch_builtin("zprof", Vec::new());
+        }
+
+        // Per-command breakdown from tracing (if tracing is at debug level)
+        println!();
+        println!(
+            "  {} set ZSHRS_LOG=trace for per-command tracing",
+            yellow("tip:")
+        );
+        println!(
+            "  {} output: {}",
+            dim("log"),
+            dim(&crate::log::log_path().display().to_string())
+        );
+
+        self.profiling_enabled = was_enabled;
+        status
+    }
+
+    /// intercept builtin — register AOP advice on commands.
+    ///
+    /// Usage:
+    ///   intercept before <pattern> { code }
+    ///   intercept after <pattern> { code }
+    ///   intercept around <pattern> { code }
+    ///   intercept list                       — show all intercepts
+    ///   intercept remove <id>                — remove by ID
+    ///   intercept clear                      — remove all
+    pub(crate) fn builtin_intercept(&mut self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            println!("Usage: intercept <before|after|around> <pattern> {{ code }}");
+            println!("       intercept list | remove <id> | clear");
+            return 0;
+        }
+
+        match args[0].as_str() {
+            "list" => {
+                if self.intercepts.is_empty() {
+                    println!("no intercepts registered");
+                } else {
+                    let bold = |s: &str| format!("\x1b[1m{}\x1b[0m", s);
+                    let cyan = |s: &str| format!("\x1b[36m{}\x1b[0m", s);
+                    println!(
+                        "{:>4}  {:<8}  {:<20}  {}",
+                        bold("ID"),
+                        bold("KIND"),
+                        bold("PATTERN"),
+                        bold("CODE")
+                    );
+                    for i in &self.intercepts {
+                        let kind = match i.kind {
+                            AdviceKind::Before => "before",
+                            AdviceKind::After => "after",
+                            AdviceKind::Around => "around",
+                        };
+                        let code_preview = if i.code.len() > 40 {
+                            format!("{}...", &i.code[..37])
+                        } else {
+                            i.code.clone()
+                        };
+                        println!(
+                            "{:>4}  {:<8}  {:<20}  {}",
+                            cyan(&i.id.to_string()),
+                            kind,
+                            i.pattern,
+                            code_preview
+                        );
+                    }
+                }
+                0
+            }
+            "clear" => {
+                let count = self.intercepts.len();
+                self.intercepts.clear();
+                println!("cleared {} intercepts", count);
+                0
+            }
+            "remove" => {
+                if args.len() < 2 {
+                    eprintln!("intercept remove: requires ID");
+                    return 1;
+                }
+                if let Ok(id) = args[1].parse::<u32>() {
+                    let before = self.intercepts.len();
+                    self.intercepts.retain(|i| i.id != id);
+                    if self.intercepts.len() < before {
+                        println!("removed intercept {}", id);
+                        0
+                    } else {
+                        eprintln!("zshrs:intercept:1: no intercept with ID {}", id);
+                        1
+                    }
+                } else {
+                    eprintln!("intercept remove: invalid ID");
+                    1
+                }
+            }
+            "before" | "after" | "around" => {
+                let kind = match args[0].as_str() {
+                    "before" => AdviceKind::Before,
+                    "after" => AdviceKind::After,
+                    "around" => AdviceKind::Around,
+                    _ => unreachable!(),
+                };
+
+                if args.len() < 3 {
+                    eprintln!("intercept {}: requires <pattern> {{ code }}", args[0]);
+                    return 1;
+                }
+
+                let pattern = args[1].clone();
+                // Join remaining args as the code (handles { code } or 'code')
+                let code = args[2..].join(" ");
+                // Strip surrounding braces if present
+                let code = code.trim().to_string();
+                let code = if code.starts_with('{') && code.ends_with('}') {
+                    code[1..code.len() - 1].trim().to_string()
+                } else {
+                    code
+                };
+
+                let id = self.intercepts.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+                self.intercepts.push(Intercept {
+                    pattern,
+                    kind: kind.clone(),
+                    code: code.clone(),
+                    id,
+                });
+
+                let kind_str = match kind {
+                    AdviceKind::Before => "before",
+                    AdviceKind::After => "after",
+                    AdviceKind::Around => "around",
+                };
+                // Registration is not user-requested output. A `.zshrc` that
+                // arms a handful of intercepts printed a banner line per
+                // registration on every shell start, which is exactly the
+                // startup chatter the project forbids. `intercept list` is
+                // the way to see what is registered.
+                tracing::info!(
+                    id,
+                    kind = kind_str,
+                    pattern = %self.intercepts.last().unwrap().pattern,
+                    code = %code,
+                    "intercept registered"
+                );
+                0
+            }
+            _ => {
+                eprintln!(
+                    "intercept: unknown subcommand '{}'. Use before|after|around|list|remove|clear",
+                    args[0]
+                );
+                1
+            }
+        }
+    }
+
+    /// intercept_proceed — called from around advice to execute the original command.
+    pub(crate) fn builtin_intercept_proceed(&mut self, _args: &[String]) -> i32 {
+        self.set_scalar("__intercept_proceed".to_string(), "1".to_string());
+        // Run the original command using saved INTERCEPT_NAME/INTERCEPT_ARGS
+        let cmd_name = self.scalar("INTERCEPT_NAME").unwrap_or_default();
+        let args_str = self.scalar("INTERCEPT_ARGS").unwrap_or_default();
+        let args: Vec<String> = if args_str.is_empty() {
+            Vec::new()
+        } else {
+            args_str.split_whitespace().map(|s| s.to_string()).collect()
+        };
+        match crate::intercepts::outside_advice(|| self.run_original_command(&cmd_name, &args)) {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!("zshrs:intercept_proceed:1: {}", e);
+                1
+            }
+        }
+    }
+
+    /// async { cmd } — run command on worker pool, return job ID immediately.
+    /// Output captured in background, retrieve with `await $id`.
+    ///
+    /// Usage:
+    ///   id=$(async 'sleep 2; echo done')
+    ///   ... do other work ...
+    ///   result=$(await $id)
+    pub(crate) fn builtin_async(&mut self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            eprintln!("zshrs:async:1: requires a command string");
+            return 1;
+        }
+
+        let code = args.join(" ");
+        let id = self.next_async_id;
+        self.next_async_id += 1;
+
+        let (tx, rx) = crossbeam_channel::bounded::<(i32, String)>(1);
+        let pool = std::sync::Arc::clone(&self.worker_pool);
+
+        pool.submit(move || {
+            // Execute in a subprocess to capture stdout
+            let output = Command::new("sh")
+                .args(["-c", &code])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .output();
+            match output {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let status = out.status.code().unwrap_or(1);
+                    let _ = tx.send((status, stdout));
+                }
+                Err(_) => {
+                    let _ = tx.send((127, String::new()));
+                }
+            }
+        });
+
+        self.async_jobs.insert(id, rx);
+        // Print the job ID so it can be captured: id=$(async 'cmd')
+        println!("{}", id);
+        0
+    }
+
+    /// await $id — block until async job completes, print its stdout, return its status.
+    ///
+    /// Usage:
+    ///   id=$(async 'expensive_command')
+    ///   await $id    # blocks until done, prints output
+    ///   echo $?      # exit status of the async command
+    pub(crate) fn builtin_await(&mut self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            eprintln!("zshrs:await:1: requires a job ID");
+            return 1;
+        }
+
+        let id: u32 = match args[0].parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("zshrs:await:1: invalid job ID '{}'", args[0]);
+                return 1;
+            }
+        };
+
+        let rx = match self.async_jobs.remove(&id) {
+            Some(rx) => rx,
+            None => {
+                eprintln!("zshrs:await:1: no async job with ID {}", id);
+                return 1;
+            }
+        };
+
+        // Block until the job completes
+        match rx.recv() {
+            Ok((status, stdout)) => {
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                self.set_last_status(status);
+                status
+            }
+            Err(_) => {
+                eprintln!("zshrs:await:1: job {} died without result", id);
+                1
+            }
+        }
+    }
+
+    /// pmap 'cmd {}' arg1 arg2 arg3 — parallel map across worker pool.
+    /// Runs `cmd` for each argument, replacing `{}` with the argument.
+    /// Output is collected in order. Returns 0 if all succeed.
+    ///
+    /// Usage:
+    ///   pmap 'gzip {}' *.log
+    ///   pmap 'echo {}' a b c d
+    ///   ls *.rs | pmap 'wc -l {}'
+    pub(crate) fn builtin_pmap(&mut self, args: &[String]) -> i32 {
+        if args.len() < 2 {
+            eprintln!("zshrs:pmap:1: requires 'command {{}}' followed by arguments");
+            return 1;
+        }
+
+        let template = &args[0];
+        let items: Vec<String> = args[1..].to_vec();
+
+        // Substitute `{}` with `${=__ZSHRS_P_ARG__}` ONCE — the `=`
+        // flag forces word-splitting on $IFS so an item like "a b"
+        // still expands to two arguments at use site. Per-item the
+        // subprocess receives the item via the `__ZSHRS_P_ARG__` env
+        // var so the template's expansion picks it up natively.
+        const ARG_ENV: &str = "__ZSHRS_P_ARG__";
+        let parametrised = template.replace("{}", &format!("${{={}}}", ARG_ENV));
+
+        // Resolve our own binary once so every parallel subprocess
+        // runs zshrs (NOT /bin/sh) — preserves zshrs-specific
+        // builtins (`echo` flags, `print -P`, etc.).
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zshrs:pmap:1: current_exe: {}", e);
+                return 1;
+            }
+        };
+
+        use rayon::prelude::*;
+        // Run all items in parallel via rayon's work-stealing pool.
+        // `par_iter().collect()` preserves the input order in the
+        // result Vec — so pmap's documented "output collected in
+        // order" guarantee holds across the parallel run. The
+        // subprocess inherits our env (so $PATH etc. work) plus
+        // gets ARG_ENV=item.
+        let results: Vec<(i32, Vec<u8>, Vec<u8>)> = par_install(|| items
+            .par_iter()
+            .map(|item| {
+                let output = Command::new(&exe)
+                    .args(["--zsh", "-c", &parametrised])
+                    .env(ARG_ENV, item)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output();
+                match output {
+                    Ok(o) => (o.status.code().unwrap_or(1), o.stdout, o.stderr),
+                    Err(_) => (1, Vec::new(), Vec::new()),
+                }
+            })
+            .collect());
+
+        let mut any_fail = false;
+        for (status, stdout, stderr) in results {
+            if !stdout.is_empty() {
+                let _ = std::io::stdout().write_all(&stdout);
+            }
+            if !stderr.is_empty() {
+                let _ = std::io::stderr().write_all(&stderr);
+            }
+            if status != 0 {
+                any_fail = true;
+            }
+        }
+
+        if any_fail {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// pgrep 'pattern' arg1 arg2 ... — parallel grep/filter across worker pool.
+    /// Runs the pattern command for each argument, prints args where command succeeds.
+    ///
+    /// Usage:
+    ///   pgrep 'test -f {}' /path/a /path/b /path/c
+    ///   pgrep 'grep -q TODO {}' *.rs
+    pub(crate) fn builtin_pgrep(&mut self, args: &[String]) -> i32 {
+        if args.len() < 2 {
+            eprintln!("zshrs:pgrep:1: requires 'test_command {{}}' followed by arguments");
+            return 1;
+        }
+
+        let template = &args[0];
+        let items: Vec<String> = args[1..].to_vec();
+
+        const ARG_ENV: &str = "__ZSHRS_P_ARG__";
+        let parametrised = template.replace("{}", &format!("${{={}}}", ARG_ENV));
+
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zshrs:pgrep:1: current_exe: {}", e);
+                return 1;
+            }
+        };
+
+        use rayon::prelude::*;
+        // Parallel filter: keep input order via `.collect()`, output
+        // only items whose test passed (rc=0).
+        let pass_flags: Vec<bool> = par_install(|| items
+            .par_iter()
+            .map(|item| {
+                let status = Command::new(&exe)
+                    .args(["--zsh", "-c", &parametrised])
+                    .env(ARG_ENV, item)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                match status {
+                    Ok(s) => s.success(),
+                    Err(_) => false,
+                }
+            })
+            .collect());
+
+        for (item, &passed) in items.iter().zip(pass_flags.iter()) {
+            if passed {
+                println!("{}", item);
+            }
+        }
+        0
+    }
+
+    /// peach 'cmd {}' arg1 arg2 ... — parallel for-each, no output ordering.
+    /// Like pmap but doesn't collect output — fire-and-forget, print as completed.
+    ///
+    /// Usage:
+    ///   peach 'convert {} {}.png' *.svg
+    ///   peach 'rsync -a {} remote:{}' dir1 dir2 dir3
+    pub(crate) fn builtin_peach(&mut self, args: &[String]) -> i32 {
+        if args.len() < 2 {
+            eprintln!("zshrs:peach:1: requires 'command {{}}' followed by arguments");
+            return 1;
+        }
+
+        let template = &args[0];
+        let items: Vec<String> = args[1..].to_vec();
+
+        const ARG_ENV: &str = "__ZSHRS_P_ARG__";
+        let parametrised = template.replace("{}", &format!("${{={}}}", ARG_ENV));
+
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zshrs:peach:1: current_exe: {}", e);
+                return 1;
+            }
+        };
+
+        use rayon::prelude::*;
+        use std::sync::atomic::AtomicBool;
+        // peach: "fire-and-forget, print as completed" (no order
+        // guarantee). Inherit stdout/stderr so each subprocess
+        // streams to the parent's tty as it runs. par_iter().for_each
+        // runs items concurrently; failures are aggregated via an
+        // atomic flag.
+        let any_fail = AtomicBool::new(false);
+        par_install(|| items.par_iter().for_each(|item| {
+            let status = Command::new(&exe)
+                .args(["--zsh", "-c", &parametrised])
+                .env(ARG_ENV, item)
+                .status();
+            let ok = match status {
+                Ok(s) => s.success(),
+                Err(_) => false,
+            };
+            if !ok {
+                any_fail.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+
+        if any_fail.load(std::sync::atomic::Ordering::Relaxed) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// barrier cmd1 ::: cmd2 ::: cmd3 — run commands in parallel, wait for ALL to complete.
+    /// Returns the worst (highest) exit status.
+    ///
+    /// Usage:
+    ///   barrier 'make -C proj1' ::: 'make -C proj2' ::: 'make -C proj3'
+    ///   barrier 'npm test' ::: 'cargo test' ::: 'pytest'
+    pub(crate) fn builtin_barrier(&mut self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            eprintln!("zshrs:barrier:1: requires commands separated by :::");
+            return 1;
+        }
+
+        // Split on ::: delimiter
+        let mut commands: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for arg in args {
+            if arg == ":::" {
+                if !current.is_empty() {
+                    commands.push(current.trim().to_string());
+                    current.clear();
+                }
+            } else {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(arg);
+            }
+        }
+        if !current.is_empty() {
+            commands.push(current.trim().to_string());
+        }
+
+        if commands.is_empty() {
+            return 0;
+        }
+
+        // Ship all to pool
+        let mut receivers = Vec::with_capacity(commands.len());
+        for cmd in &commands {
+            let cmd = cmd.clone();
+            let rx = self.worker_pool.submit_with_result(move || {
+                Command::new("sh")
+                    .args(["-c", &cmd])
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .map(|s| s.code().unwrap_or(1))
+                    .unwrap_or(127)
+            });
+            receivers.push(rx);
+        }
+
+        // Wait for all — return worst status
+        let mut worst = 0i32;
+        for rx in receivers {
+            if let Ok(status) = rx.recv() {
+                if status > worst {
+                    worst = status;
+                }
+            }
+        }
+
+        self.set_last_status(worst);
+        worst
+    }
+
+    /// help - display help for builtins (bash)
+    pub(crate) fn builtin_help(&self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            println!("zshrs shell builtins:");
+            println!();
+            println!("  alias, bg, bind, break, builtin, cd, command, continue,");
+            println!("  declare, dirs, disown, echo, enable, eval, exec, exit,");
+            println!("  export, false, fc, fg, getopts, hash, help, history,");
+            println!("  jobs, kill, let, local, logout, popd, printf, pushd,");
+            println!("  pwd, read, readonly, return, set, shift, shopt, source,");
+            println!("  suspend, test, times, trap, true, type, typeset, ulimit,");
+            println!("  umask, unalias, unset, wait, whence, where, which");
+            println!();
+            println!("Type 'help name' for more information about 'name'.");
+            return 0;
+        }
+
+        let cmd = &args[0];
+        match cmd.as_str() {
+            "cd" => println!("cd: cd [-L|-P] [dir]\n    Change the shell working directory."),
+            "echo" => println!("echo: echo [-neE] [arg ...]\n    Write arguments to standard output."),
+            "export" => println!("export: export [-fn] [name[=value] ...]\n    Set export attribute for shell variables."),
+            "alias" => println!("alias: alias [-p] [name[=value] ...]\n    Define or display aliases."),
+            "history" => println!("history: history [-c] [-d offset] [n]\n    Display or manipulate the history list."),
+            "jobs" => println!("jobs: jobs [-lnprs] [jobspec ...]\n    Display status of jobs."),
+            "kill" => println!("kill: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ...\n    Send a signal to a job."),
+            "read" => println!("read: read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]\n    Read a line from standard input."),
+            "set" => println!("set: set [-abefhkmnptuvxBCHP] [-o option-name] [--] [arg ...]\n    Set or unset values of shell options and positional parameters."),
+            "test" | "[" => println!("test: test [expr]\n    Evaluate conditional expression."),
+            "type" => println!("type: type [-afptP] name [name ...]\n    Display information about command type."),
+            _ => println!("{}: no help available", cmd),
+        }
+        0
+    }
+
+    /// `add-zsh-hook` builtin. Direct port of the shell function at
+    /// `Src/Functions/Misc/add-zsh-hook`, which maintains a paramtab
+    /// array per well-known hook (`chpwd_functions`, `precmd_functions`,
+    /// `preexec_functions`, `periodic_functions`, `zshexit_functions`,
+    /// `zshaddhistory_functions`). This is the SHELL-LEVEL mechanism;
+    /// it is distinct from the C-module hookdef chain in
+    /// `src/ported/module.rs` (`addhookfunc(name, Hookfn)` writes to
+    /// `hooktab` and is consumed by `runhookdef` for C-module
+    /// callbacks like BEFORECOMPLETEHOOK / AFTERCOMPLETEHOOK).
+    pub(crate) fn builtin_add_zsh_hook(&mut self, args: &[String]) -> i32 {
+        // add-zsh-hook [-d] hook function
+        if args.len() < 2 {
+            eprintln!("usage: add-zsh-hook [-d] hook function");
+            return 1;
+        }
+
+        let (delete, hook, func) = if args[0] == "-d" {
+            if args.len() < 3 {
+                eprintln!("usage: add-zsh-hook -d hook function");
+                return 1;
+            }
+            (true, args[1].as_str(), args[2].as_str())
+        } else {
+            (false, args[0].as_str(), args[1].as_str())
+        };
+
+        let array_name = format!("{}_functions", hook);
+        if delete {
+            if let Some(mut arr) = self.array(&array_name) {
+                arr.retain(|f| f != func);
+                crate::ported::params::setaparam(&array_name, arr);
+            }
+        } else {
+            let mut arr = self.array(&array_name).unwrap_or_default();
+            if !arr.iter().any(|f| f == func) {
+                arr.push(func.to_string());
+                crate::ported::params::setaparam(&array_name, arr);
+            }
+        }
+        0
+    }
+
+    /// Generate completion candidates
+    pub(crate) fn builtin_compgen(&self, args: &[String]) -> i32 {
+        let mut prefix = String::new();
+        let mut actions: Vec<String> = Vec::new();
+        let mut wordlist = None;
+        let mut globpat = None;
+        let mut filter = None;
+        let mut pre = String::new();
+        let mut suf = String::new();
+        // -F FUNC, -C COMMAND, -o OPTION (see the post-processing below).
+        let mut func: Option<String> = None;
+        let mut command: Option<String> = None;
+        let mut copts: Vec<String> = Vec::new();
+
+        // bash getopt: clustered letters (`-fd`), option arguments either
+        // glued or in the next word, `--` ends options.
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i].as_str();
+            if a == "--" {
+                if let Some(w) = args.get(i + 1) {
+                    prefix = w.clone();
+                }
+                break;
+            }
+            if !a.starts_with('-') || a.len() == 1 {
+                prefix = a.to_string();
+                i += 1;
+                continue;
+            }
+            let letters: Vec<char> = a[1..].chars().collect();
+            let mut k = 0;
+            while k < letters.len() {
+                let c = letters[k];
+                k += 1;
+                let action = match c {
+                    'a' => Some("alias"),
+                    'b' => Some("builtin"),
+                    'c' => Some("command"),
+                    'd' => Some("directory"),
+                    'e' => Some("export"),
+                    'f' => Some("file"),
+                    'g' => Some("group"),
+                    'j' => Some("job"),
+                    'k' => Some("keyword"),
+                    's' => Some("service"),
+                    'u' => Some("user"),
+                    'v' => Some("variable"),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    actions.push(action.to_string());
+                    continue;
+                }
+                if !matches!(c, 'W' | 'G' | 'A' | 'F' | 'C' | 'P' | 'S' | 'X' | 'o') {
+                    if matches!(c, 'r' | 'D' | 'E' | 'I') {
+                        continue;
+                    }
+                    eprintln!("zshrs:compgen:1: -{}: invalid option", c);
+                    return 2;
+                }
+                // The option argument: rest of the cluster, else the next word.
+                let optarg: String = if k < letters.len() {
+                    let s: String = letters[k..].iter().collect();
+                    k = letters.len();
+                    s
+                } else {
+                    i += 1;
+                    args.get(i).cloned().unwrap_or_default()
+                };
+                match c {
+                    'W' => wordlist = Some(optarg),
+                    'G' => globpat = Some(optarg),
+                    'A' => actions.push(optarg),
+                    'X' => filter = Some(optarg),
+                    'P' => pre = optarg,
+                    'S' => suf = optarg,
+                    'F' => func = Some(optarg),
+                    'C' => command = Some(optarg),
+                    'o' => {
+                        if !matches!(
+                            optarg.as_str(),
+                            "bashdefault" | "default" | "dirnames" | "filenames" | "noquote" | "nosort" | "nospace" | "plusdirs"
+                        ) {
+                            eprintln!("zshrs:compgen:1: {}: invalid option name", optarg);
+                            return 2;
+                        }
+                        copts.push(optarg);
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+
+        let mut results: Vec<String> = Vec::new();
+        let pfx = prefix.as_str();
+        let keep = |n: &str| n.starts_with(pfx);
+
+        for action in &actions {
+            match action.as_str() {
+                "alias" => {
+                    let mut names: Vec<String> = self.alias_entries().into_iter().map(|(k, _)| k).collect();
+                    names.sort();
+                    results.extend(names.into_iter().filter(|n| keep(n)));
+                }
+                "arrayvar" => {
+                    let mut names: Vec<String> = crate::ported::params::paramtab()
+                        .read()
+                        .map(|t| t.iter().filter(|(_, pm)| pm.u_arr.is_some()).map(|(k, _)| k.clone()).collect())
+                        .unwrap_or_default();
+                    names.extend(Self::compgen_bash_arrays().iter().map(|s| s.to_string()));
+                    names.sort();
+                    names.dedup();
+                    results.extend(names.into_iter().filter(|n| keep(n)));
+                }
+                "builtin" | "enabled" | "helptopic" => {
+                    // Canonical BUILTIN_NAMES (port of `Src/builtin.c:40-137
+                    // builtins[]`) plus the in-process extension builtins.
+                    let mut names: Vec<&str> = Self::compgen_builtin_names();
+                    names.sort();
+                    names.dedup();
+                    let disabled = crate::ported::builtin::BUILTINS_DISABLED
+                        .lock()
+                        .map(|d| d.clone())
+                        .unwrap_or_default();
+                    results.extend(
+                        names
+                            .into_iter()
+                            .filter(|n| keep(n) && (action == "helptopic" || !disabled.contains(*n)))
+                            .map(String::from),
+                    );
+                }
+                "disabled" => {
+                    let mut names: Vec<String> = crate::ported::builtin::BUILTINS_DISABLED
+                        .lock()
+                        .map(|d| d.iter().cloned().collect())
+                        .unwrap_or_default();
+                    names.sort();
+                    results.extend(names.into_iter().filter(|n| keep(n)));
+                }
+                "command" => {
+                    let mut names: Vec<String> = self.alias_entries().into_iter().map(|(k, _)| k).collect();
+                    names.extend(Self::compgen_function_names());
+                    names.extend(Self::compgen_keywords().iter().map(|s| s.to_string()));
+                    names.extend(Self::compgen_builtin_names().into_iter().map(String::from));
+                    let path = crate::ported::params::getsparam("PATH").unwrap_or_default();
+                    for dir in path.split(':').filter(|d| !d.is_empty()) {
+                        if let Ok(rd) = std::fs::read_dir(dir) {
+                            names.extend(rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
+                        }
+                    }
+                    names.retain(|n| keep(n));
+                    names.sort();
+                    names.dedup();
+                    results.extend(names);
+                }
+                "directory" | "file" => results.extend(Self::compgen_paths(pfx, action == "directory")),
+                "export" => {
+                    let mut names: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+                    names.sort();
+                    results.extend(names.into_iter().filter(|n| keep(n)));
+                }
+                "function" => {
+                    let mut names = Self::compgen_function_names();
+                    names.sort();
+                    results.extend(names.into_iter().filter(|n| keep(n)));
+                }
+                "group" => results.extend(Self::compgen_passwd_names(true).into_iter().filter(|n| keep(n))),
+                "user" => results.extend(Self::compgen_passwd_names(false).into_iter().filter(|n| keep(n))),
+                "keyword" => results.extend(Self::compgen_keywords().iter().filter(|n| keep(n)).map(|s| s.to_string())),
+                "service" => {
+                    let text = std::fs::read_to_string("/etc/services").unwrap_or_default();
+                    results.extend(
+                        text.lines()
+                            .filter(|l| !l.starts_with('#'))
+                            .filter_map(|l| l.split_whitespace().next())
+                            .filter(|n| keep(n))
+                            .map(String::from),
+                    );
+                }
+                "setopt" => results.extend(
+                    crate::dash_mode::BASH_SET_O.iter().map(|(n, _)| *n).filter(|n| keep(n)).map(String::from),
+                ),
+                "shopt" => results.extend(
+                    crate::dash_mode::BASH_SHOPTS.iter().map(|(n, _, _)| *n).filter(|n| keep(n)).map(String::from),
+                ),
+                "signal" => results.extend(
+                    crate::ported::signals_h::SIGS
+                        .iter()
+                        .map(|(n, _)| format!("SIG{n}"))
+                        .filter(|n| keep(n)),
+                ),
+                "variable" => {
+                    let mut names: Vec<String> = crate::ported::params::paramtab()
+                        .read()
+                        .map(|t| t.keys().cloned().collect())
+                        .unwrap_or_default();
+                    names.extend(std::env::vars().map(|(k, _)| k));
+                    if crate::dash_mode::bash_mode() {
+                        names.extend(Self::compgen_bash_arrays().iter().map(|s| s.to_string()));
+                        names.extend(Self::compgen_bash_scalars().iter().map(|s| s.to_string()));
+                    }
+                    names.sort();
+                    names.dedup();
+                    results.extend(names.into_iter().filter(|n| keep(n)));
+                }
+                // job / running / stopped / hostname / binding: nothing to offer.
+                _ => {}
+            }
+        }
+
+        if let Some(words) = wordlist {
+            results.extend(words.split_whitespace().filter(|w| keep(w)).map(String::from));
+        }
+        if let Some(pattern) = globpat {
+            if let Ok(paths) = glob::glob(&pattern) {
+                results.extend(paths.flatten().map(|p| p.to_string_lossy().into_owned()).filter(|n| keep(n)));
+            }
+        }
+
+        // -F FUNC: call FUNC with ($1 = "compgen", $2 = the word, $3 = "")
+        // and take the candidates it leaves in COMPREPLY.
+        if let Some(f) = func {
+            crate::ported::params::setaparam("COMPREPLY", Vec::new());
+            let fargs = vec!["compgen".to_string(), prefix.clone(), String::new()];
+            if crate::ported::exec::dispatch_function_call(&f, &fargs).is_none() {
+                eprintln!("zshrs:compgen:1: {}: function not found", f);
+                return 1;
+            }
+            results.extend(crate::ported::params::getaparam("COMPREPLY").unwrap_or_default());
+        }
+        // -C COMMAND: run it under sh with COMP_LINE/COMP_POINT set;
+        // each output line is a candidate.
+        if let Some(c) = command {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&c)
+                .env("COMP_LINE", &prefix)
+                .env("COMP_POINT", prefix.len().to_string())
+                .stderr(std::process::Stdio::inherit())
+                .output();
+            match out {
+                Ok(o) => results.extend(
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .map(String::from),
+                ),
+                Err(e) => {
+                    eprintln!("zshrs:compgen:1: {}: {}", c, e);
+                    return 1;
+                }
+            }
+        }
+        // -o plusdirs adds directory matches; -o dirnames / default /
+        // bashdefault fall back to file-name matches when nothing else
+        // matched. The remaining options only shape readline insertion.
+        if copts.iter().any(|o| o == "plusdirs") {
+            results.extend(Self::compgen_paths(pfx, true));
+        }
+        if results.is_empty() {
+            if copts.iter().any(|o| o == "dirnames") {
+                results.extend(Self::compgen_paths(pfx, true));
+            } else if copts.iter().any(|o| o == "default" || o == "bashdefault") {
+                results.extend(Self::compgen_paths(pfx, false));
+            }
+        }
+
+        // -X: a pattern; matching words are removed, or with a leading `!`
+        // only matching words are kept.
+        if let Some(f) = filter {
+            let (negate, pat) = match f.strip_prefix('!') {
+                Some(p) => (true, p.to_string()),
+                None => (false, f),
+            };
+            if let Ok(p) = glob::Pattern::new(&pat) {
+                results.retain(|w| p.matches(w) == negate);
+            }
+        }
+
+        if results.is_empty() {
+            return 1;
+        }
+        for r in results {
+            println!("{pre}{r}{suf}");
+        }
+        0
+    }
+
+    /// Builtin names visible to `compgen -b`: bash's own table under `--bash`,
+    /// else zshrs's canonical table plus the in-process extension builtins.
+    fn compgen_builtin_names() -> Vec<&'static str> {
+        if crate::dash_mode::bash_mode() {
+            return crate::extensions::emulation_output::BASH_BUILTINS.iter().map(|(n, _)| *n).collect();
+        }
+        let mut names: Vec<&'static str> = BUILTIN_NAMES.iter().map(|s| s.as_str()).collect();
+        names.extend(crate::ext_builtins::EXT_BUILTIN_NAMES.iter().copied());
+        names
+    }
+
+    /// The array-valued variables every bash shell has (`compgen -A arrayvar`).
+    fn compgen_bash_arrays() -> &'static [&'static str] {
+        if !crate::dash_mode::bash_mode() {
+            return &[];
+        }
+        &[
+            "BASH_ALIASES", "BASH_ARGC", "BASH_ARGV", "BASH_CMDS", "BASH_LINENO", "BASH_SOURCE",
+            "BASH_VERSINFO", "DIRSTACK", "GROUPS", "PIPESTATUS",
+        ]
+    }
+
+    /// The scalar specials every bash shell has (`compgen -v`).
+    fn compgen_bash_scalars() -> &'static [&'static str] {
+        &[
+            "BASH", "BASHOPTS", "BASHPID", "BASH_COMMAND", "BASH_SUBSHELL", "BASH_VERSION", "EPOCHREALTIME",
+            "EPOCHSECONDS", "EUID", "FUNCNAME", "HISTCMD", "HOSTNAME", "HOSTTYPE", "LINENO", "MACHTYPE",
+            "OSTYPE", "PPID", "SECONDS", "SHELLOPTS", "SHLVL", "SRANDOM", "UID",
+        ]
+    }
+
+    /// bash reserved words (`compgen -k`).
+    fn compgen_keywords() -> &'static [&'static str] {
+        &[
+            "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until", "do",
+            "done", "in", "function", "time", "{", "}", "!", "[[", "]]", "coproc",
+        ]
+    }
+
+    /// Names of the defined shell functions (hidden internals excluded).
+    fn compgen_function_names() -> Vec<String> {
+        let mut v: Vec<String> = crate::ported::hashtable::shfunctab_lock()
+            .read()
+            .map(|t| t.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        v.retain(|n| !n.starts_with("_zshrs_anon_"));
+        v
+    }
+
+    /// `compgen -f` / `-d`: directory entries for the path prefix `pfx`, each
+    /// reported with the directory part exactly as typed, in readdir order.
+    fn compgen_paths(pfx: &str, dirs_only: bool) -> Vec<String> {
+        let (dir_part, base) = match pfx.rfind('/') {
+            Some(i) => (&pfx[..=i], &pfx[i + 1..]),
+            None => ("", pfx),
+        };
+        let read = if dir_part.is_empty() { "." } else { dir_part };
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(read) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(base) {
+                    continue;
+                }
+                if dirs_only && !e.path().is_dir() {
+                    continue;
+                }
+                out.push(format!("{dir_part}{name}"));
+            }
+        }
+        out
+    }
+
+    /// User names (`compgen -u`) or group names (`compgen -g`) from the system databases.
+    fn compgen_passwd_names(groups: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        unsafe {
+            if groups {
+                libc::setgrent();
+                loop {
+                    let g = libc::getgrent();
+                    if g.is_null() {
+                        break;
+                    }
+                    out.push(std::ffi::CStr::from_ptr((*g).gr_name).to_string_lossy().into_owned());
+                }
+                libc::endgrent();
+            } else {
+                libc::setpwent();
+                loop {
+                    let p = libc::getpwent();
+                    if p.is_null() {
+                        break;
+                    }
+                    out.push(std::ffi::CStr::from_ptr((*p).pw_name).to_string_lossy().into_owned());
+                }
+                libc::endpwent();
+            }
+        }
+        out
+    }
+
+    /// Define completion spec for a command
+    pub(crate) fn builtin_complete(&mut self, args: &[String]) -> i32 {
+        // `complete -p [NAME...]`: print the specs (all, or only the named
+        // commands; a name with no spec is an error, status 1).
+        let print_only: Option<&[String]> = (args.first().map(String::as_str) == Some("-p")).then(|| &args[1..]);
+        if args.is_empty() || print_only.is_some() {
+            // List all completion specs, sorted by command name so
+            // 'complete' (no args) outputs deterministically.
+            let wanted = print_only.unwrap_or(&[]);
+            let mut rc = 0;
+            for w in wanted {
+                if !self.completions.contains_key(w) {
+                    eprintln!("zshrs:complete:1: {w}: no completion specification");
+                    rc = 1;
+                }
+            }
+            let mut cmds: Vec<&String> = self.completions.keys().filter(|k| wanted.is_empty() || wanted.contains(*k)).collect();
+            cmds.sort();
+            for cmd in cmds {
+                let spec = self.completions.get(cmd).unwrap();
+                let mut parts = vec!["complete".to_string()];
+                for action in &spec.actions {
+                    parts.push(format!("-{}", action));
+                }
+                if let Some(ref w) = spec.wordlist {
+                    parts.push("-W".to_string());
+                    parts.push(format!("'{}'", w));
+                }
+                if let Some(ref f) = spec.function {
+                    parts.push("-F".to_string());
+                    parts.push(f.clone());
+                }
+                if let Some(ref c) = spec.command {
+                    parts.push("-C".to_string());
+                    parts.push(c.clone());
+                }
+                parts.push(cmd.clone());
+                println!("{}", parts.join(" "));
+            }
+            return rc;
+        }
+
+        let mut spec = CompSpec::default();
+        let mut commands = Vec::new();
+        let mut i = 0;
+
+        while i < args.len() {
+            match args[i].as_str() {
+                "-W" => {
+                    i += 1;
+                    if i < args.len() {
+                        spec.wordlist = Some(args[i].clone());
+                    }
+                }
+                "-F" => {
+                    i += 1;
+                    if i < args.len() {
+                        spec.function = Some(args[i].clone());
+                    }
+                }
+                "-C" => {
+                    i += 1;
+                    if i < args.len() {
+                        spec.command = Some(args[i].clone());
+                    }
+                }
+                "-G" => {
+                    i += 1;
+                    if i < args.len() {
+                        spec.globpat = Some(args[i].clone());
+                    }
+                }
+                "-P" => {
+                    i += 1;
+                    if i < args.len() {
+                        spec.prefix = Some(args[i].clone());
+                    }
+                }
+                "-S" => {
+                    i += 1;
+                    if i < args.len() {
+                        spec.suffix = Some(args[i].clone());
+                    }
+                }
+                "-a" => spec.actions.push("a".to_string()),
+                "-b" => spec.actions.push("b".to_string()),
+                "-c" => spec.actions.push("c".to_string()),
+                "-d" => spec.actions.push("d".to_string()),
+                "-e" => spec.actions.push("e".to_string()),
+                "-f" => spec.actions.push("f".to_string()),
+                "-j" => spec.actions.push("j".to_string()),
+                // `-A ACTION`: the long name of a letter action above.
+                "-A" => {
+                    i += 1;
+                    let letter = match args.get(i).map(String::as_str) {
+                        Some("alias") => Some("a"),
+                        Some("builtin") => Some("b"),
+                        Some("command") => Some("c"),
+                        Some("directory") => Some("d"),
+                        Some("export") => Some("e"),
+                        Some("file") => Some("f"),
+                        Some("job") => Some("j"),
+                        _ => None,
+                    };
+                    if let Some(l) = letter {
+                        spec.actions.push(l.to_string());
+                    }
+                }
+                // `-o COMP-OPTION` and `-X FILTERPAT` take a value this spec
+                // does not store. Consume it, or it becomes a command name.
+                "-o" | "-X" => i += 1,
+                "-r" => {
+                    // Remove completion spec
+                    i += 1;
+                    while i < args.len() {
+                        self.completions.remove(&args[i]);
+                        i += 1;
+                    }
+                    return 0;
+                }
+                s if !s.starts_with('-') => commands.push(s.to_string()),
+                _ => {}
+            }
+            i += 1;
+        }
+
+        for cmd in commands {
+            self.completions.insert(cmd, spec.clone());
+        }
+        0
+    }
+
+    /// compdef - register completion functions for commands
+    /// Usage: compdef _git git
+    ///        compdef _docker docker docker-compose
+    ///        compdef -d git  # delete
+    pub(crate) fn builtin_compdef(&mut self, args: &[String]) -> i32 {
+        // PFA-SMR aspect: emit one `compdef` event with the completion
+        // function name + the joined command list it's bound to.
+        // `compdef _git git gita gitb` → name="_git", value="git gita gitb".
+        #[cfg(feature = "recorder")]
+        if crate::recorder::is_enabled() {
+            let mut positional: Vec<&str> = Vec::new();
+            for a in args {
+                if a.starts_with('-') || a.starts_with('+') {
+                    continue;
+                }
+                positional.push(a.as_str());
+            }
+            if positional.len() >= 2 {
+                let ctx = self.recorder_ctx();
+                let func = positional[0];
+                let cmds = positional[1..].join(" ");
+                crate::recorder::emit_compdef(func, &cmds, ctx);
+            }
+        }
+        // The runtime `compdef` entry point lives in `compinit.rs`
+        // and owns a process-wide `CompdefState` published back into
+        // the shell-side `_comps` / `_services` / `_patcomps` /
+        // `_postpatcomps` / `_compautos` arrays. The legacy
+        // `compsys_cache` SQLite path is no longer the source of
+        // truth.
+        crate::compsys::ported::compinit::compdef(args)
+    }
+
+    /// compinit sh:549-551 — `if [[ $_i_autodump = 1 ]]; then compdump; fi`,
+    /// restricted to an explicit `compinit -d FILE`.
+    ///
+    /// Native mode keeps the rkyv/SQLite cache authoritative: nothing here is
+    /// read back on any fast path and no cache behaviour changes. What it
+    /// repairs is that a caller who NAMES a dump file got no file at all.
+    /// `-d FILE` is a request for FILE to exist — every other zsh writes it,
+    /// zshrs's own `--zsh` mode writes it, and rc files that pass `-d` go on
+    /// to read that path themselves. The DEFAULT dumpfile is
+    /// deliberately not written: with no `-d` nothing named a file, and
+    /// writing one would change native mode's out-of-the-box behaviour.
+    ///
+    /// Not called on the `-C`-sourced-a-dump path, matching sh:518's
+    /// `if [[ -z "$_i_done" ]]`: upstream re-dumps only after a `$fpath`
+    /// scan, never after loading a dump it just read.
+    ///
+    /// Failures are logged, not printed. Upstream's own failure mode is
+    /// compdump sh:24 returning 1 into a caller (sh:550) that ignores it.
+    fn compdump_explicit(&mut self, dump_file: Option<&str>, no_dump: bool, why: bool) {
+        // sh:549 `[[ $_i_autodump = 1 ]]` — `-D` sets it to 0 (sh:90-92).
+        if no_dump {
+            return;
+        }
+        // sh:533 — `-w` reports the regeneration.
+        if why {
+            eprintln!("Regenerating dump file");
+        }
+        let Some(path) = dump_file.filter(|f| !f.is_empty()) else {
+            return;
+        };
+        // compdump sh:44-70 reads the five association arrays out of the
+        // shell it is called from, so this must run after they are published.
+        let tables = crate::compsys::ported::compinit::DumpTables {
+            comps: self.assoc("_comps").unwrap_or_default(),
+            services: self.assoc("_services").unwrap_or_default(),
+            patcomps: self.assoc("_patcomps").unwrap_or_default(),
+            postpatcomps: self.assoc("_postpatcomps").unwrap_or_default(),
+            compautos: self.assoc("_compautos").unwrap_or_default(),
+        };
+        // compdump sh:37 stamps `$ZSH_VERSION`, which is what compinit
+        // sh:494 compares a dump's header against — including a real zsh
+        // reading a dump this shell wrote.
+        let version = self
+            .scalar("ZSH_VERSION")
+            .unwrap_or_else(|| crate::ported::patchlevel::ZSH_VERSION.to_string());
+        let t0 = std::time::Instant::now();
+        match crate::compsys::ported::compdump::compdump_live(
+            &tables,
+            std::path::Path::new(path),
+            &version,
+            &self.fpath,
+        ) {
+            Ok(written) => tracing::info!(
+                dump = %written.display(),
+                comps = tables.comps.len(),
+                ms = t0.elapsed().as_millis() as u64,
+                "compinit: wrote explicit -d dump"
+            ),
+            Err(e) => tracing::warn!(
+                dump = %path,
+                error = %e,
+                "compinit: could not write explicit -d dump"
+            ),
+        }
+    }
+
+    /// compinit - initialize the completion system
+    /// Scans fpath for completion functions and registers them
+    #[tracing::instrument(level = "info", skip(self))]
+    pub(crate) fn builtin_compinit(&mut self, args: &[String]) -> i32 {
+        tracing::debug!(target: "compsys_args", ?args, "builtin_compinit ENTER");
+        // compinit sh:523 — `for _i_dir in $fpath`, and sh:455's
+        // `compaudit` likewise walks `$fpath`. Upstream reads the
+        // PARAMETER at call time, so the `fpath=( … )` line every
+        // .zshrc runs immediately before `compinit` is what gets
+        // scanned.
+        //
+        // `self.fpath` is not that: it is seeded once at startup from
+        // the inherited `$FPATH` env var (vm_helper.rs:1174/1287) and
+        // never resynced, so an `fpath=( … )` assignment was invisible
+        // here. Whenever the parent process exported FPATH the two
+        // happened to agree and the bug stayed hidden; with FPATH unset
+        // — which is the normal case for `zsh -f`, for a login shell
+        // that builds fpath in .zshrc, and for the parity harness's
+        // child env (scripts/comptab_parity.py `child_env`) — the scan
+        // got ZERO directories. That is not a silent no-op: the worker
+        // still completes and `set_comps_bulk` writes its empty result
+        // over the cache, so `$_comps` came back empty, `_dispatch`
+        // resolved every command to `-default-`, and completion was
+        // dead shell-wide until something re-populated the cache.
+        //
+        // Resync from the live parameter, keeping the env-derived value
+        // when `$fpath` is unset (module/plugin callers that never set
+        // the array).
+        self.fpath = crate::compsys::ported::shared::compinit_scan_dirs(&self.fpath);
+        // Parse options
+        // -C: use cache if valid (skip fpath scan)
+        // -D: don't dump (don't write .zcompdump)
+        // -d file: specify dump file
+        // -u: use insecure dirs anyway  -i: silently ignore insecure dirs
+        // -q: quiet
+        let mut quiet = false;
+        let mut no_dump = false;
+        let mut dump_file: Option<String> = None;
+        let mut use_cache = false;
+        let mut ignore_insecure = false;
+        let mut use_insecure = false;
+        // -w: report why the dump file is (not) used (sh:89, sh:467-533).
+        let mut why = false;
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-q" => quiet = true,
+                "-C" => use_cache = true,
+                "-D" => no_dump = true,
+                "-d" => {
+                    i += 1;
+                    if i < args.len() {
+                        dump_file = Some(args[i].clone());
+                    }
+                }
+                "-u" => use_insecure = true,
+                "-i" => ignore_insecure = true,
+                "-w" => why = true,
+                s if s.starts_with('-') && s.len() > 1 => {
+                    // compinit -X errors in zsh ("bad option") rather
+                    // than silently no-op'ing. Without this, typos
+                    // like \`compinit -B\` (bash convention) would
+                    // proceed normally and only fail later via the
+                    // missing flag's effect.
+                    let bad: String = s[1..].chars().take(1).collect();
+                    eprintln!("zshrs:compinit:1: bad option: -{}", bad);
+                    return 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // compinit sh:116-197 — the `typeset -g…` block at the top of
+        // compinit's body. Unconditional upstream, so it must run
+        // before every branch below (including the `-C` cache-hit
+        // early return and the insecure-directory bail-out), not just
+        // on the fresh-scan path in `compinit::compinit()`.
+        crate::compsys::ported::compinit::declare_compinit_globals(dump_file.as_deref());
+
+        // compinit sh:201 — `: $funcstack` ("Loading it now ensures that
+        // the `funcstack' parameter is always correct"). Reaching for a
+        // `zsh/parameter` parameter loads that module, so a real zsh lists
+        // it in `zmodload -L` after any compinit.
+        crate::compsys::ported::compinit::touch_funcstack_param();
+
+        // sh:467-505 — `-w` explains the dump-file decision on stderr.
+        // The fpath file-count reason (sh:482) is not reported: the count
+        // upstream compares against is a fresh `$fpath` scan that zshrs
+        // performs later, on the worker pool.
+        if why {
+            let dump = crate::ported::params::getsparam("_comp_dumpfile").unwrap_or_default();
+            eprintln!("Using dump file: {}", dump);
+            match std::fs::read_to_string(&dump) {
+                Err(_) => eprintln!("No existing dump file found"),
+                Ok(text) if !use_cache => {
+                    let header: Vec<&str> =
+                        text.lines().next().unwrap_or("").split_whitespace().collect();
+                    let current = crate::ported::params::getsparam("ZSH_VERSION")
+                        .unwrap_or_else(|| crate::ported::patchlevel::ZSH_VERSION.to_string());
+                    let mut reasons: Vec<String> = Vec::new();
+                    if no_dump {
+                        reasons.push("-D flag given".to_string());
+                    }
+                    if let Some(old) = header.get(3).filter(|v| **v != current) {
+                        reasons.push(format!("zsh version changed from {} to {}", old, current));
+                    }
+                    if !reasons.is_empty() {
+                        eprintln!("Loading dump file skipped because: {}", reasons.join(", "));
+                    }
+                }
+                Ok(_) => {}
+            }
+        }
+
+        // compinit sh:455 `autoload -RUz compaudit` and sh:481
+        // `autoload -RUz compdump compinstall` ("Make sure compdump is
+        // available, even if we aren't going to use it"), plus sh:578
+        // `autoload -RUz compinit compaudit` at the very end. These are
+        // unconditional lines in compinit's own body — they fire on
+        // every path, dump-hit or fresh-scan alike, so a real zsh always
+        // finishes compinit with all three names in `${(k)functions}`.
+        // zshrs derived its autoload stubs purely from the fpath/cache
+        // scan, and none of the three carries a `#compdef` / `#autoload`
+        // header, so they were the only names compinit itself guarantees
+        // that zshrs was missing. Registered before the audit call so
+        // the insecure-directory early return below still leaves
+        // `compaudit` callable, exactly as sh:455 does.
+        crate::compsys::ported::compinit::register_autoload_stubs([
+            "compaudit",   // sh:455
+            "compdump",    // sh:481
+            "compinstall", // sh:481
+        ]);
+
+        // compinit sh:515-518 — `-C` clears `_i_check` (sh:102-104), and
+        // with the check off an existing dump file is sourced outright:
+        //
+        //   else
+        //     builtin . "$_comp_dumpfile"
+        //     _i_done=yes
+        //   fi
+        //
+        // `_i_done` then skips the entire sh:523-550 `$fpath` scan, so on
+        // that path the dump — not the scan — is what defines every
+        // completer name the session ends up with. zshrs substitutes its
+        // own cache for the dump's `_comps`/`_services`/… payload, but the
+        // dump's `autoload` lines have no substitute: compdump lists every
+        // defined `_*` function that has a file in `$fpath`
+        // (compdump:113), which includes headerless helpers no
+        // `#compdef`/`#autoload` scan can see. On this host that was 12
+        // names — `_command_names`, `_parameters`, `_megacomplete`,
+        // `_complete_hist`, `__zpwr_aliases`, … — every one of them a
+        // `# -*- mode: sh -*-`-headed file, plus `_zemacs`, whose file has
+        // since left `$fpath` entirely. Missing stubs are observable well
+        // beyond `${(k)functions}`: the legacy `compcall` namespace census
+        // `_default` falls back to counts them, and `_tmux` derives its
+        // sub-command list from `${(M)${(k)functions}:#_tmux-*}`.
+        //
+        // Only the `-C` branch is mirrored. The checked branch (sh:492-514)
+        // loads the dump solely when its recorded file count and
+        // `$ZSH_VERSION` both still match; zshrs does not evaluate that
+        // condition and rescans instead — the same thing a real zsh does
+        // whenever the dump is stale.
+        // sh:497-498/516-517 — sourcing the dump sets `_i_done=yes`, and
+        // sh:523 (`if [[ -z "$_i_done" ]]`) then skips the whole $fpath scan.
+        // So on the dump path the dump is the SOLE source of names; anything
+        // else that contributes is a zshrs-only divergence.
+        let mut dump_sourced = false;
+        let mut dump_tables = None;
+        if use_cache {
+            if let Some(dump) = crate::ported::params::getsparam("_comp_dumpfile") {
+                let dump = std::path::PathBuf::from(dump);
+                // `-C` skips zsh's security check, and sh:492-514's checked
+                // branch is the only place upstream compares the dump against
+                // reality. zshrs materialises its bundled function tree into
+                // ~/.zshrs/functions out of band, so a dump written before an
+                // upgrade lists none of it and `-C` would trust it forever:
+                // every zshrs builtin then completed as if nothing shipped
+                // (`_comps[zjob]` empty with _zjob sitting on fpath). Treat
+                // the dump as stale when the bundle stamp is newer, which is
+                // what a real zsh does whenever its own staleness check trips.
+                let bundle_newer = (|| {
+                    let stamp = crate::bundled_functions::functions_dir()?
+                        .join(".zshrs-bundle-version");
+                    let s = std::fs::metadata(&stamp).ok()?.modified().ok()?;
+                    let d = std::fs::metadata(&dump).ok()?.modified().ok()?;
+                    Some(s > d)
+                })()
+                .unwrap_or(false);
+                if dump.is_file() {
+                    let names = crate::compsys::ported::compinit::dump_autoload_names(&dump);
+                    let added = crate::compsys::ported::compinit::register_autoload_stubs(&names);
+                    dump_sourced = true;
+                    tracing::info!(
+                        added,
+                        total = names.len(),
+                        dump = %dump.display(),
+                        "compinit: autoload stubs from dump"
+                    );
+                    // The other half of sh:494: the five association tables.
+                    // Same `_i_done` argument as the autoload names above —
+                    // sh:501 skips the $fpath scan, so the dump alone defines
+                    // `$_comps` and friends. Reading them from zshrs's SQLite
+                    // cache instead let a partially-built cache silently
+                    // replace the dump (1849 `_comps` keys vs the dump's
+                    // 51745 on this host), which drops `$_comps[zpwr]`,
+                    // `$_comps[cargo]`, … and routes those commands to
+                    // `-default-` file completion.
+                    dump_tables = crate::compsys::ported::compinit::dump_assoc_tables(&dump);
+                    // A dump older than the bundled tree cannot list zshrs's
+                    // own completers (`_zjob`, `_ztag`, `_zcache`, …), but
+                    // DISCARDING the whole dump for that — which is what the
+                    // old `!bundle_newer` gate did — replaced it with the
+                    // SQLite cache, and the cache is a DIFFERENT table, not a
+                    // superset.  Measured on this host, fpath pinned to
+                    // `zsh -f`'s, only the dump's mtime varied:
+                    //   cache path: n=51577  X=_X  7z=_7z    zjob=_zjob
+                    //   dump path : n=51708  X=_X  7z=_7zip  zjob=
+                    //   real zsh  : n=51708  X=_X  7z=_7zip  zjob=
+                    // i.e. the dump path is byte-identical to zsh, while the
+                    // cache path is missing 163 of zsh's keys, carries 32 of
+                    // its own, and resolves 555 MORE keys to a DIFFERENT
+                    // completer (`7z` → `_7z` instead of the distribution's
+                    // `_7zip`) — a difference the net 131-key delta hides.
+                    // Keep sh:494's dump authoritative and add only what it
+                    // cannot know about, with sh:519's `compdef -na`
+                    // first-claim-wins so the dump wins every key it carries.
+                    if bundle_newer {
+                        if let Some(t) = dump_tables.as_mut() {
+                            let added =
+                                crate::compsys::ported::compinit::merge_bundled_registrations(t);
+                            tracing::info!(
+                                added,
+                                dump = %dump.display(),
+                                "compinit: dump predates the bundled tree — overlaid bundled registrations"
+                            );
+                        }
+                    }
+                    // compdump:135-138 — the dump ends with one
+                    // `autoload -Uz $_compautos[$_c] $_c` line per
+                    // `_compautos` key, and sourcing it (sh:494) runs each
+                    // through bin_functions with those options. The value
+                    // is the `#autoload` header's option words, e.g.
+                    // `_call_program`'s `+X`, which loads the body NOW
+                    // (c:Src/builtin.c bin_functions → eval_autoload →
+                    // loadautofn). `register_autoload_stubs` above only
+                    // creates undefined stubs, so without this
+                    // `functions _call_program` printed `# undefined`
+                    // where zsh prints the loaded body. The value is
+                    // unquoted in the dump line, so it word-splits.
+                    if let Some(t) = dump_tables.as_ref() {
+                        for (name, opts) in &t.compautos {
+                            let mut argv = vec!["-Uz".to_string()];
+                            argv.extend(opts.split_ascii_whitespace().map(str::to_string));
+                            argv.push(name.clone());
+                            crate::fusevm_bridge::dispatch_builtin_raw("autoload", argv);
+                        }
+                    }
+                }
+            }
+        }
+
+        // sh:434 `if [[ -n "$_i_check" ]]` — `-C` clears `_i_check` (sh:84
+        // `(( $+_i_opth[-C] )) && _i_check=`), so the cached path never
+        // audits.  `-u` sets `_i_fail=use` (sh:88), which makes compaudit
+        // itself return 0 before flagging anything.
+        if !use_cache && use_insecure && !self.posix_mode {
+            // `-u` still calls compaudit (sh:456-458); `_i_fail=use` makes it
+            // return 0 at its sh:86, which is AFTER its sh:18 getent shim.
+            crate::compsys::ported::compaudit::compaudit_getent_shim();
+        }
+        if !use_cache && !use_insecure && !self.posix_mode {
+            // sh:436 `if ! eval compaudit`.  This MUST be the faithful port,
+            // not `plugin_cache::compaudit_cached`: that helper's
+            // `check_dir_security` short-circuits `if uid == 0 || uid == euid
+            // { return true }` (plugin_cache.rs:812-814), calling any
+            // caller-owned directory secure whatever its mode, while
+            // compaudit sh:125's qualifier list
+            // `(N-f:g+w:,-f:o+w:,-^${_i_owners})` treats the commas as
+            // ALTERNATIVES — group-writable OR other-writable OR untrusted
+            // owner each flag it.  A user-owned 0777 fpath directory is
+            // therefore insecure to zsh and "secure" to the helper, which
+            // made every branch below dead code for the ordinary case:
+            // zshrs registered and RAN a completer out of a world-writable
+            // directory where zsh aborts initialization outright.
+            //   zsh  : compinit: initialization aborted / rc=1 / _comps[zz01] empty
+            //   zshrs: rc=0 / _comps[zz01]=_zz01
+            if let Err(audit) = crate::compsys::ported::compaudit::compaudit(&self.fpath) {
+                // sh:437 `if [[ -n "$_i_q" ]]` — compaudit only sets its
+                // description when it actually flagged something.
+                if !audit.is_empty() {
+                    if !ignore_insecure {
+                        // sh:438-451 — upstream's default `ask` arm prompts
+                        // with `read -q` and takes this branch when the answer
+                        // is "no" (or when there is no terminal: a
+                        // non-interactive zsh prints "initialization aborted"
+                        // and returns 1).  zshrs has no prompt here, so it
+                        // always takes the abort arm.
+                        if !quiet {
+                            eprintln!("zshrs:compinit:1: insecure directories:");
+                            for d in &audit.insecure_dirs {
+                                eprintln!("  {}", d.display());
+                            }
+                            eprintln!(
+                                "zshrs:compinit:1: run with -i to ignore or -u to use anyway"
+                            );
+                        }
+                        return 1;
+                    }
+                    // sh:452 `fpath=(${fpath:|_i_wdirs})` — element
+                    // subtraction, so a flagged PARENT directory that is not
+                    // itself an `$fpath` entry removes nothing, exactly as
+                    // upstream.  This also subsumes sh:506's
+                    // `(( $_i_wdirs[(I)$_i_dir] )) && continue`, because every
+                    // scan below reads `self.fpath`.
+                    self.fpath.retain(|d| !audit.insecure_dirs.contains(d));
+                    let fp: Vec<String> = self
+                        .fpath
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    crate::ported::params::setaparam("fpath", fp);
+                }
+                // sh:456 `typeset -g _comp_secure=yes`
+                let _ = crate::ported::params::setsparam("_comp_secure", "yes");
+            }
+        }
+
+        // Install the `compdef` function stub SYNCHRONOUSLY (before the
+        // native scan is shipped to the worker pool, which returns
+        // immediately). zsh's `compinit` defines `compdef` as a shell
+        // function; zshrs does the scan in Rust and never installed it,
+        // so `${+functions[compdef]}` stayed 0 and zinit's compdef-replay
+        // aborted with "compinit function hasn't been loaded" while direct
+        // `compdef` calls hit command-not-found. Only install our stub when
+        // no real compdef function already exists (don't clobber a user or
+        // --zsh fpath definition); the marker body routes to the fast
+        // native impl in the BUILTIN_COMPDEF handler.
+        if !self.function_exists("compdef") {
+            crate::ported::modules::parameter::setfunction(
+                "compdef",
+                NATIVE_COMPDEF_MARKER.to_string(),
+                0,
+            );
+        }
+
+        // ZSH COMPAT MODE: Use traditional zsh algorithm (fpath scan, .zcompdump, no SQLite)
+        if self.zsh_compat {
+            return self.compinit_compat(quiet, no_dump, dump_file.clone(), use_cache);
+        }
+
+        // ZSHRS MODE: Use SQLite cache with function bodies
+
+        // Main-thread widget/keybinding setup runs on EVERY compinit path,
+        // BEFORE any early return. The `-C` cached branch below returned
+        // without ever rebinding the completion widgets, so a cache-hit
+        // compinit (zpwr's default) left TAB on the INTERNAL completer —
+        // `ls -<TAB>` completed FILES instead of options while the fresh-
+        // scan path worked. These installs need no scan results (sh:542
+        // binds only _main_complete; the -k table is static).
+        crate::compsys::ported::compinit::install_standard_complete_widgets();
+        crate::compsys::ported::compinit::maybe_rebind_tab_for_expand();
+        crate::compsys::ported::compinit::install_standard_comp_keybindings();
+
+        // sh:493-496 + sh:501 — `-C` with an existing dump: `builtin .
+        // "$_comp_dumpfile"` then `_i_done=yes`, and `if [[ -z "$_i_done" ]]`
+        // skips the entire sh:504-528 `$fpath` scan. The dump is the ONLY
+        // thing that defines the five association tables on this path, so it
+        // takes precedence over zshrs's SQLite cache — which tracks a
+        // different refresh schedule and can hold a partial scan.
+        //
+        // This branch precedes the cache branch deliberately: an
+        // out-of-date-but-`cache_is_valid` cache must not shadow the dump,
+        // and a cache that fails `cache_is_valid` must not fall through to
+        // the worker-pool rescan sh:501 says never happens.
+        if let Some(tables) = dump_tables {
+            tracing::info!(
+                comps = tables.comps.len(),
+                services = tables.services.len(),
+                patcomps = tables.patcomps.len(),
+                postpatcomps = tables.postpatcomps.len(),
+                compautos = tables.compautos.len(),
+                "compinit: association tables from dump"
+            );
+            // The dump is the running shell's source of truth on this path
+            // and nothing here touched compsys.db, which a scan alone fills:
+            // it kept whichever partial scan last ran. Bring it in line.
+            let pairs = |m: &indexmap::IndexMap<String, String>| -> Vec<(String, String)> {
+                m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            sync_compsys_mirror(
+                pairs(&tables.comps),
+                pairs(&tables.services),
+                pairs(&tables.patcomps),
+                pairs(&tables.postpatcomps),
+            );
+            self.set_assoc("_comps".to_string(), tables.comps);
+            self.set_assoc("_services".to_string(), tables.services);
+            self.set_assoc("_patcomps".to_string(), tables.patcomps);
+            self.set_assoc("_postpatcomps".to_string(), tables.postpatcomps);
+            self.set_assoc("_compautos".to_string(), tables.compautos);
+            return 0;
+        }
+
+        // Try to use existing cache if -C and cache is valid
+        if use_cache {
+            if let Some(cache) = self.compsys_cache() {
+                if crate::compsys::cache_is_valid(cache, &self.fpath) {
+                    // Load from cache instead of rescanning
+                    if let Ok(result) = crate::compsys::load_from_cache(cache) {
+                        if !quiet {
+                            tracing::info!(
+                                comps = result.comps.len(),
+                                "compinit: using cached completions"
+                            );
+                        }
+                        // compinit sh:337/sh:541 — every registered completer is
+                        // `autoload -rUz`'d, so `${(k)functions}` lists all of
+                        // them. Completers depend on that: `_tmux` derives its
+                        // sub-command list from `${(M)${(k)functions}:#_tmux-*}`
+                        // (_tmux sh:1967), which silently lost the `_tmux-*`
+                        // helpers in $fpath while this table stayed empty.
+                        //
+                        // …but ONLY when no dump was sourced above. sh:523's
+                        // `[[ -z "$_i_done" ]]` makes the dump authoritative on
+                        // the `-C` path: a real zsh ends up with exactly the
+                        // names the dump lists, no more. zshrs's SQLite cache is
+                        // refreshed independently of the shared `.zcompdump`, so
+                        // running both sources added every completer the cache
+                        // had seen since the dump was last written (`_john` from
+                        // site-functions, on this host) — functions reference zsh
+                        // does not define. Keep the cache as the name source only
+                        // for the no-dump case, where sh:523-550 would have
+                        // scanned $fpath.
+                        if !dump_sourced {
+                            let stub_t0 = std::time::Instant::now();
+                            if let Ok(names) = cache.list_autoload_names() {
+                                let added =
+                                    crate::compsys::ported::compinit::register_autoload_stubs(
+                                        &names,
+                                    );
+                                tracing::info!(
+                                    added,
+                                    total = names.len(),
+                                    ms = stub_t0.elapsed().as_millis() as u64,
+                                    "compinit: autoload stubs"
+                                );
+                            }
+                        }
+
+                        self.set_assoc("_comps".to_string(), result.comps.into_iter().collect());
+                        self.set_assoc(
+                            "_services".to_string(),
+                            result.services.into_iter().collect(),
+                        );
+                        self.set_assoc(
+                            "_patcomps".to_string(),
+                            result.patcomps.into_iter().collect(),
+                        );
+                        // sh:116/121 — `_postpatcomps` and `_compautos`
+                        // are populated from the same dump/scan as the
+                        // three above (compdump sh:112-131 writes all
+                        // five). Publishing only three left
+                        // `${(k)_postpatcomps}` empty on the cache-hit
+                        // path even though the cache held the entries.
+                        self.set_assoc(
+                            "_postpatcomps".to_string(),
+                            result.postpatcomps.into_iter().collect(),
+                        );
+                        self.set_assoc(
+                            "_compautos".to_string(),
+                            result.compautos.into_iter().collect(),
+                        );
+
+                        // sh:549-551. Upstream reaches this branch only when
+                        // `-C` found no dump to source, i.e. `_i_done` is
+                        // empty and sh:521-545 scanned `$fpath` — so it
+                        // dumps here.
+                        self.compdump_explicit(dump_file.as_deref(), no_dump, why);
+                        return 0;
+                    }
+                }
+            }
+        }
+
+        // Ship compinit to worker pool — no ad-hoc thread spawn.
+        // The heavy work (scan + SQLite write) runs on a pool thread.
+        // Results are merged into shell state lazily via drain_compinit_bg().
+        let fpath = self.fpath.clone();
+        let fpath_count = fpath.len();
+        let pool_size = self.worker_pool.size();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bg_start = std::time::Instant::now();
+        tracing::info!(
+            fpath_dirs = fpath_count,
+            worker_pool = pool_size,
+            "compinit: shipping to worker pool"
+        );
+        // The cache-identity stamp must record the `$fpath` this build is
+        // scanning, and the closure below is `move` — capture it by value
+        // rather than borrowing `self` into a 'static thread.
+        let stamp_fpath: Vec<std::path::PathBuf> = self.fpath.clone();
+        self.worker_pool.submit(move || {
+            tracing::debug!("compinit-bg: thread started");
+            let cache_path = crate::compsys::cache::default_cache_path();
+            if let Some(parent) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Serialise the whole rebuild. The build-aside + `rename`
+            // below is atomic for a READER, but two BUILDERS still each
+            // install a complete database over the other's: whichever
+            // renames last wins and the loser's entire scan is thrown
+            // away, along with any registration only it had seen. Up to
+            // 16 of the user's shells share this file, so two of them
+            // starting cold at once is the ordinary case. Blocking and
+            // exclusive, on a side file the rename does not replace, the
+            // same shape `script_cache` and `autoload_cache` already use
+            // for their shards.
+            let _rebuild_lock = crate::compsys::cache::acquire_rebuild_lock();
+            // Whoever held the lock before us may have just installed a
+            // cache this binary can use. Re-check under the lock instead
+            // of rebuilding what is already there: the check that sent us
+            // down this branch ran before we waited.
+            //
+            // ONLY for `compinit -C`. Without `-C`, sh:504-528 scans
+            // `$fpath` unconditionally, and this one file is shared by
+            // every shell on the machine no matter what each one's
+            // `$fpath` holds — so accepting a neighbour's cache here
+            // publishes the NEIGHBOUR's registrations. Measured: eight
+            // shells rebuilding at once, each with one completion unique
+            // to its own `$fpath`, all eight came back holding shell 8's
+            // unique entry and none of their own.
+            if use_cache {
+            if let Ok(existing) = crate::compsys::cache::CompsysCache::open(&cache_path) {
+                if crate::compsys::cache_is_valid(&existing, &stamp_fpath) {
+                    if let Ok(result) = crate::compsys::load_from_cache(&existing) {
+                        tracing::info!(
+                            path = %cache_path.display(),
+                            comps = result.comps.len(),
+                            "compinit: another shell installed a usable cache while we waited for the rebuild lock"
+                        );
+                        let _ = tx.send(CompInitBgResult {
+                            result,
+                            cache: existing,
+                        });
+                        return;
+                    }
+                }
+            }
+            }
+
+            // Build into a private file and move it into place when it is
+            // finished, the same crash-safe shape `compdump` already uses
+            // for the dump (compdump.rs:175-188, sh:21-23).
+            //
+            // The old code deleted the live db (plus its -shm/-wal) FIRST
+            // and then spent seconds refilling it. Up to 16 of the user's
+            // shells share this one file, so every shell that started
+            // inside that window found either no cache at all or one with
+            // a handful of rows — and `cache_is_valid`'s old `count > 0`
+            // accepted the partial — leaving `_comps` with a fraction of
+            // its registrations and `_dispatch` with no completer for any
+            // command. `rename(2)` is atomic within a filesystem, so a
+            // concurrent reader now opens either the whole previous cache
+            // or the whole new one, never a half-written file.
+            let build_path = cache_path.with_file_name(format!(
+                "{}.building.{}",
+                cache_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "compsys.db".to_string()),
+                std::process::id()
+            ));
+            // Leftovers from a build this pid was killed during. The path
+            // is pid-private, so nothing else can be reading them.
+            for stale in [
+                build_path.display().to_string(),
+                format!("{}-shm", build_path.display()),
+                format!("{}-wal", build_path.display()),
+            ] {
+                let _ = std::fs::remove_file(stale);
+            }
+
+            let mut cache = match crate::compsys::cache::CompsysCache::open(&build_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("compinit: failed to create cache: {}", e);
+                    return;
+                }
+            };
+
+            let result = match crate::compsys::build_cache_from_fpath(&fpath, &mut cache) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("compinit: scan failed: {}", e);
+                    return;
+                }
+            };
+
+            tracing::info!(
+                functions = result.files_scanned,
+                comps = result.comps.len(),
+                dirs = result.dirs_scanned,
+                ms = result.scan_time_ms,
+                "compinit: background scan complete"
+            );
+
+            // No bytecode pre-warm here. Autoload chunks are cached
+            // write-through by the loader itself (`vm_helper`'s autoload
+            // arm → `autoload_cache::try_save_one`), keyed on the resolved
+            // fpath directory plus a digest of the exact definition text.
+            // A speculative pre-warm on
+            // this worker thread cannot produce those chunks: it would have
+            // to parse 46k bodies against process-global lexer state that
+            // the interactive main thread is using concurrently — which is
+            // what corrupted the prompt into a stuck PS2 when the pre-warm
+            // was enabled — and the chunks it built were the bare file body
+            // compiled as a top-level script, not the definition program the
+            // loader installs.
+            // Stamp completeness LAST, so `cache_is_valid` can tell a
+            // finished cache from one that is still filling, then close the
+            // connection: SQLite checkpoints the WAL into the db and removes
+            // the -wal/-shm side files on the last close, which is what makes
+            // the single-file rename below carry the whole cache.
+            if !crate::compsys::ported::compinit::stamp_cache_complete(&cache, &stamp_fpath) {
+                tracing::error!("compinit: could not stamp cache as complete; not installing it");
+                return;
+            }
+            drop(cache);
+
+            // The outgoing file's side files must go before the rename: they
+            // are named after `cache_path`, so leaving them would pair a WAL
+            // from the OLD database with the NEW one. The freshly built cache
+            // has none of its own after the clean close above.
+            for stale in [
+                format!("{}-shm", cache_path.display()),
+                format!("{}-wal", cache_path.display()),
+            ] {
+                let _ = std::fs::remove_file(stale);
+            }
+            if let Err(e) = std::fs::rename(&build_path, &cache_path) {
+                tracing::error!(error = %e, "compinit: could not install rebuilt cache");
+                let _ = std::fs::remove_file(&build_path);
+                return;
+            }
+
+            let cache = match crate::compsys::cache::CompsysCache::open(&cache_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("compinit: failed to reopen installed cache: {}", e);
+                    return;
+                }
+            };
+
+            let _ = tx.send(CompInitBgResult { result, cache });
+        });
+
+        // (Widget + #compdef -k installs run for ALL paths near the top of
+        // this fn, before the cached-branch early return.)
+
+        // zsh CONTRACT: compinit RETURNS with $_comps populated — the scan
+        // work is parallel (rayon fan-out on the pool inside compinit()),
+        // the COMPLETION of that work is not deferred. The previous lazy
+        // merge (compinit_pending + drain) left $_comps empty until some
+        // later drain call — `_dispatch` resolved comp="" for every command
+        // and option completion was dead shell-wide. Block on the result
+        // here; warm starts take the cache path above and never reach this.
+        match rx.recv() {
+            Ok(bg) => {
+                let comps = bg.result.comps.len();
+                crate::compsys::ported::compinit::apply_keybindings(&bg.result);
+                // sh:333/sh:541 — every completer compinit registers is also
+                // `autoload -rUz`'d, from BOTH scan arms: `compdef -na` does it
+                // for each `#compdef` file and the `#autoload` arm does it
+                // directly. This branch is the one a cold `compinit` (no `-C`)
+                // takes, and it published the five association tables without
+                // ever registering a stub, so the shell came back with
+                // `$#_comps` = 1822 and `${#${(M)${(k)functions}:#_*}}` = 0
+                // where the same scan under reference zsh ends at 9048.
+                // `_main_complete` was among the missing names, so the
+                // completion widgets compinit binds at sh:556-560 all called an
+                // undefined function and tab inserted nothing.
+                let mut stubs = crate::compsys::ported::compinit::register_scanned_autoload_stubs(
+                    &bg.result,
+                    &self.fpath,
+                );
+                // `autoload_stub_names` reads `result.files`, which only a
+                // fresh `$fpath` scan fills — the background thread also
+                // returns a `load_from_cache` result (compinit.rs) when
+                // another shell installs a usable cache while this one waits
+                // for the rebuild lock, and that leaves `files` empty. The
+                // `autoloads` table holds the names that scan produced.
+                if bg.result.files.is_empty() {
+                    if let Ok(names) = bg.cache.list_autoload_names() {
+                        stubs +=
+                            crate::compsys::ported::compinit::register_autoload_stubs(&names);
+                    }
+                }
+                tracing::info!(stubs, "compinit: autoload stubs from scan");
+                self.set_assoc("_comps".to_string(), bg.result.comps.into_iter().collect());
+                self.set_assoc(
+                    "_services".to_string(),
+                    bg.result.services.into_iter().collect(),
+                );
+                self.set_assoc(
+                    "_patcomps".to_string(),
+                    bg.result.patcomps.into_iter().collect(),
+                );
+                // sh:116/121 — `typeset -gHA` declares all five, and the
+                // scan fills all five (compdump.rs writes all five). The
+                // cache-hit branch above already published the other two;
+                // this branch stopped at three, so a fresh-scan shell had
+                // `_postpatcomps` unset and `_dispatch`'s post pass nothing
+                // to walk — every `#compdef -P` completer (`_dir_list`,
+                // `_urls`, `_locales`, `_gcc`, `_python`, …) dead.
+                self.set_assoc(
+                    "_postpatcomps".to_string(),
+                    bg.result.postpatcomps.into_iter().collect(),
+                );
+                self.set_assoc(
+                    "_compautos".to_string(),
+                    bg.result.compautos.into_iter().collect(),
+                );
+                self.compsys_cache = std::cell::OnceCell::from(Some(bg.cache));
+                tracing::info!(
+                    wall_ms = bg_start.elapsed().as_millis() as u64,
+                    comps,
+                    "compinit: scan complete, _comps populated"
+                );
+                // sh:549-551 — the cold path is the `$fpath` scan upstream
+                // dumps after. Last statement of the scan branch, matching
+                // upstream's position: every completer is registered and
+                // autoloaded by now, which is what compdump sh:108 reads.
+                self.compdump_explicit(dump_file.as_deref(), no_dump, why);
+                0
+            }
+            Err(_) => {
+                tracing::error!("compinit: scan worker died without sending results");
+                1
+            }
+        }
+    }
+
+    /// cdreplay - replay deferred compdef calls (zinit turbo mode)
+    /// Usage: cdreplay [-q]
+    pub(crate) fn builtin_cdreplay(&mut self, args: &[String]) -> i32 {
+        let quiet = args.contains(&"-q".to_string());
+
+        if self.deferred_compdefs.is_empty() {
+            return 0;
+        }
+
+        let deferred = std::mem::take(&mut self.deferred_compdefs);
+        let count = deferred.len();
+
+        // One publish for the whole replay. Each `compdef` otherwise
+        // read-modify-writes the entire `_comps` hash (there is no
+        // single-key assoc setter in `params.rs`), which a turbo-mode
+        // replay of hundreds of registrations would pay hundreds of times
+        // over ~50k entries. The resulting `_comps` is identical.
+        crate::compsys::ported::compinit::compdef_batch(|| {
+            for compdef_args in deferred {
+                crate::compsys::ported::compinit::compdef(&compdef_args);
+            }
+        });
+
+        if !quiet {
+            eprintln!("cdreplay: replayed {} compdef calls", count);
+        }
+
+        0
+    }
+
+    // zgetattr/zsetattr/zdelattr/zlistattr - extended attributes
+    // builtin_zattr deleted — zero callers. Was a Rust-only dispatcher
+    // wrapping the 4 zattr bin_* free ported; callers should use
+    // canonical dispatch_builtin("zgetattr"/etc, args) which goes
+    // through execbuiltin → BUILTINS entry (attr.c:NNN ports) with
+    // optstr parsing built in.
+}
+
+/// Make compsys.db's `comps` / `services` / `patcomps` / `postpatcomps`
+/// tables hold the association tables the shell is actually running with.
+///
+/// The mirror exists for `dbview` and SQL inspection (the authoritative
+/// store is the dump / rkyv shards), so this runs on its own thread with its
+/// own connection and never delays a prompt. A table is rewritten only when
+/// its row count differs — the usual startup is a no-op.
+fn sync_compsys_mirror(
+    comps: Vec<(String, String)>,
+    services: Vec<(String, String)>,
+    patcomps: Vec<(String, String)>,
+    postpatcomps: Vec<(String, String)>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("compsys-mirror".into())
+        .spawn(move || {
+            let Ok(mut cache) =
+                crate::compsys::cache::CompsysCache::open(crate::compsys::cache::default_cache_path())
+            else {
+                return;
+            };
+            if cache.count_table("comps").ok() != Some(comps.len()) {
+                let _ = cache.set_comps_bulk(&comps);
+            }
+            if cache.count_table("services").ok() != Some(services.len()) {
+                let _ = cache.set_services_bulk(&services);
+            }
+            if cache.count_table("patcomps").ok() != Some(patcomps.len()) {
+                for (pattern, function) in &patcomps {
+                    let _ = cache.set_patcomp(pattern, function);
+                }
+            }
+            if cache.count_table("postpatcomps").ok() != Some(postpatcomps.len()) {
+                for (pattern, function) in &postpatcomps {
+                    let _ = cache.set_postpatcomp(pattern, function);
+                }
+            }
+        });
+}
+
+impl ShellExecutor {
+    pub(crate) fn builtin_cat(&self, args: &[String]) -> i32 {
+        // coreutils cat(1) port: adds -E (show $ at line end),
+        // -T (show TAB as ^I), -A (= -vET), -b (number nonempty),
+        // -s (squeeze blank lines), -v (show non-printing as ^X).
+
+        let mut number_all = false;
+        let mut number_nonempty = false;
+        let mut show_ends = false;
+        let mut show_tabs = false;
+        let mut show_nonprint = false;
+        let mut squeeze_blank = false;
+        let mut files: Vec<&str> = Vec::new();
+
+        for arg in args {
+            match arg.as_str() {
+                "-n" => number_all = true,
+                "-b" => number_nonempty = true,
+                "-E" => show_ends = true,
+                "-T" => show_tabs = true,
+                "-v" => show_nonprint = true,
+                "-A" => {
+                    show_ends = true;
+                    show_tabs = true;
+                    show_nonprint = true;
+                }
+                "-e" => {
+                    show_ends = true;
+                    show_nonprint = true;
+                }
+                "-t" => {
+                    show_tabs = true;
+                    show_nonprint = true;
+                }
+                "-s" => squeeze_blank = true,
+                "-" => files.push("-"),
+                a if a.starts_with('-') && a.len() > 1 => {
+                    for c in a[1..].chars() {
+                        match c {
+                            'n' => number_all = true,
+                            'b' => number_nonempty = true,
+                            'E' => show_ends = true,
+                            'T' => show_tabs = true,
+                            'v' => show_nonprint = true,
+                            's' => squeeze_blank = true,
+                            'A' => {
+                                show_ends = true;
+                                show_tabs = true;
+                                show_nonprint = true;
+                            }
+                            'e' => {
+                                show_ends = true;
+                                show_nonprint = true;
+                            }
+                            't' => {
+                                show_tabs = true;
+                                show_nonprint = true;
+                            }
+                            // coreutils cat errors on unknown short
+                            // flag letters (esp. inside combined forms
+                            // like \`-nX\`). Old \`_ => {}\` swallowed.
+                            _ => {
+                                eprintln!("cat: unrecognized option: '-{}'", c);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                _ => files.push(arg),
+            }
+        }
+
+        if files.is_empty() {
+            files.push("-");
+        }
+
+        // Decorate one chunk per cat semantics. Returns the
+        // transformed string with -T / -v / -E applied.
+        let decorate = |s: &str| -> String {
+            if !show_tabs && !show_nonprint && !show_ends {
+                return s.to_string();
+            }
+            let mut out = String::with_capacity(s.len());
+            for c in s.chars() {
+                if c == '\t' {
+                    if show_tabs {
+                        out.push_str("^I");
+                    } else {
+                        out.push('\t');
+                    }
+                    continue;
+                }
+                if c == '\n' {
+                    out.push(c);
+                    continue;
+                }
+                if show_nonprint && (c.is_control() || (c as u32) >= 0x80) {
+                    let code = c as u32;
+                    if code < 0x20 {
+                        out.push('^');
+                        out.push((b'@' + code as u8) as char);
+                    } else if code == 0x7f {
+                        out.push_str("^?");
+                    } else if code < 0x80 {
+                        out.push(c);
+                    } else {
+                        // M- prefix for high-bit chars.
+                        out.push_str("M-");
+                        let lo = code & 0x7f;
+                        if lo < 0x20 {
+                            out.push('^');
+                            out.push((b'@' + lo as u8) as char);
+                        } else {
+                            out.push(char::from_u32(lo).unwrap_or('?'));
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+
+        let mut stdout = io::stdout().lock();
+        let mut line_num = 1usize;
+        let mut prev_blank = false;
+        let any_decoration = number_all
+            || number_nonempty
+            || show_ends
+            || show_tabs
+            || show_nonprint
+            || squeeze_blank;
+
+        for file in files {
+            let result: io::Result<()> = (|| {
+                if !any_decoration {
+                    // Fast path: copy bytes through.
+                    if file == "-" {
+                        let stdin = io::stdin();
+                        let mut handle = stdin.lock();
+                        io::copy(&mut handle, &mut stdout)?;
+                    } else {
+                        let mut f = std::fs::File::open(file).inspect_err(|e| {
+                            eprintln!(
+                                "cat: {}: {}",
+                                file,
+                                crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                            );
+                        })?;
+                        io::copy(&mut f, &mut stdout)?;
+                    }
+                    return Ok(());
+                }
+
+                let reader: Box<dyn BufRead> = if file == "-" {
+                    Box::new(BufReader::new(io::stdin()))
+                } else {
+                    let f = std::fs::File::open(file).inspect_err(|e| {
+                        eprintln!(
+                            "cat: {}: {}",
+                            file,
+                            crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                        );
+                    })?;
+                    Box::new(BufReader::new(f))
+                };
+
+                for line in reader.lines() {
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    let is_blank = line.is_empty();
+                    if squeeze_blank && is_blank && prev_blank {
+                        continue;
+                    }
+                    prev_blank = is_blank;
+
+                    let decorated = decorate(&line);
+                    let suffix = if show_ends { "$" } else { "" };
+                    if number_all || (number_nonempty && !is_blank) {
+                        writeln!(stdout, "{:6}\t{}{}", line_num, decorated, suffix)?;
+                        line_num += 1;
+                    } else {
+                        // -b skips blank-line numbering; both that and the
+                        // unnumbered branch print the decorated text only.
+                        writeln!(stdout, "{}{}", decorated, suffix)?;
+                    }
+                }
+                Ok(())
+            })();
+
+            if result.is_err() {
+                return 1;
+            }
+        }
+        0
+    }
+
+    pub(crate) fn builtin_head(&self, args: &[String]) -> i32 {
+        // -n N: keep first N lines. -n -N: keep all BUT the last N
+        // lines (coreutils extension). Negative is encoded by a
+        // 'skip_last' tail count.
+        let mut lines = 10usize;
+        let mut skip_last_lines: Option<usize> = None;
+        // Some(N) when -c N was given — switches to byte-count mode.
+        let mut bytes: Option<usize> = None;
+        let mut skip_last_bytes: Option<usize> = None;
+        // -q / -v override the default 'header iff >1 file' rule.
+        let mut force_quiet = false;
+        let mut force_verbose = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut i = 0;
+
+        // Parse a count that may be negative; returns (positive_count,
+        // is_skip_last).
+        let parse_count = |s: &str| -> (usize, bool) {
+            if let Some(rest) = s.strip_prefix('-') {
+                (rest.parse().unwrap_or(0), true)
+            } else if let Some(rest) = s.strip_prefix('+') {
+                (rest.parse().unwrap_or(0), false)
+            } else {
+                (s.parse().unwrap_or(0), false)
+            }
+        };
+
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "-n" && i + 1 < args.len() {
+                i += 1;
+                let (n, neg) = parse_count(&args[i]);
+                if neg {
+                    skip_last_lines = Some(n);
+                } else {
+                    lines = n;
+                }
+            } else if let Some(after) = arg.strip_prefix("-n") {
+                let (n, neg) = parse_count(after);
+                if neg {
+                    skip_last_lines = Some(n);
+                } else {
+                    lines = n;
+                }
+            } else if arg == "-c" && i + 1 < args.len() {
+                i += 1;
+                let (n, neg) = parse_count(&args[i]);
+                if neg {
+                    skip_last_bytes = Some(n);
+                } else {
+                    bytes = Some(n);
+                }
+            } else if arg.starts_with("-c") && arg.len() > 2 {
+                let (n, neg) = parse_count(&arg[2..]);
+                if neg {
+                    skip_last_bytes = Some(n);
+                } else {
+                    bytes = Some(n);
+                }
+            } else if arg == "-q" || arg == "--quiet" || arg == "--silent" {
+                force_quiet = true;
+            } else if arg == "-v" || arg == "--verbose" {
+                force_verbose = true;
+            } else if arg.starts_with('-')
+                && arg.len() > 1
+                && arg[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                lines = arg[1..].parse().unwrap_or(10);
+            } else if !arg.starts_with('-') || arg == "-" {
+                files.push(arg);
+            } else if arg == "--" {
+                // end of options — collect rest as files
+                i += 1;
+                while i < args.len() {
+                    files.push(&args[i]);
+                    i += 1;
+                }
+                break;
+            } else {
+                // coreutils head rejects unknown flags. Silent
+                // fall-through made `head -X foo` print foo's first
+                // 10 lines while losing the -X signal.
+                eprintln!("head: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            i += 1;
+        }
+
+        if files.is_empty() {
+            files.push("-");
+        }
+
+        // coreutils: header on iff >1 file. -q forces off, -v forces on.
+        let show_headers = if force_quiet {
+            false
+        } else if force_verbose {
+            true
+        } else {
+            files.len() > 1
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+
+        for (idx, file) in files.iter().enumerate() {
+            if show_headers {
+                if idx > 0 {
+                    let _ = writeln!(out);
+                }
+                let _ = writeln!(out, "==> {} <==", file);
+            }
+
+            if let Some(skip) = skip_last_bytes {
+                // -c -N: read everything, drop last N bytes.
+                let mut reader: Box<dyn Read> = if *file == "-" {
+                    Box::new(std::io::stdin())
+                } else {
+                    match std::fs::File::open(file) {
+                        Ok(f) => Box::new(f),
+                        Err(e) => {
+                            eprintln!(
+                                "head: {}: {}",
+                                file,
+                                crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                            );
+                            return 1;
+                        }
+                    }
+                };
+                let mut buf = Vec::new();
+                let _ = reader.read_to_end(&mut buf);
+                let end = buf.len().saturating_sub(skip);
+                let _ = out.write_all(&buf[..end]);
+                continue;
+            }
+
+            if let Some(n) = bytes {
+                // -c N: byte-count mode. Read up to N bytes and write.
+                let mut reader: Box<dyn Read> = if *file == "-" {
+                    Box::new(std::io::stdin())
+                } else {
+                    match std::fs::File::open(file) {
+                        Ok(f) => Box::new(f),
+                        Err(e) => {
+                            eprintln!(
+                                "head: {}: {}",
+                                file,
+                                crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                            );
+                            return 1;
+                        }
+                    }
+                };
+                let mut buf = vec![0u8; n];
+                let mut total = 0usize;
+                while total < n {
+                    match reader.read(&mut buf[total..]) {
+                        Ok(0) => break,
+                        Ok(k) => total += k,
+                        Err(_) => break,
+                    }
+                }
+                let _ = out.write_all(&buf[..total]);
+                continue;
+            }
+
+            let reader: Box<dyn BufRead> = if *file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!(
+                            "head: {}: {}",
+                            file,
+                            crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                        );
+                        return 1;
+                    }
+                }
+            };
+
+            if let Some(skip) = skip_last_lines {
+                // -n -N: collect all lines, emit all except the last
+                // N. Direct port of coreutils head -n -N.
+                let all: Vec<String> = reader.lines().map_while(Result::ok).collect();
+                let end = all.len().saturating_sub(skip);
+                for line in &all[..end] {
+                    let _ = writeln!(out, "{}", line);
+                }
+            } else {
+                for line in reader.lines().take(lines) {
+                    match line {
+                        Ok(l) => {
+                            let _ = writeln!(out, "{}", l);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    pub(crate) fn builtin_tail(&self, args: &[String]) -> i32 {
+        let mut lines = 10usize;
+        // Some(N) when -c N was given — switches to byte-count mode.
+        let mut bytes: Option<usize> = None;
+        // -n +N / -c +N: start at line/byte N (1-based) instead of
+        // tailing the last N. coreutils extension.
+        let mut start_line: Option<usize> = None;
+        let mut start_byte: Option<usize> = None;
+        let mut force_quiet = false;
+        let mut force_verbose = false;
+        // -f / --follow: after the initial output, keep emitting data
+        // appended to the last named file (polled; handles truncation).
+        let mut follow = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut i = 0;
+
+        let parse_count = |s: &str| -> (usize, bool) {
+            // Returns (count, from_start_flag).
+            if let Some(rest) = s.strip_prefix('+') {
+                (rest.parse().unwrap_or(0), true)
+            } else if let Some(rest) = s.strip_prefix('-') {
+                (rest.parse().unwrap_or(0), false)
+            } else {
+                (s.parse().unwrap_or(0), false)
+            }
+        };
+
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "-n" && i + 1 < args.len() {
+                i += 1;
+                let (n, from_start) = parse_count(&args[i]);
+                if from_start {
+                    start_line = Some(n);
+                } else {
+                    lines = n;
+                }
+            } else if let Some(after) = arg.strip_prefix("-n") {
+                let (n, from_start) = parse_count(after);
+                if from_start {
+                    start_line = Some(n);
+                } else {
+                    lines = n;
+                }
+            } else if arg == "-c" && i + 1 < args.len() {
+                i += 1;
+                let (n, from_start) = parse_count(&args[i]);
+                if from_start {
+                    start_byte = Some(n);
+                } else {
+                    bytes = Some(n);
+                }
+            } else if arg.starts_with("-c") && arg.len() > 2 {
+                let (n, from_start) = parse_count(&arg[2..]);
+                if from_start {
+                    start_byte = Some(n);
+                } else {
+                    bytes = Some(n);
+                }
+            } else if arg == "-q" || arg == "--quiet" || arg == "--silent" {
+                force_quiet = true;
+            } else if arg == "-v" || arg == "--verbose" {
+                force_verbose = true;
+            } else if arg.starts_with('-')
+                && arg.len() > 1
+                && arg[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                lines = arg[1..].parse().unwrap_or(10);
+            } else if !arg.starts_with('-') || arg == "-" {
+                files.push(arg);
+            } else if arg == "--" {
+                i += 1;
+                while i < args.len() {
+                    files.push(&args[i]);
+                    i += 1;
+                }
+                break;
+            } else if arg == "-f" || arg == "--follow" {
+                follow = true;
+            } else {
+                eprintln!("tail: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            i += 1;
+        }
+
+        if files.is_empty() {
+            files.push("-");
+        }
+
+        // coreutils: header on iff >1 file. -q forces off, -v forces on.
+        let show_headers = if force_quiet {
+            false
+        } else if force_verbose {
+            true
+        } else {
+            files.len() > 1
+        };
+
+        for (idx, file) in files.iter().enumerate() {
+            if show_headers {
+                if idx > 0 {
+                    println!();
+                }
+                println!("==> {} <==", file);
+            }
+
+            let mut reader: Box<dyn BufRead> = if *file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!(
+                            "tail: {}: {}",
+                            file,
+                            crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                        );
+                        return 1;
+                    }
+                }
+            };
+
+            if let Some(start) = start_byte {
+                // -c +N: emit from byte N (1-based) onwards.
+                let mut buf = Vec::new();
+                let _ = reader.read_to_end(&mut buf);
+                let s = start.saturating_sub(1).min(buf.len());
+                let stdout = std::io::stdout();
+                let _ = stdout.lock().write_all(&buf[s..]);
+                continue;
+            }
+
+            if let Some(n) = bytes {
+                // Byte-count mode: read everything into a buffer
+                // (tail needs the END), keep last n bytes. Simple
+                // approach matches BSD tail -c.
+                let mut buf = Vec::new();
+                let _ = reader.read_to_end(&mut buf);
+                let start = buf.len().saturating_sub(n);
+                let stdout = std::io::stdout();
+                let _ = stdout.lock().write_all(&buf[start..]);
+                continue;
+            }
+
+            if let Some(start) = start_line {
+                // -n +N: emit from line N (1-based) onwards.
+                // Streams without buffering the whole file.
+                for (i, line) in reader.lines().map_while(Result::ok).enumerate() {
+                    if i + 1 >= start {
+                        println!("{}", line);
+                    }
+                }
+                continue;
+            }
+
+            let mut ring: VecDeque<String> = VecDeque::with_capacity(lines);
+            for line in reader.lines().map_while(Result::ok) {
+                if ring.len() == lines {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+            for line in ring {
+                println!("{}", line);
+            }
+        }
+        if follow {
+            if let Some(path) = files.iter().rev().find(|f| **f != "-") {
+                return Self::tail_follow(path);
+            }
+        }
+        0
+    }
+
+    /// `tail -f` loop: poll `path` for growth and copy new bytes to
+    /// stdout. A shrinking file is treated as truncated and re-read from
+    /// the start. Runs until the process is signalled.
+    fn tail_follow(path: &str) -> i32 {
+        use std::io::{Seek, SeekFrom};
+        let mut pos = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                eprintln!(
+                    "tail: {}: {}",
+                    path,
+                    crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                );
+                return 1;
+            }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let len = match std::fs::metadata(path) {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            if len < pos {
+                pos = 0;
+            }
+            if len == pos {
+                continue;
+            }
+            let Ok(mut f) = std::fs::File::open(path) else {
+                continue;
+            };
+            if f.seek(SeekFrom::Start(pos)).is_err() {
+                continue;
+            }
+            let mut buf = Vec::new();
+            if f.read_to_end(&mut buf).is_err() {
+                continue;
+            }
+            pos += buf.len() as u64;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            if out.write_all(&buf).and_then(|_| out.flush()).is_err() {
+                return 1;
+            }
+        }
+    }
+
+    pub(crate) fn builtin_wc(&self, args: &[String]) -> i32 {
+        let mut count_lines = false;
+        let mut count_words = false;
+        let mut count_bytes = false;
+        let mut count_chars = false;
+        // -L / --max-line-length: width of the longest input line.
+        let mut count_max = false;
+        let mut files: Vec<&str> = Vec::new();
+
+        for arg in args {
+            match arg.as_str() {
+                "-l" => count_lines = true,
+                "-w" => count_words = true,
+                // coreutils wc(1): -c counts BYTES, -m counts unicode
+                // codepoints. Was conflating them — broke wc on
+                // multi-byte input where the user expected -m to
+                // give char counts smaller than the byte count.
+                "-c" => count_bytes = true,
+                "-m" => count_chars = true,
+                "-L" | "--max-line-length" => count_max = true,
+                a if a.starts_with('-') => {
+                    for c in a[1..].chars() {
+                        match c {
+                            'l' => count_lines = true,
+                            'w' => count_words = true,
+                            'c' => count_bytes = true,
+                            'm' => count_chars = true,
+                            'L' => count_max = true,
+                            // coreutils wc errors on unknown short
+                            // flags. \`wc -lXw foo\` previously counted
+                            // lines+words while ignoring -X.
+                            _ => {
+                                eprintln!("wc: unrecognized option: '-{}'", c);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                _ => files.push(arg),
+            }
+        }
+
+        if !count_lines && !count_words && !count_bytes && !count_chars && !count_max {
+            count_lines = true;
+            count_words = true;
+            count_bytes = true;
+        }
+
+        if files.is_empty() {
+            files.push("-");
+        }
+
+        let mut total_lines = 0usize;
+        let mut total_words = 0usize;
+        let mut total_bytes = 0usize;
+        let mut total_chars = 0usize;
+        let mut total_max = 0usize;
+
+        for file in &files {
+            let reader: Box<dyn BufRead> = if *file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!(
+                            "wc: {}: {}",
+                            file,
+                            crate::ported::compat::strerror(e.raw_os_error().unwrap_or(0))
+                        );
+                        return 1;
+                    }
+                }
+            };
+
+            let mut lines = 0usize;
+            let mut words = 0usize;
+            let mut bytes = 0usize;
+            let mut chars = 0usize;
+            let mut max_line: usize = 0;
+
+            // POSIX wc: -l counts NEWLINE characters (a final line
+            // without `\n` adds no line), -c counts raw bytes. The
+            // previous `reader.lines()` loop stripped `\n`/`\r\n`
+            // and re-added a flat `+1` per line — `printf "\r" |
+            // wc -c` reported 2 (1 content byte + phantom newline)
+            // where wc(1) reports 1, and CRLF input undercounted.
+            // Stream raw bytes: count `\n` for lines, UTF-8 lead
+            // bytes (non-0x80-continuation) for -m chars, ASCII
+            // isspace transitions for words.
+            let mut rdr = reader;
+            let mut in_word = false;
+            let mut cur_line_len = 0usize;
+            let mut chunk = [0u8; 65536];
+            loop {
+                let n = match rdr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                bytes += n;
+                for &b in &chunk[..n] {
+                    let is_lead = (b & 0xC0) != 0x80;
+                    if is_lead {
+                        chars += 1;
+                    }
+                    if b == b'\n' {
+                        lines += 1;
+                        if cur_line_len > max_line {
+                            max_line = cur_line_len;
+                        }
+                        cur_line_len = 0;
+                    } else if is_lead {
+                        cur_line_len += 1;
+                    }
+                    if matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+                        in_word = false;
+                    } else if !in_word {
+                        in_word = true;
+                        words += 1;
+                    }
+                }
+            }
+            if cur_line_len > max_line {
+                max_line = cur_line_len;
+            }
+
+            total_lines += lines;
+            total_words += words;
+            total_bytes += bytes;
+            total_chars += chars;
+            if max_line > total_max {
+                total_max = max_line;
+            }
+
+            let mut out = String::new();
+            if count_lines {
+                out.push_str(&format!("{:8}", lines));
+            }
+            if count_words {
+                out.push_str(&format!("{:8}", words));
+            }
+            if count_bytes {
+                out.push_str(&format!("{:8}", bytes));
+            }
+            if count_chars {
+                out.push_str(&format!("{:8}", chars));
+            }
+            if count_max {
+                out.push_str(&format!("{:8}", max_line));
+            }
+            if *file != "-" {
+                out.push_str(&format!(" {}", file));
+            }
+            // BSD wc (what zsh uses on macOS) preserves the 8-char
+            // right-aligned padding even on stdin output. trim_start
+            // here was stripping it; output then differed from zsh.
+            println!("{}", out);
+        }
+
+        if files.len() > 1 {
+            let mut out = String::new();
+            if count_lines {
+                out.push_str(&format!("{:8}", total_lines));
+            }
+            if count_words {
+                out.push_str(&format!("{:8}", total_words));
+            }
+            if count_bytes {
+                out.push_str(&format!("{:8}", total_bytes));
+            }
+            if count_chars {
+                out.push_str(&format!("{:8}", total_chars));
+            }
+            if count_max {
+                out.push_str(&format!("{:8}", total_max));
+            }
+            out.push_str(" total");
+            println!("{}", out.trim_start());
+        }
+        0
+    }
+
+    pub(crate) fn builtin_basename(&self, args: &[String]) -> i32 {
+        // coreutils basename(1) port. Adds:
+        // - -a / --multiple: every operand is a path (suffix not
+        //   consumed positionally).
+        // - -s SUFFIX: implies -a, supplies suffix to strip.
+        // - -z / --zero: NUL-terminate output.
+        if args.is_empty() {
+            eprintln!("basename: missing operand");
+            return 1;
+        }
+        let mut multiple = false;
+        let mut suffix: Option<String> = None;
+        let mut zero = false;
+        let mut positional: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-a" | "--multiple" => multiple = true,
+                "-s" | "--suffix" => {
+                    if let Some(s) = iter.next() {
+                        suffix = Some(s.clone());
+                        multiple = true;
+                    }
+                }
+                "-z" | "--zero" => zero = true,
+                "--" => {} // accept end-of-options
+                s if s.starts_with("-s") && s.len() > 2 => {
+                    suffix = Some(s[2..].to_string());
+                    multiple = true;
+                }
+                s if s.starts_with('-') && s.len() > 1 => {
+                    // coreutils basename rejects unknown flags. Old
+                    // silent-ignore made `basename -Z foo` succeed
+                    // returning `foo` while losing the -Z signal.
+                    eprintln!("basename: unrecognized option: '{}'", s);
+                    return 1;
+                }
+                s => positional.push(s),
+            }
+        }
+        if positional.is_empty() {
+            eprintln!("basename: missing operand");
+            return 1;
+        }
+        // Without -a / -s, the legacy 2-arg form: NAME [SUFFIX]
+        // applies the second operand as a suffix to strip from the
+        // first.
+        let term = if zero { '\0' } else { '\n' };
+        let strip_suffix = |name: &mut String, suf: &str| {
+            if name.ends_with(suf) && name.len() > suf.len() {
+                let new_len = name.len() - suf.len();
+                name.truncate(new_len);
+            }
+        };
+        let basename = |path: &str| -> String {
+            let trimmed = path.trim_end_matches('/');
+            let t = if trimmed.is_empty() { path } else { trimmed };
+            std::path::Path::new(t)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string())
+        };
+        if multiple {
+            for p in &positional {
+                let mut name = basename(p);
+                if let Some(ref s) = suffix {
+                    strip_suffix(&mut name, s);
+                }
+                print!("{}{}", name, term);
+            }
+        } else {
+            let path = positional[0];
+            let arg_suffix = positional.get(1).copied();
+            let mut name = basename(path);
+            if let Some(s) = arg_suffix {
+                strip_suffix(&mut name, s);
+            }
+            print!("{}{}", name, term);
+        }
+        0
+    }
+
+    pub(crate) fn builtin_dirname(&self, args: &[String]) -> i32 {
+        // coreutils dirname(1) port. Strip flags before walking
+        // operands, support -z / --zero (NUL-terminate output
+        // instead of newline).
+        if args.is_empty() {
+            eprintln!("dirname: missing operand");
+            return 1;
+        }
+        let mut zero = false;
+        let mut paths: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.as_str() {
+                "-z" | "--zero" => zero = true,
+                "--" => {} // accept end-of-options
+                s if s.starts_with('-') && s.len() > 1 => {
+                    // coreutils dirname rejects unknown flags with
+                    // \"unrecognized option\" exit 1. Silent-ignore
+                    // masked typos like \`dirname -Z foo\` (typo of -z).
+                    eprintln!("dirname: unrecognized option: '{}'", s);
+                    return 1;
+                }
+                s => paths.push(s),
+            }
+        }
+        if paths.is_empty() {
+            eprintln!("dirname: missing operand");
+            return 1;
+        }
+        let term = if zero { '\0' } else { '\n' };
+        for path in paths {
+            // POSIX dirname: trailing '/' chars on a non-root path
+            // collapse; '/foo' → '/'; 'foo' → '.'.
+            let trimmed: &str = if path.is_empty() {
+                "."
+            } else {
+                let t = path.trim_end_matches('/');
+                if t.is_empty() {
+                    "/"
+                } else {
+                    t
+                }
+            };
+            let dir = std::path::Path::new(trimmed)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            let out = if dir.is_empty() { ".".to_string() } else { dir };
+            print!("{}{}", out, term);
+        }
+        0
+    }
+
+    pub(crate) fn builtin_touch(&self, args: &[String]) -> i32 {
+        // coreutils touch(1) port: -a/-m, -c (no create), -r REF
+        // (copy times from REF), -t [[CC]YY]MMDDhhmm[.SS] (POSIX
+        // timestamp, local time). -d / -h are rejected as
+        // unrecognized — they need date-string parsing through
+        // reverse_strftime.
+
+        if args.is_empty() {
+            eprintln!("touch: missing file operand");
+            return 1;
+        }
+
+        let mut atime_only = false;
+        let mut mtime_only = false;
+        let mut no_create = false;
+        let mut reference: Option<String> = None;
+        let mut stamp: Option<String> = None;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-a" => atime_only = true,
+                "-m" => mtime_only = true,
+                "-c" | "--no-create" => no_create = true,
+                "-r" | "--reference" => {
+                    if let Some(r) = iter.next() {
+                        reference = Some(r.clone());
+                    }
+                }
+                "-t" => match iter.next() {
+                    Some(t) => stamp = Some(t.clone()),
+                    None => {
+                        eprintln!("touch: option requires an argument: '-t'");
+                        return 1;
+                    }
+                },
+                "--" => {} // accept; remaining are files
+                s if s.starts_with('-') && s.len() > 1 => {
+                    // -ac, -am combos: walk chars.
+                    for c in s[1..].chars() {
+                        match c {
+                            'a' => atime_only = true,
+                            'm' => mtime_only = true,
+                            'c' => no_create = true,
+                            // coreutils touch errors on unknown flag
+                            // letters (esp. inside combined forms like
+                            // \`-amX\`). Old \`_ => {}\` swallowed.
+                            _ => {
+                                eprintln!("touch: unrecognized option: '-{}'", c);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                _ => files.push(arg),
+            }
+        }
+
+        // -t [[CC]YY]MMDDhhmm[.SS] — POSIX touch(1) timestamp,
+        // interpreted in local time. YY 69-99 → 19YY, 00-68 → 20YY
+        // (POSIX rule); 8-digit form defaults to the current year.
+        fn parse_t_stamp(s: &str) -> Option<filetime::FileTime> {
+            let (main, ss) = match s.split_once('.') {
+                Some((m, sec)) => (m, sec.parse::<u32>().ok()?),
+                None => (s, 0u32),
+            };
+            if !main.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let (year, rest): (i32, &str) = match main.len() {
+                12 => (main[..4].parse().ok()?, &main[4..]),
+                10 => {
+                    let yy: i32 = main[..2].parse().ok()?;
+                    (if yy >= 69 { 1900 + yy } else { 2000 + yy }, &main[2..])
+                }
+                8 => (chrono::Local::now().year(), main),
+                _ => return None,
+            };
+            let month: u32 = rest[..2].parse().ok()?;
+            let day: u32 = rest[2..4].parse().ok()?;
+            let hour: u32 = rest[4..6].parse().ok()?;
+            let min: u32 = rest[6..8].parse().ok()?;
+            let dt = chrono::Local
+                .with_ymd_and_hms(year, month, day, hour, min, ss)
+                .single()?;
+            Some(filetime::FileTime::from_unix_time(dt.timestamp(), 0))
+        }
+
+        // Determine the target times: from -t STAMP, -r REF, or now.
+        let (target_atime, target_mtime) = if let Some(ref st) = stamp {
+            match parse_t_stamp(st) {
+                Some(ft) => (ft, ft),
+                None => {
+                    eprintln!("touch: out of range or illegal time specification: {}", st);
+                    return 1;
+                }
+            }
+        } else if let Some(ref refpath) = reference {
+            match std::fs::metadata(refpath) {
+                Ok(meta) => (
+                    filetime::FileTime::from_last_access_time(&meta),
+                    filetime::FileTime::from_last_modification_time(&meta),
+                ),
+                Err(e) => {
+                    eprintln!("touch: {}: {}", refpath, e);
+                    return 1;
+                }
+            }
+        } else {
+            let ft = filetime::FileTime::from_system_time(std::time::SystemTime::now());
+            (ft, ft)
+        };
+
+        let mut status = 0;
+        for file in files {
+            let path = std::path::Path::new(file);
+            if !path.exists() {
+                if no_create {
+                    continue;
+                }
+                if let Err(e) = OpenOptions::new()
+                    .create(true)
+                    .truncate(false) // touch only updates mtime; never truncates
+                    .write(true)
+                    .open(path)
+                {
+                    eprintln!("touch: {}: {}", file, e);
+                    status = 1;
+                    continue;
+                }
+            }
+            // Write times: -a → atime only, -m → mtime only,
+            // neither → both.
+            let result = if atime_only && !mtime_only {
+                filetime::set_file_atime(path, target_atime)
+            } else if mtime_only && !atime_only {
+                filetime::set_file_mtime(path, target_mtime)
+            } else {
+                filetime::set_file_times(path, target_atime, target_mtime)
+            };
+            if let Err(e) = result {
+                eprintln!("touch: {}: {}", file, e);
+                status = 1;
+            }
+        }
+        status
+    }
+
+    /// realpath [-eLmPqsz] [--relative-to=DIR] [--relative-base=DIR] FILE...
+    /// — coreutils realpath(1). Default: every component but the last
+    /// must exist; `-e` requires all, `-m` none. `-s` leaves symlinks
+    /// unexpanded, `-L` folds `..` textually before expanding symlinks,
+    /// `-P` (default) expands as it walks.
+    pub(crate) fn builtin_realpath(&self, args: &[String]) -> i32 {
+        let mut quiet = false;
+        let mut need = RealpathNeed::AllButLast;
+        let mut logical = false;
+        let mut nosym = false;
+        let mut zero = false;
+        let mut rel_to: Option<String> = None;
+        let mut rel_base: Option<String> = None;
+        let mut paths: Vec<&str> = Vec::new();
+        let mut opts_done = false;
+        let mut it = args.iter();
+        while let Some(arg) = it.next() {
+            let a = arg.as_str();
+            if opts_done || a == "-" || !a.starts_with('-') {
+                paths.push(a);
+            } else if a == "--" {
+                opts_done = true;
+            } else if let Some(long) = a.strip_prefix("--") {
+                match long {
+                    "quiet" => quiet = true,
+                    "canonicalize-existing" => need = RealpathNeed::All,
+                    "canonicalize-missing" => need = RealpathNeed::Nothing,
+                    "strip" | "no-symlinks" => nosym = true,
+                    "logical" => {
+                        logical = true;
+                        nosym = false;
+                    }
+                    "physical" => {
+                        logical = false;
+                        nosym = false;
+                    }
+                    "zero" => zero = true,
+                    "relative-to" | "relative-base" => {
+                        let Some(v) = it.next() else {
+                            eprintln!("realpath: option '--{}' requires an argument", long);
+                            return 1;
+                        };
+                        if long == "relative-to" {
+                            rel_to = Some(v.clone());
+                        } else {
+                            rel_base = Some(v.clone());
+                        }
+                    }
+                    _ => {
+                        if let Some(v) = long.strip_prefix("relative-to=") {
+                            rel_to = Some(v.to_string());
+                        } else if let Some(v) = long.strip_prefix("relative-base=") {
+                            rel_base = Some(v.to_string());
+                        } else {
+                            eprintln!("realpath: unrecognized option '{}'", a);
+                            return 1;
+                        }
+                    }
+                }
+            } else {
+                for ch in a[1..].chars() {
+                    match ch {
+                        'q' => quiet = true,
+                        'e' => need = RealpathNeed::All,
+                        'm' => need = RealpathNeed::Nothing,
+                        's' => nosym = true,
+                        'L' => {
+                            logical = true;
+                            nosym = false;
+                        }
+                        'P' => {
+                            logical = false;
+                            nosym = false;
+                        }
+                        'z' => zero = true,
+                        _ => {
+                            eprintln!("realpath: invalid option -- '{}'", ch);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        if paths.is_empty() {
+            eprintln!("realpath: missing operand");
+            return 1;
+        }
+
+        let errtext = |e: &io::Error| {
+            let s = e.to_string();
+            s.split(" (os error").next().unwrap_or(&s).to_string()
+        };
+        // The relative-to / relative-base directories must exist.
+        let resolve_dir = |d: &str| -> Result<std::path::PathBuf, i32> {
+            match realpath_canonicalize(std::path::Path::new(d), RealpathNeed::All, logical, nosym) {
+                Ok(p) => Ok(p),
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("realpath: {}: {}", d, errtext(&e));
+                    }
+                    Err(1)
+                }
+            }
+        };
+        let rel_to_dir = match rel_to.as_deref().map(resolve_dir).transpose() {
+            Ok(v) => v,
+            Err(s) => return s,
+        };
+        let rel_base_dir = match rel_base.as_deref().map(resolve_dir).transpose() {
+            Ok(v) => v,
+            Err(s) => return s,
+        };
+
+        let term = if zero { '\0' } else { '\n' };
+        let mut status = 0;
+        for path in &paths {
+            match realpath_canonicalize(std::path::Path::new(path), need, logical, nosym) {
+                Ok(abs) => {
+                    // coreutils: with --relative-base, a path outside the
+                    // base stays absolute; otherwise --relative-to (or the
+                    // base itself) picks the directory printed against.
+                    let base = rel_to_dir.as_ref().or(rel_base_dir.as_ref());
+                    let inside_base = rel_base_dir.as_ref().is_none_or(|b| {
+                        abs.starts_with(b) && rel_to_dir.as_ref().is_none_or(|t| t.starts_with(b))
+                    });
+                    match base {
+                        Some(b) if inside_base => print!("{}{}", realpath_relative_to(&abs, b), term),
+                        _ => print!("{}{}", abs.display(), term),
+                    }
+                }
+                Err(e) => {
+                    if !quiet {
+                        eprintln!("realpath: {}: {}", path, errtext(&e));
+                    }
+                    status = 1;
+                }
+            }
+        }
+        status
+    }
+
+    pub(crate) fn builtin_sort(&self, args: &[String]) -> i32 {
+        // coreutils sort(1) port — adds case-fold (-f), field
+        // selection (-k N), custom separator (-t C) on top of the
+        // existing -n / -r / -u handling.
+
+        let mut reverse = false;
+        let mut numeric = false;
+        let mut unique = false;
+        let mut fold = false;
+        // -h / --human-numeric-sort: 1K / 5M / 2G suffix-aware compare.
+        let mut human_numeric = false;
+        // -V / --version-sort: natural (1, 2, 10) instead of (1, 10, 2).
+        let mut version_sort = false;
+        // -R / --random-sort: random shuffle.
+        let mut random_sort = false;
+        // -z / --zero-terminated: input records separated by NUL.
+        let mut zero_term = false;
+        // -b / --ignore-leading-blanks: strip leading whitespace
+        // before comparing.
+        let mut ignore_blanks = false;
+        // -d / --dictionary-order: only [a-zA-Z0-9 \\t] are significant
+        // for comparison; everything else folds to nothing.
+        let mut dictionary = false;
+        // -c / --check: verify input is sorted; don't write output.
+        let mut check_only = false;
+        // -k FIELD: sort by field N (1-based, N-M range).
+        let mut key_start: Option<usize> = None;
+        let mut key_end: Option<usize> = None;
+        // -t C: field separator. Default is run-of-whitespace.
+        let mut sep: Option<char> = None;
+        let mut files: Vec<&str> = Vec::new();
+
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "-r" | "--reverse" => reverse = true,
+                "-n" | "--numeric-sort" => numeric = true,
+                "-u" | "--unique" => unique = true,
+                "-f" | "--ignore-case" => fold = true,
+                "-h" | "--human-numeric-sort" => human_numeric = true,
+                "-V" | "--version-sort" => version_sort = true,
+                "-R" | "--random-sort" => random_sort = true,
+                "-z" | "--zero-terminated" => zero_term = true,
+                "-b" | "--ignore-leading-blanks" => ignore_blanks = true,
+                "-d" | "--dictionary-order" => dictionary = true,
+                "-c" | "--check" => check_only = true,
+                "-k" if i + 1 < args.len() => {
+                    i += 1;
+                    if let Some((a, b)) = args[i].split_once(',') {
+                        key_start = a.split('.').next().and_then(|s| s.parse().ok());
+                        key_end = b.split('.').next().and_then(|s| s.parse().ok());
+                    } else {
+                        key_start = args[i].split('.').next().and_then(|s| s.parse().ok());
+                    }
+                }
+                "-t" if i + 1 < args.len() => {
+                    i += 1;
+                    sep = args[i].chars().next();
+                }
+                a if a.starts_with("-k") && a.len() > 2 => {
+                    let s = &a[2..];
+                    if let Some((aa, bb)) = s.split_once(',') {
+                        key_start = aa.split('.').next().and_then(|s| s.parse().ok());
+                        key_end = bb.split('.').next().and_then(|s| s.parse().ok());
+                    } else {
+                        key_start = s.split('.').next().and_then(|s| s.parse().ok());
+                    }
+                }
+                a if a.starts_with("-t") && a.len() > 2 => {
+                    sep = a.chars().nth(2);
+                }
+                a if a.starts_with('-') && a.len() > 1 => {
+                    for c in a[1..].chars() {
+                        match c {
+                            'r' => reverse = true,
+                            'n' => numeric = true,
+                            'u' => unique = true,
+                            'f' => fold = true,
+                            'h' => human_numeric = true,
+                            'V' => version_sort = true,
+                            'R' => random_sort = true,
+                            'z' => zero_term = true,
+                            'b' => ignore_blanks = true,
+                            'd' => dictionary = true,
+                            'c' => check_only = true,
+                            // coreutils sort errors on unknown short
+                            // flags. Old `_ => {}` masked typos like
+                            // `sort -X` (treating it as a no-op).
+                            _ => {
+                                eprintln!("sort: unrecognized option: '-{}'", c);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                _ => files.push(arg),
+            }
+            i += 1;
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        if zero_term {
+            // Read raw bytes, split on NUL.
+            let mut buf = Vec::new();
+            if files.is_empty() {
+                let _ = std::io::stdin().read_to_end(&mut buf);
+            } else {
+                for file in &files {
+                    match std::fs::File::open(file) {
+                        Ok(mut f) => {
+                            let _ = f.read_to_end(&mut buf);
+                        }
+                        Err(e) => {
+                            eprintln!("sort: {}: {}", file, e);
+                            return 1;
+                        }
+                    }
+                }
+            }
+            for chunk in buf.split(|b| *b == 0) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                lines.push(String::from_utf8_lossy(chunk).into_owned());
+            }
+        } else if files.is_empty() {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines().map_while(Result::ok) {
+                lines.push(line);
+            }
+        } else {
+            for file in files {
+                match std::fs::File::open(file) {
+                    Ok(f) => {
+                        for line in BufReader::new(f).lines().map_while(Result::ok) {
+                            lines.push(line);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("sort: {}: {}", file, e);
+                        return 1;
+                    }
+                }
+            }
+        }
+
+        // Extract the sort key from a line per -k/-t/-b/-d. Returns
+        // the selected fields joined back with the separator (or just
+        // the line when -k is absent), then optionally trimmed
+        // (-b) and dictionary-filtered (-d).
+        let extract_key = |line: &str| -> String {
+            let raw = match key_start {
+                Some(s) if s >= 1 => {
+                    let start = s - 1;
+                    let parts: Vec<&str> = match sep {
+                        Some(c) => line.split(c).collect(),
+                        None => line.split_whitespace().collect(),
+                    };
+                    let end = key_end
+                        .map(|e| e.saturating_sub(1).min(parts.len().saturating_sub(1)))
+                        .unwrap_or_else(|| parts.len().saturating_sub(1));
+                    if start >= parts.len() {
+                        String::new()
+                    } else {
+                        let sep_str = sep
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| " ".to_string());
+                        parts[start..=end].join(&sep_str)
+                    }
+                }
+                _ => line.to_string(),
+            };
+            let blanks_stripped: String = if ignore_blanks {
+                raw.trim_start().to_string()
+            } else {
+                raw
+            };
+            if dictionary {
+                // Keep alnum + space/tab; drop everything else for
+                // comparison. Direct port of coreutils sort -d.
+                blanks_stripped
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '\t')
+                    .collect()
+            } else {
+                blanks_stripped
+            }
+        };
+
+        // -h: parse '5K', '2.5M', '1G' etc. into an f64 with the
+        // suffix multiplier. Direct port of coreutils sort -h.
+        fn human_value(s: &str) -> f64 {
+            let s = s.trim();
+            // Strip optional leading '+'/'-' and a numeric prefix.
+            let mut end = 0;
+            let mut seen_dot = false;
+            for (i, c) in s.char_indices() {
+                if i == 0 && (c == '+' || c == '-') {
+                    end = c.len_utf8();
+                    continue;
+                }
+                if c.is_ascii_digit() {
+                    end = i + c.len_utf8();
+                } else if c == '.' && !seen_dot {
+                    seen_dot = true;
+                    end = i + c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let num: f64 = s[..end].parse().unwrap_or(0.0);
+            let suffix = s[end..].chars().next();
+            let mult = match suffix {
+                Some('K') | Some('k') => 1_024.0,
+                Some('M') => 1_048_576.0,
+                Some('G') => 1_073_741_824.0,
+                Some('T') => 1_099_511_627_776.0,
+                Some('P') => 1_125_899_906_842_624.0,
+                _ => 1.0,
+            };
+            num * mult
+        }
+        // -V: split into runs of (non-digit, digit) and compare
+        // pairwise. Direct port of coreutils sort -V.
+        fn version_compare(a: &str, b: &str) -> std::cmp::Ordering {
+            let mut ai = a.chars().peekable();
+            let mut bi = b.chars().peekable();
+            loop {
+                // Compare leading non-digit prefixes lexically.
+                let (mut as_pre, mut bs_pre) = (String::new(), String::new());
+                while let Some(&c) = ai.peek() {
+                    if c.is_ascii_digit() {
+                        break;
+                    }
+                    as_pre.push(c);
+                    ai.next();
+                }
+                while let Some(&c) = bi.peek() {
+                    if c.is_ascii_digit() {
+                        break;
+                    }
+                    bs_pre.push(c);
+                    bi.next();
+                }
+                let pre_cmp = as_pre.cmp(&bs_pre);
+                if pre_cmp != std::cmp::Ordering::Equal {
+                    return pre_cmp;
+                }
+                // Compare the digit run as integers.
+                let mut as_num = String::new();
+                let mut bs_num = String::new();
+                while let Some(&c) = ai.peek() {
+                    if !c.is_ascii_digit() {
+                        break;
+                    }
+                    as_num.push(c);
+                    ai.next();
+                }
+                while let Some(&c) = bi.peek() {
+                    if !c.is_ascii_digit() {
+                        break;
+                    }
+                    bs_num.push(c);
+                    bi.next();
+                }
+                if as_num.is_empty() && bs_num.is_empty() {
+                    return std::cmp::Ordering::Equal;
+                }
+                let an: u128 = as_num.parse().unwrap_or(0);
+                let bn: u128 = bs_num.parse().unwrap_or(0);
+                let num_cmp = an.cmp(&bn);
+                if num_cmp != std::cmp::Ordering::Equal {
+                    return num_cmp;
+                }
+            }
+        }
+        // Locale-collating compare, mirroring src/ported/sort.rs:246-253
+        // (truncate at first NUL, then libc::strcoll).
+        fn strcoll_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+            #[cfg(unix)]
+            {
+                let cstr_head = |s: &str| -> std::ffi::CString {
+                    let bs = s.as_bytes();
+                    let n = bs.iter().position(|&x| x == 0).unwrap_or(bs.len());
+                    std::ffi::CString::new(&bs[..n])
+                        .unwrap_or_else(|_| std::ffi::CString::new(vec![0u8]).expect("nul"))
+                };
+                let ca = cstr_head(a);
+                let cb = cstr_head(b);
+                let r = unsafe { libc::strcoll(ca.as_ptr(), cb.as_ptr()) };
+                r.cmp(&0)
+            }
+            #[cfg(not(unix))]
+            {
+                a.cmp(b)
+            }
+        }
+        let cmp_keys = |a: &str, b: &str| -> std::cmp::Ordering {
+            let ka = extract_key(a);
+            let kb = extract_key(b);
+            if version_sort {
+                version_compare(&ka, &kb)
+            } else if human_numeric {
+                human_value(&ka)
+                    .partial_cmp(&human_value(&kb))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            } else if numeric {
+                // sort(1) -n converts via strtod: the LEADING numeric
+                // prefix counts, trailing text is ignored ("5.txt" →
+                // 5, "10.txt" → 10). Whole-token parse() failed on
+                // any suffix and collapsed everything to 0.0.
+                let numeric_prefix = |s: &str| -> f64 {
+                    let s = s.trim_start();
+                    let mut end = 0;
+                    let mut seen_dot = false;
+                    for (i, c) in s.char_indices() {
+                        if i == 0 && (c == '+' || c == '-') {
+                            end = c.len_utf8();
+                        } else if c.is_ascii_digit() {
+                            end = i + c.len_utf8();
+                        } else if c == '.' && !seen_dot {
+                            seen_dot = true;
+                        } else {
+                            break;
+                        }
+                    }
+                    // A bare sign or dot with no digits parses as 0,
+                    // matching strtod's no-conversion result.
+                    s[..end].parse().unwrap_or(0.0)
+                };
+                let na = numeric_prefix(&ka);
+                let nb = numeric_prefix(&kb);
+                na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+            } else if fold {
+                strcoll_cmp(&ka.to_lowercase(), &kb.to_lowercase())
+            } else {
+                // sort(1) compares with strcoll under LC_COLLATE
+                // (POSIX: "comparisons ... based on the collating
+                // sequence of the current locale"). Byte-order
+                // ka.cmp(&kb) diverged from /usr/bin/sort whenever
+                // LC_ALL/LC_COLLATE is a non-C locale ("X" < "baz"
+                // bytewise, "baz" < "X" in en_US.UTF-8). setlocale
+                // (LC_ALL, "") runs at startup (vm_helper.rs), so
+                // strcoll sees the user's locale — same pattern as
+                // the zsh-sort port at src/ported/sort.rs:253.
+                strcoll_cmp(&ka, &kb)
+            }
+        };
+
+        // -c / --check: report whether input is sorted; never write
+        // sorted output. Direct port of coreutils sort -c. Returns 1
+        // (and prints diagnostic) on first out-of-order pair.
+        if check_only {
+            for w in lines.windows(2) {
+                if cmp_keys(&w[0], &w[1]) == std::cmp::Ordering::Greater {
+                    eprintln!("sort: -:?: disorder: {}", w[1]);
+                    return 1;
+                }
+            }
+            return 0;
+        }
+
+        if random_sort {
+            // -R: coreutils random sort — each line sorts by a hash of
+            // (per-run random salt, line), so identical lines stay
+            // adjacent and the permutation changes per run.
+            let salt = rand::thread_rng().gen::<u128>().to_ne_bytes();
+            let mut keyed: Vec<([u8; 32], String)> = lines
+                .drain(..)
+                .map(|l| {
+                    let mut h = Sha256::new();
+                    h.update(salt);
+                    h.update(l.as_bytes());
+                    (h.finalize().into(), l)
+                })
+                .collect();
+            keyed.sort_by(|(ha, a), (hb, b)| ha.cmp(hb).then_with(|| cmp_keys(a, b)));
+            lines = keyed.into_iter().map(|(_, l)| l).collect();
+        } else {
+            lines.sort_by(|a, b| cmp_keys(a, b));
+        }
+
+        if reverse {
+            lines.reverse();
+        }
+        if unique {
+            lines.dedup();
+        }
+
+        let term = if zero_term { '\0' } else { '\n' };
+        for line in lines {
+            print!("{}{}", line, term);
+        }
+        0
+    }
+
+    pub(crate) fn builtin_find(&self, args: &[String]) -> i32 {
+        find_impl(args)
+    }
+
+    pub(crate) fn builtin_uniq(&self, args: &[String]) -> i32 {
+        let mut count = false;
+        let mut repeated = false;
+        let mut unique_only = false;
+        let mut ignore_case = false;
+        // -z / --zero-terminated: input/output records separated by
+        // NUL instead of \\n. coreutils extension; useful with
+        // 'find -print0 | sort -z | uniq -z'.
+        let mut zero_term = false;
+        // -f N / --skip-fields=N: skip the first N whitespace-
+        // separated fields when comparing.
+        let mut skip_fields: usize = 0;
+        // -s N / --skip-chars=N: skip N chars after the field-skip
+        // before comparing.
+        let mut skip_chars: usize = 0;
+        let mut files: Vec<&str> = Vec::new();
+
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-c" | "--count" => count = true,
+                "-d" | "--repeated" => repeated = true,
+                "-u" | "--unique" => unique_only = true,
+                "-i" | "--ignore-case" => ignore_case = true,
+                "-z" | "--zero-terminated" => zero_term = true,
+                "-f" | "--skip-fields" => {
+                    if let Some(n) = iter.next() {
+                        skip_fields = n.parse().unwrap_or(0);
+                    }
+                }
+                "-s" | "--skip-chars" => {
+                    if let Some(n) = iter.next() {
+                        skip_chars = n.parse().unwrap_or(0);
+                    }
+                }
+                s if s.starts_with("-f") && s.len() > 2 => {
+                    skip_fields = s[2..].parse().unwrap_or(0);
+                }
+                s if s.starts_with("-s") && s.len() > 2 => {
+                    skip_chars = s[2..].parse().unwrap_or(0);
+                }
+                a if !a.starts_with('-') => files.push(a),
+                "-" => files.push("-"),
+                s => {
+                    // coreutils uniq rejects unknown flags. Old `_ => {}`
+                    // accepted any -X letter silently.
+                    eprintln!("uniq: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+
+        let reader: Box<dyn BufRead> = if files.is_empty() || files[0] == "-" {
+            Box::new(BufReader::new(std::io::stdin()))
+        } else {
+            match std::fs::File::open(files[0]) {
+                Ok(f) => Box::new(BufReader::new(f)),
+                Err(e) => {
+                    eprintln!("uniq: {}: {}", files[0], e);
+                    return 1;
+                }
+            }
+        };
+
+        let mut prev: Option<String> = None;
+        let mut cnt = 0usize;
+        let key = |s: &str| -> String {
+            // -f / -s: drop leading fields then leading chars before
+            // comparing. Field separator is whitespace.
+            let mut tail = s;
+            for _ in 0..skip_fields {
+                let trimmed = tail.trim_start();
+                let after_field = trimmed
+                    .find(|c: char| c.is_whitespace())
+                    .map(|i| &trimmed[i..])
+                    .unwrap_or("");
+                tail = after_field;
+            }
+            let after_chars: String = tail.chars().skip(skip_chars).collect();
+            if ignore_case {
+                after_chars.to_lowercase()
+            } else {
+                after_chars
+            }
+        };
+        let term = if zero_term { '\0' } else { '\n' };
+        let emit = |p: &str, cnt: usize| {
+            if repeated && cnt <= 1 {
+                return;
+            }
+            if unique_only && cnt > 1 {
+                return;
+            }
+            if count {
+                print!("{:7} {}{}", cnt, p, term);
+            } else {
+                print!("{}{}", p, term);
+            }
+        };
+
+        // -z: treat NUL as record separator. Otherwise BufRead::lines
+        // splits on \n.
+        if zero_term {
+            let mut buf = Vec::new();
+            let mut reader = reader;
+            let _ = reader.read_to_end(&mut buf);
+            for chunk in buf.split(|b| *b == 0) {
+                let line = String::from_utf8_lossy(chunk).into_owned();
+                if line.is_empty() && chunk.is_empty() {
+                    continue;
+                }
+                if prev.as_ref().map(|p| key(p)) == Some(key(&line)) {
+                    cnt += 1;
+                } else {
+                    if let Some(p) = prev.take() {
+                        emit(&p, cnt);
+                    }
+                    prev = Some(line);
+                    cnt = 1;
+                }
+            }
+        } else {
+            for line in reader.lines().map_while(Result::ok) {
+                if prev.as_ref().map(|p| key(p)) == Some(key(&line)) {
+                    cnt += 1;
+                } else {
+                    if let Some(p) = prev.take() {
+                        emit(&p, cnt);
+                    }
+                    prev = Some(line);
+                    cnt = 1;
+                }
+            }
+        }
+
+        if let Some(p) = prev {
+            emit(&p, cnt);
+        }
+        0
+    }
+
+    pub(crate) fn builtin_cut(&self, args: &[String]) -> i32 {
+        // coreutils cut(1) port: parses -d / -f / -c / -b ranges
+        // including N-M, N-, -M shorthand and comma-lists.
+
+        #[derive(Copy, Clone)]
+        enum Mode {
+            Field,
+            Char,
+            Byte,
+        }
+        let mut delimiter = '\t';
+        let mut output_delimiter: Option<String> = None;
+        let mut mode = Mode::Field;
+        // Each entry is (start, end) inclusive, 0-based. end == usize::MAX
+        // means "to end of line".
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut suppress_no_delim = false;
+        // -z / --zero-terminated: line delim becomes NUL.
+        let mut zero_term = false;
+        // --complement: print complement of selected ranges.
+        let mut complement = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut i = 0;
+
+        // Parse a coreutils-style cut spec: 'N', 'N-M', 'N-', '-M',
+        // separated by ','.
+        let parse_spec = |spec: &str, out: &mut Vec<(usize, usize)>| {
+            for part in spec.split(',') {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some((a, b)) = part.split_once('-') {
+                    let start = if a.is_empty() {
+                        0
+                    } else {
+                        match a.parse::<usize>() {
+                            Ok(n) if n > 0 => n - 1,
+                            _ => continue,
+                        }
+                    };
+                    let end = if b.is_empty() {
+                        usize::MAX
+                    } else {
+                        match b.parse::<usize>() {
+                            Ok(n) if n > 0 => n - 1,
+                            _ => continue,
+                        }
+                    };
+                    if start <= end {
+                        out.push((start, end));
+                    }
+                } else if let Ok(n) = part.parse::<usize>() {
+                    if n > 0 {
+                        out.push((n - 1, n - 1));
+                    }
+                }
+            }
+        };
+
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "-d" && i + 1 < args.len() {
+                i += 1;
+                delimiter = args[i].chars().next().unwrap_or('\t');
+            } else if let Some(s) = arg.strip_prefix("-d") {
+                delimiter = s.chars().next().unwrap_or('\t');
+            } else if arg == "-f" && i + 1 < args.len() {
+                i += 1;
+                mode = Mode::Field;
+                parse_spec(&args[i], &mut ranges);
+            } else if let Some(s) = arg.strip_prefix("-f") {
+                mode = Mode::Field;
+                parse_spec(s, &mut ranges);
+            } else if arg == "-c" && i + 1 < args.len() {
+                i += 1;
+                mode = Mode::Char;
+                parse_spec(&args[i], &mut ranges);
+            } else if let Some(s) = arg.strip_prefix("-c") {
+                mode = Mode::Char;
+                parse_spec(s, &mut ranges);
+            } else if arg == "-b" && i + 1 < args.len() {
+                i += 1;
+                mode = Mode::Byte;
+                parse_spec(&args[i], &mut ranges);
+            } else if let Some(s) = arg.strip_prefix("-b") {
+                mode = Mode::Byte;
+                parse_spec(s, &mut ranges);
+            } else if arg == "-s" || arg == "--only-delimited" {
+                suppress_no_delim = true;
+            } else if arg == "-z" || arg == "--zero-terminated" {
+                zero_term = true;
+            } else if arg == "--complement" {
+                complement = true;
+            } else if let Some(s) = arg.strip_prefix("--output-delimiter=") {
+                output_delimiter = Some(s.to_string());
+            } else if arg == "--output-delimiter" && i + 1 < args.len() {
+                i += 1;
+                output_delimiter = Some(args[i].clone());
+            } else if arg == "-" {
+                files.push("-");
+            } else if arg == "--" {
+                i += 1;
+                while i < args.len() {
+                    files.push(&args[i]);
+                    i += 1;
+                }
+                break;
+            } else if !arg.starts_with('-') {
+                files.push(arg);
+            } else {
+                eprintln!("cut: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            i += 1;
+        }
+
+        let in_range = |idx: usize| -> bool {
+            let m = ranges.iter().any(|(s, e)| idx >= *s && idx <= *e);
+            if complement {
+                !m
+            } else {
+                m
+            }
+        };
+
+        let reader: Box<dyn BufRead> = if files.is_empty() || files[0] == "-" {
+            Box::new(BufReader::new(std::io::stdin()))
+        } else {
+            match std::fs::File::open(files[0]) {
+                Ok(f) => Box::new(BufReader::new(f)),
+                Err(e) => {
+                    eprintln!("cut: {}: {}", files[0], e);
+                    return 1;
+                }
+            }
+        };
+
+        let line_term = if zero_term { '\0' } else { '\n' };
+        // -z splits input on NUL too; otherwise BufRead::lines splits
+        // on \\n (the default).
+        let process_line = |line: String| match mode {
+            Mode::Field => {
+                if !line.contains(delimiter) {
+                    if !suppress_no_delim {
+                        print!("{}{}", line, line_term);
+                    }
+                    return;
+                }
+                let parts: Vec<&str> = line.split(delimiter).collect();
+                let selected: Vec<&str> = parts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, p)| if in_range(idx) { Some(*p) } else { None })
+                    .collect();
+                let out_sep: String = output_delimiter
+                    .clone()
+                    .unwrap_or_else(|| delimiter.to_string());
+                print!("{}{}", selected.join(&out_sep), line_term);
+            }
+            Mode::Char => {
+                let chars: String = line
+                    .chars()
+                    .enumerate()
+                    .filter_map(|(idx, c)| if in_range(idx) { Some(c) } else { None })
+                    .collect();
+                print!("{}{}", chars, line_term);
+            }
+            Mode::Byte => {
+                let bytes: Vec<u8> = line
+                    .bytes()
+                    .enumerate()
+                    .filter_map(|(idx, b)| if in_range(idx) { Some(b) } else { None })
+                    .collect();
+                print!("{}{}", String::from_utf8_lossy(&bytes), line_term);
+            }
+        };
+
+        if zero_term {
+            let mut buf = Vec::new();
+            let mut reader = reader;
+            let _ = reader.read_to_end(&mut buf);
+            for chunk in buf.split(|b| *b == 0) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                process_line(String::from_utf8_lossy(chunk).into_owned());
+            }
+        } else {
+            for line in reader.lines().map_while(Result::ok) {
+                process_line(line);
+            }
+        }
+        0
+    }
+
+    pub(crate) fn builtin_tr(&self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            eprintln!("tr: missing operand");
+            return 1;
+        }
+
+        let delete = args.iter().any(|a| a == "-d" || a == "--delete");
+        let complement = args
+            .iter()
+            .any(|a| a == "-c" || a == "-C" || a == "--complement");
+        let squeeze = args.iter().any(|a| a == "-s" || a == "--squeeze-repeats");
+        // -t / --truncate-set1: truncate set1 to set2's length.
+        // Direct port of coreutils tr -t.
+        let truncate1 = args.iter().any(|a| a == "-t" || a == "--truncate-set1");
+        // Validate every flag-prefixed arg matches a known flag. Old
+        // \`filter(|a| !starts_with('-'))\` consumed unknown flags
+        // silently — \`tr -X 'a' 'b'\` would translate as if -X were
+        // a no-op.
+        for a in args {
+            let s: &str = a.as_str();
+            if s.starts_with('-')
+                && s != "-d"
+                && s != "--delete"
+                && s != "-c"
+                && s != "-C"
+                && s != "--complement"
+                && s != "-s"
+                && s != "--squeeze-repeats"
+                && s != "-t"
+                && s != "--truncate-set1"
+                && s.len() > 1
+            {
+                eprintln!("tr: unrecognized option: '{}'", s);
+                return 1;
+            }
+        }
+        let set1_raw: &str;
+        let set2_raw: &str;
+
+        let non_flag: Vec<&str> = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| s.as_str())
+            .collect();
+        if delete {
+            set1_raw = non_flag.first().copied().unwrap_or("");
+            set2_raw = "";
+        } else {
+            set1_raw = non_flag.first().copied().unwrap_or("");
+            set2_raw = non_flag.get(1).copied().unwrap_or("");
+        }
+
+        // Expand ranges like `a-z` into the full character list.
+        // Handles escapes (\n \t \r \\ \0 \xNN \NNN) AND POSIX
+        // character classes (`[:upper:]`, `[:lower:]`, `[:digit:]`,
+        // `[:alpha:]`, `[:alnum:]`, `[:punct:]`, `[:space:]`,
+        // `[:blank:]`, `[:cntrl:]`, `[:graph:]`, `[:print:]`,
+        // `[:xdigit:]`).
+        fn expand_set(s: &str) -> Vec<char> {
+            let mut out = Vec::new();
+            let bytes: Vec<char> = s.chars().collect();
+            let mut i = 0;
+            while i < bytes.len() {
+                // [:CLASS:] character classes.
+                if bytes[i] == '[' && i + 1 < bytes.len() && bytes[i + 1] == ':' {
+                    if let Some(end) = bytes[i + 2..]
+                        .iter()
+                        .position(|&c| c == ':')
+                        .map(|p| i + 2 + p)
+                    {
+                        if end + 1 < bytes.len() && bytes[end + 1] == ']' {
+                            let class: String = bytes[i + 2..end].iter().collect();
+                            for c in 0u32..128 {
+                                if let Some(ch) = char::from_u32(c) {
+                                    let m = match class.as_str() {
+                                        "upper" => ch.is_ascii_uppercase(),
+                                        "lower" => ch.is_ascii_lowercase(),
+                                        "digit" => ch.is_ascii_digit(),
+                                        "alpha" => ch.is_ascii_alphabetic(),
+                                        "alnum" => ch.is_ascii_alphanumeric(),
+                                        "punct" => ch.is_ascii_punctuation(),
+                                        "space" => ch.is_ascii_whitespace(),
+                                        "blank" => ch == ' ' || ch == '\t',
+                                        "cntrl" => ch.is_ascii_control(),
+                                        "graph" => ch.is_ascii_graphic(),
+                                        "print" => ch.is_ascii_graphic() || ch == ' ',
+                                        "xdigit" => ch.is_ascii_hexdigit(),
+                                        _ => false,
+                                    };
+                                    if m {
+                                        out.push(ch);
+                                    }
+                                }
+                            }
+                            i = end + 2;
+                            continue;
+                        }
+                    }
+                }
+                let c = bytes[i];
+                let resolved = if c == '\\' && i + 1 < bytes.len() {
+                    let next = bytes[i + 1];
+                    i += 1;
+                    match next {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        'a' => '\x07',
+                        'b' => '\x08',
+                        'f' => '\x0c',
+                        'v' => '\x0b',
+                        '\\' => '\\',
+                        // \xNN hex escape
+                        'x' => {
+                            let mut hex = String::new();
+                            let mut j = i + 1;
+                            while j < bytes.len() && hex.len() < 2 {
+                                if bytes[j].is_ascii_hexdigit() {
+                                    hex.push(bytes[j]);
+                                    j += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            i = j - 1;
+                            u32::from_str_radix(&hex, 16)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('x')
+                        }
+                        // \NNN octal (1-3 digits)
+                        d if d.is_digit(8) => {
+                            let mut oct = String::from(d);
+                            let mut j = i + 1;
+                            while j < bytes.len() && oct.len() < 3 && bytes[j].is_digit(8) {
+                                oct.push(bytes[j]);
+                                j += 1;
+                            }
+                            i = j - 1;
+                            u32::from_str_radix(&oct, 8)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('\0')
+                        }
+                        other => other,
+                    }
+                } else {
+                    c
+                };
+                if i + 2 < bytes.len() && bytes[i + 1] == '-' {
+                    let end = bytes[i + 2];
+                    if (resolved as u32) <= (end as u32) {
+                        for cc in (resolved as u32)..=(end as u32) {
+                            if let Some(c) = char::from_u32(cc) {
+                                out.push(c);
+                            }
+                        }
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(resolved);
+                i += 1;
+            }
+            out
+        }
+
+        let mut s1 = expand_set(set1_raw);
+        let s2 = expand_set(set2_raw);
+        // -t / --truncate-set1: shrink set1 to set2's length.
+        if truncate1 && s1.len() > s2.len() {
+            s1.truncate(s2.len());
+        }
+
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).ok();
+
+        let in_set1 = |c: char| -> bool {
+            let m = s1.contains(&c);
+            if complement {
+                !m
+            } else {
+                m
+            }
+        };
+        // Pick the squeeze set per coreutils tr semantics: with -d
+        // and -s together, squeeze uses set2 (the second arg, or
+        // empty if not given); without -d, squeeze uses set2 (the
+        // translation target), falling back to set1 when set2 is
+        // empty (the "tr -s" common form).
+        let squeeze_set: Vec<char> = if !s2.is_empty() {
+            s2.clone()
+        } else {
+            s1.clone()
+        };
+
+        let output_pre: String = if delete {
+            input.chars().filter(|c| !in_set1(*c)).collect()
+        } else if complement {
+            // With -c (without -d), every char NOT in set1 maps to
+            // the LAST char of set2 (or first if set2 has one). zsh
+            // / coreutils tr semantics.
+            let target = s2.last().copied().or_else(|| s2.first().copied());
+            input
+                .chars()
+                .map(|c| {
+                    if s1.contains(&c) {
+                        c
+                    } else if let Some(t) = target {
+                        t
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        } else {
+            input
+                .chars()
+                .map(|c| {
+                    if let Some(pos) = s1.iter().position(|&x| x == c) {
+                        s2.get(pos).or(s2.last()).copied().unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        };
+
+        // Squeeze pass: collapse runs of consecutive chars from
+        // squeeze_set down to one occurrence. Direct port of
+        // coreutils tr's squeeze_repeats.
+        let output: String = if squeeze {
+            let mut out = String::with_capacity(output_pre.len());
+            let mut last: Option<char> = None;
+            for c in output_pre.chars() {
+                if Some(c) == last && squeeze_set.contains(&c) {
+                    continue;
+                }
+                out.push(c);
+                last = Some(c);
+            }
+            out
+        } else {
+            output_pre
+        };
+
+        print!("{}", output);
+        0
+    }
+
+    pub(crate) fn builtin_seq(&self, args: &[String]) -> i32 {
+        // coreutils seq(1): handles floats and -s SEPARATOR. The
+        // previous impl only supported integers and emitted one per
+        // line, so `seq -s , 1 5` printed five lines instead of
+        // '1,2,3,4,5'.
+        let mut sep = "\n".to_string();
+        let mut nums_str: Vec<&str> = Vec::new();
+        let mut equal_width = false;
+        let mut format_str: Option<String> = None;
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            if arg == "-s" && i + 1 < args.len() {
+                i += 1;
+                sep = args[i].clone();
+            } else if let Some(s) = arg.strip_prefix("-s") {
+                sep = s.to_string();
+            } else if arg == "-w" || arg == "--equal-width" {
+                equal_width = true;
+            } else if arg == "-f" && i + 1 < args.len() {
+                i += 1;
+                format_str = Some(args[i].clone());
+            } else if let Some(s) = arg.strip_prefix("-f") {
+                format_str = Some(s.to_string());
+            } else {
+                nums_str.push(arg.as_str());
+            }
+            i += 1;
+        }
+        // Parse all-or-nothing as f64 to handle '0.5', '1e3', etc.
+        let nums: Vec<f64> = nums_str.iter().filter_map(|a| a.parse().ok()).collect();
+        if nums.len() != nums_str.len() {
+            eprintln!("seq: invalid argument");
+            return 1;
+        }
+
+        let (first, inc, last): (f64, f64, f64) = match nums.len() {
+            1 => (1.0, 1.0, nums[0]),
+            2 => (nums[0], 1.0, nums[1]),
+            3 => (nums[0], nums[1], nums[2]),
+            _ => {
+                eprintln!("seq: missing operand");
+                return 1;
+            }
+        };
+
+        if inc == 0.0 {
+            eprintln!("seq: zero increment");
+            return 1;
+        }
+        // Derive output precision from the input args so 'seq 0.1 0.1
+        // 0.5' prints '0.1\n0.2\n...'  and not the default float repr.
+        let prec = nums_str
+            .iter()
+            .map(|s| s.split('.').nth(1).map(|f| f.len()).unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        // Apply -f FORMAT (printf-style) when given. Supports the
+        // common conversions: %d / %i (int), %f / %.Nf / %g / %e
+        // (float). Other conversions fall through to the auto fmt.
+        // Per coreutils, -f overrides equal_width.
+        let user_fmt = format_str.clone();
+        let fmt = move |v: f64| -> String {
+            if let Some(f) = &user_fmt {
+                // Replace the first %... conversion in f with the
+                // formatted value. This is a tiny printf — full
+                // coreutils format is more complex but this covers
+                // 99% of \`seq -f '%.2f' 0 0.1 1\` style usage.
+                let bytes = f.as_bytes();
+                let mut out = String::with_capacity(f.len() + 16);
+                let mut i = 0;
+                let mut applied = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' && i + 1 < bytes.len() {
+                        if bytes[i + 1] == b'%' {
+                            out.push('%');
+                            i += 2;
+                            continue;
+                        }
+                        // Find the conversion char.
+                        let mut j = i + 1;
+                        while j < bytes.len() {
+                            let c = bytes[j];
+                            if matches!(c, b'd' | b'i' | b'u' | b'f' | b'e' | b'g' | b'E' | b'G') {
+                                break;
+                            }
+                            j += 1;
+                        }
+                        if j >= bytes.len() {
+                            out.push('%');
+                            i += 1;
+                            continue;
+                        }
+                        let spec = std::str::from_utf8(&bytes[i..=j]).unwrap_or("%g");
+                        let formatted = match bytes[j] {
+                            b'd' | b'i' | b'u' => format!("{}", v as i64),
+                            b'f' | b'e' | b'g' | b'E' | b'G' => {
+                                // Extract precision if present (.N).
+                                let s = spec.trim_start_matches('%');
+                                let prec_part: String = s
+                                    .chars()
+                                    .skip_while(|c| *c != '.')
+                                    .skip(1)
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect();
+                                let prec_n: usize = prec_part.parse().unwrap_or(6);
+                                match bytes[j] {
+                                    b'f' => format!("{:.p$}", v, p = prec_n),
+                                    b'e' => format!("{:.p$e}", v, p = prec_n),
+                                    b'E' => format!("{:.p$E}", v, p = prec_n),
+                                    _ => format!("{:.p$}", v, p = prec_n),
+                                }
+                            }
+                            _ => format!("{}", v),
+                        };
+                        out.push_str(&formatted);
+                        applied = true;
+                        i = j + 1;
+                    } else {
+                        out.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                let _ = applied;
+                return out;
+            }
+            if prec == 0 {
+                format!("{}", v as i64)
+            } else {
+                format!("{:.prec$}", v, prec = prec)
+            }
+        };
+
+        let mut out: Vec<String> = Vec::new();
+        let mut v = first;
+        if inc > 0.0 {
+            while v <= last + f64::EPSILON {
+                out.push(fmt(v));
+                v += inc;
+            }
+        } else {
+            while v >= last - f64::EPSILON {
+                out.push(fmt(v));
+                v += inc;
+            }
+        }
+        // -w: zero-pad each line to the longest output's width.
+        // coreutils seq pads with leading zeros (or after sign) so
+        // \`seq -w 8 10\` emits \`08 09 10\`. zshrs's previous "skip
+        // silently" left them as \`8 9 10\`, breaking column-aligned
+        // output.
+        if equal_width && !out.is_empty() {
+            let width = out.iter().map(|s| s.len()).max().unwrap_or(0);
+            for s in &mut out {
+                if s.len() < width {
+                    let pad = width - s.len();
+                    if let Some(rest) = s.strip_prefix('-') {
+                        *s = format!("-{:0>pad$}{}", "", rest, pad = pad);
+                    } else {
+                        *s = format!("{:0>pad$}{}", "", s, pad = pad);
+                    }
+                }
+            }
+        }
+        if !out.is_empty() {
+            print!("{}", out.join(&sep));
+            // coreutils seq always terminates the final line with `\n`,
+            // even when -s SEPARATOR is given and the separator itself
+            // is not a newline. Joining with sep leaves no trailing
+            // terminator, so emit one unconditionally here.
+            println!();
+        }
+        0
+    }
+
+    pub(crate) fn builtin_rev(&self, args: &[String]) -> i32 {
+        // util-linux rev(1) port. Accepts multiple files; reverses
+        // each line by chars (codepoint-correct, not bytes). One
+        // bad file emits an error and continues with the rest;
+        // returns 1 if any file failed.
+
+        // util-linux rev has no flags. Reject any \`-\`-prefixed arg
+        // that isn't \`-\` (stdin) or \`--\` (end-of-options).
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(a) = iter.next() {
+            let s: &str = a.as_str();
+            if s == "-" {
+                files.push("-");
+            } else if s == "--" {
+                for rest in iter.by_ref() {
+                    files.push(rest);
+                }
+                break;
+            } else if s.starts_with('-') && s.len() > 1 {
+                eprintln!("rev: unrecognized option: '{}'", s);
+                return 1;
+            } else {
+                files.push(s);
+            }
+        }
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        let mut status = 0;
+        for file in targets {
+            let reader: Box<dyn BufRead> = if file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!("rev: {}: {}", file, e);
+                        status = 1;
+                        continue;
+                    }
+                }
+            };
+            for line in reader.lines().map_while(Result::ok) {
+                println!("{}", line.chars().rev().collect::<String>());
+            }
+        }
+        status
+    }
+
+    pub(crate) fn builtin_tee(&self, args: &[String]) -> i32 {
+        // coreutils tee(1) port: stream stdin to stdout AND each
+        // named file in 8 KB chunks so 'tail -f log | tee out' works
+        // — was buffering everything until EOF, which never arrives
+        // for streaming sources.
+
+        let mut append = false;
+        let mut ignore_int = false;
+        let mut files: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.as_str() {
+                "-a" | "--append" => append = true,
+                // -i: ignore SIGINT — coreutils flag for keeping the
+                // process alive when the upstream gets ^C'd. We just
+                // accept; real ignore wiring would need signal masks.
+                "-i" | "--ignore-interrupts" => ignore_int = true,
+                "--" => {} // end of options
+                s if !s.starts_with('-') || s == "-" => files.push(s),
+                s => {
+                    // coreutils tee rejects unknown flags. Old
+                    // \`_ => {}\` operated normally with -X dropped.
+                    eprintln!("tee: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let _ = ignore_int;
+
+        // Open every output file once; bail per-file but keep going
+        // for the rest (matches coreutils behaviour).
+        let mut handles: Vec<Box<dyn Write>> = Vec::with_capacity(files.len());
+        let mut returnval = 0;
+        for file in &files {
+            let result = if append {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(file)
+            } else {
+                std::fs::File::create(file)
+            };
+            match result {
+                Ok(f) => handles.push(Box::new(f)),
+                Err(e) => {
+                    eprintln!("tee: {}: {}", file, e);
+                    returnval = 1;
+                }
+            }
+        }
+
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let _ = out.write_all(&buf[..n]);
+            let _ = out.flush();
+            for h in handles.iter_mut() {
+                let _ = h.write_all(&buf[..n]);
+                let _ = h.flush();
+            }
+        }
+        returnval
+    }
+
+    pub(crate) fn builtin_sleep(&self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            eprintln!("zshrs:sleep:1: missing operand");
+            return 1;
+        }
+
+        let mut total_secs = 0.0f64;
+        let mut had_operand = false;
+        for arg in args {
+            if arg.starts_with('-') && arg.len() > 1 {
+                // coreutils sleep accepts no flags besides --help and
+                // --version. Anything else is an error. Old impl
+                // silently skipped flag args, so \`sleep -X 5\` slept
+                // 5 seconds while losing -X.
+                if arg == "--" {
+                    continue; // end-of-options
+                }
+                eprintln!("zshrs:sleep:1: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            had_operand = true;
+            let (num, suffix) = if arg.ends_with('s') {
+                (&arg[..arg.len() - 1], 1.0)
+            } else if arg.ends_with('m') {
+                (&arg[..arg.len() - 1], 60.0)
+            } else if arg.ends_with('h') {
+                (&arg[..arg.len() - 1], 3600.0)
+            } else if arg.ends_with('d') {
+                (&arg[..arg.len() - 1], 86400.0)
+            } else {
+                (arg.as_str(), 1.0)
+            };
+            if let Ok(n) = num.parse::<f64>() {
+                total_secs += n * suffix;
+            } else {
+                // coreutils sleep errors on non-numeric operand.
+                eprintln!("zshrs:sleep:1: invalid time interval: '{}'", arg);
+                return 1;
+            }
+        }
+        let _ = had_operand;
+
+        // Duration::from_secs_f64 panics on negative / NaN / +inf.
+        // coreutils sleep treats negative as an error; here we
+        // tolerate non-positive total as a no-op exit 0. Also cap
+        // upper bound (Duration panics near u64::MAX seconds).
+        if !total_secs.is_finite() || total_secs <= 0.0 {
+            return 0;
+        }
+        let capped = if total_secs > i64::MAX as f64 {
+            i64::MAX as f64
+        } else {
+            total_secs
+        };
+        std::thread::sleep(std::time::Duration::from_secs_f64(capped));
+        0
+    }
+
+    /// paste [-d LIST] [FILE...] — merge lines of files. coreutils
+    /// paste(1). Default delim is TAB; -d cycles through the
+    /// supplied delimiter chars.
+    pub(crate) fn builtin_paste(&self, args: &[String]) -> i32 {
+        // paste(1) delimiter list: backslash escapes are decoded, and `\0`
+        // means "no separator at all" — so a delimiter is a STRING, not a
+        // char. Treating the list as raw chars emitted a literal backslash
+        // where both BSD and GNU paste emit a newline (`paste -d'\n'`).
+        fn decode_delims(spec: &str) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            let mut it = spec.chars();
+            while let Some(c) = it.next() {
+                if c != '\\' {
+                    out.push(c.to_string());
+                    continue;
+                }
+                match it.next() {
+                    Some('n') => out.push("\n".to_string()),
+                    Some('t') => out.push("\t".to_string()),
+                    Some('\\') => out.push("\\".to_string()),
+                    Some('0') => out.push(String::new()), // empty separator
+                    // A trailing lone backslash, or any other escape, stays
+                    // literal — matching both implementations' leniency.
+                    Some(other) => out.push(other.to_string()),
+                    None => out.push("\\".to_string()),
+                }
+            }
+            out
+        }
+
+        let mut delims: Vec<String> = vec!["\t".to_string()];
+        let mut serial = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        let mut no_more_opts = false;
+        while let Some(arg) = iter.next() {
+            let a = arg.as_str();
+            if no_more_opts || a == "-" || !a.starts_with('-') {
+                files.push(a);
+                continue;
+            }
+            match a {
+                "--" => {
+                    no_more_opts = true;
+                    continue;
+                }
+                "--serial" => {
+                    serial = true;
+                    continue;
+                }
+                "--delimiters" => {
+                    if let Some(s) = iter.next() {
+                        delims = decode_delims(s);
+                        if delims.is_empty() {
+                            delims = vec!["\t".to_string()];
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(spec) = a.strip_prefix("--delimiters=") {
+                delims = decode_delims(spec);
+                if delims.is_empty() {
+                    delims = vec!["\t".to_string()];
+                }
+                continue;
+            }
+            // Short options CLUSTER, and `-d` takes the rest of the cluster as
+            // its argument (or the next argv element when it ends the
+            // cluster). `paste -sd, -` is the canonical spelling and was
+            // rejected outright as an unknown option.
+            let mut chars = a[1..].chars();
+            let mut bad = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    's' => serial = true,
+                    'd' => {
+                        let rest: String = chars.by_ref().collect();
+                        let spec = if rest.is_empty() {
+                            iter.next().map(|s| s.as_str()).unwrap_or("")
+                        } else {
+                            &rest
+                        };
+                        delims = decode_delims(spec);
+                        if delims.is_empty() {
+                            delims = vec!["\t".to_string()];
+                        }
+                    }
+                    _ => {
+                        eprintln!("paste: unrecognized option: '{}'", a);
+                        bad = true;
+                        break;
+                    }
+                }
+            }
+            if bad {
+                return 1;
+            }
+        }
+        if files.is_empty() {
+            files.push("-");
+        }
+        // Every `-` operand names the SAME stdin stream, so they must share
+        // one reader: `paste - -` interleaves consecutive lines of one input
+        // (`a<TAB>b`), which is the documented idiom for pairing up lines.
+        // Giving each `-` its own BufReader let the first one buffer the
+        // whole stream, so the second saw EOF and the output degraded to one
+        // column per line.
+        enum Src {
+            Stdin,
+            File(BufReader<std::fs::File>),
+        }
+        let mut stdin_reader = BufReader::new(std::io::stdin());
+        let mut srcs: Vec<Src> = Vec::with_capacity(files.len());
+        for file in &files {
+            if *file == "-" {
+                srcs.push(Src::Stdin);
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => srcs.push(Src::File(BufReader::new(f))),
+                    Err(e) => {
+                        eprintln!("paste: {}: {}", file, e);
+                        return 1;
+                    }
+                }
+            }
+        }
+        fn next_line(src: &mut Src, stdin: &mut BufReader<std::io::Stdin>) -> Option<String> {
+            let mut buf = String::new();
+            let n = match src {
+                Src::Stdin => stdin.read_line(&mut buf),
+                Src::File(f) => f.read_line(&mut buf),
+            };
+            match n {
+                Ok(0) | Err(_) => None,
+                Ok(_) => {
+                    if buf.ends_with('\n') {
+                        buf.pop();
+                        if buf.ends_with('\r') {
+                            buf.pop();
+                        }
+                    }
+                    Some(buf)
+                }
+            }
+        }
+        if serial {
+            // -s: each file's lines on a single output line.
+            for src in srcs.iter_mut() {
+                let mut lines: Vec<String> = Vec::new();
+                while let Some(l) = next_line(src, &mut stdin_reader) {
+                    lines.push(l);
+                }
+                // An input with no lines produces NO output line at all —
+                // `paste -s /dev/null` prints nothing, where emitting one
+                // unconditionally added a stray blank line.
+                if lines.is_empty() {
+                    continue;
+                }
+                let mut out = String::new();
+                for (i, l) in lines.iter().enumerate() {
+                    out.push_str(l);
+                    if i + 1 < lines.len() {
+                        out.push_str(&delims[i % delims.len()]);
+                    }
+                }
+                println!("{}", out);
+            }
+            return 0;
+        }
+        // Parallel-merge: round-robin one line from each operand.
+        loop {
+            let mut row: Vec<Option<String>> = Vec::with_capacity(srcs.len());
+            for src in srcs.iter_mut() {
+                row.push(next_line(src, &mut stdin_reader));
+            }
+            if row.iter().all(|c| c.is_none()) {
+                break;
+            }
+            let mut out = String::new();
+            for (i, cell) in row.iter().enumerate() {
+                if let Some(s) = cell {
+                    out.push_str(s);
+                }
+                if i + 1 < row.len() {
+                    out.push_str(&delims[i % delims.len()]);
+                }
+            }
+            println!("{}", out);
+        }
+        0
+    }
+
+    /// fold [-w WIDTH] [-s] [-b] [FILE...] — wrap input lines.
+    /// coreutils fold(1).
+    pub(crate) fn builtin_fold(&self, args: &[String]) -> i32 {
+        let mut width: usize = 80;
+        let mut break_at_space = false;
+        let mut count_bytes = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-w" | "--width" => {
+                    if let Some(s) = iter.next() {
+                        width = s.parse().unwrap_or(80);
+                    }
+                }
+                s if s.starts_with("-w") && s.len() > 2 => {
+                    width = s[2..].parse().unwrap_or(80);
+                }
+                "-s" | "--spaces" => break_at_space = true,
+                "-b" | "--bytes" => count_bytes = true,
+                "-" => files.push("-"),
+                "--" => {
+                    for rest in iter.by_ref() {
+                        files.push(rest);
+                    }
+                    break;
+                }
+                s if !s.starts_with('-') => files.push(s),
+                s => {
+                    eprintln!("fold: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        if files.is_empty() {
+            files.push("-");
+        }
+        for file in files {
+            let reader: Box<dyn BufRead> = if file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!("fold: {}: {}", file, e);
+                        return 1;
+                    }
+                }
+            };
+            for line in reader.lines().map_while(Result::ok) {
+                let mut chunk = String::new();
+                let walker: Box<dyn Iterator<Item = char>> = if count_bytes {
+                    // Treat each byte as a char (lossy for UTF-8).
+                    Box::new(line.bytes().map(|b| b as char))
+                } else {
+                    Box::new(line.chars())
+                };
+                let mut col = 0usize;
+                let mut last_space: Option<usize> = None;
+                for c in walker {
+                    chunk.push(c);
+                    col += 1;
+                    if c == ' ' || c == '\t' {
+                        last_space = Some(chunk.len());
+                    }
+                    if col >= width {
+                        if break_at_space {
+                            if let Some(pos) = last_space {
+                                let head = &chunk[..pos];
+                                let tail = chunk[pos..].to_string();
+                                println!("{}", head);
+                                chunk = tail;
+                                col = chunk.chars().count();
+                                last_space = None;
+                                continue;
+                            }
+                        }
+                        println!("{}", chunk);
+                        chunk.clear();
+                        col = 0;
+                        last_space = None;
+                    }
+                }
+                if !chunk.is_empty() {
+                    println!("{}", chunk);
+                }
+            }
+        }
+        0
+    }
+
+    /// shuf [-n N] [-i LO-HI] [-e [STR...]] [FILE] — random
+    /// permutation. coreutils shuf(1).
+    pub(crate) fn builtin_shuf(&self, args: &[String]) -> i32 {
+        let mut count: Option<usize> = None;
+        let mut input_range: Option<(i64, i64)> = None;
+        let mut echo_args: Option<Vec<String>> = None;
+        let mut zero_term = false;
+        let mut file: Option<&str> = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-n" | "--head-count" => {
+                    if let Some(s) = iter.next() {
+                        count = s.parse().ok();
+                    }
+                }
+                "-i" | "--input-range" => {
+                    if let Some(s) = iter.next() {
+                        if let Some((a, b)) = s.split_once('-') {
+                            if let (Ok(lo), Ok(hi)) = (a.parse::<i64>(), b.parse::<i64>()) {
+                                input_range = Some((lo, hi));
+                            }
+                        }
+                    }
+                }
+                "-e" | "--echo" => {
+                    let rest: Vec<String> = iter.by_ref().cloned().collect();
+                    echo_args = Some(rest);
+                    break;
+                }
+                "-z" | "--zero-terminated" => zero_term = true,
+                "-" => file = Some("-"),
+                "--" => {
+                    if let Some(rest) = iter.next() {
+                        file = Some(rest.as_str());
+                    }
+                    break;
+                }
+                s if !s.starts_with('-') => file = Some(s),
+                s => {
+                    eprintln!("shuf: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+
+        let mut items: Vec<String> = if let Some((lo, hi)) = input_range {
+            (lo..=hi).map(|n| n.to_string()).collect()
+        } else if let Some(echo) = echo_args {
+            echo
+        } else {
+            let reader: Box<dyn BufRead> = match file {
+                Some(f) if f != "-" => match std::fs::File::open(f) {
+                    Ok(fh) => Box::new(BufReader::new(fh)),
+                    Err(e) => {
+                        eprintln!("shuf: {}: {}", f, e);
+                        return 1;
+                    }
+                },
+                _ => Box::new(BufReader::new(std::io::stdin())),
+            };
+            reader.lines().map_while(Result::ok).collect()
+        };
+        let mut rng = rand::thread_rng();
+        items.shuffle(&mut rng);
+        if let Some(n) = count {
+            items.truncate(n);
+        }
+        let term = if zero_term { '\0' } else { '\n' };
+        for item in items {
+            print!("{}{}", item, term);
+        }
+        0
+    }
+
+    /// groups [USER...] — print group memberships. Coreutils
+    /// groups(1) / POSIX. With no args, prints groups for the
+    /// effective user; with args, prints "USER : group1 group2 ..."
+    /// per user.
+    pub(crate) fn builtin_groups(&self, args: &[String]) -> i32 {
+        // Validate flags.
+        let mut users: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.as_str() {
+                "--" => {}
+                s if s.starts_with('-') && s.len() > 1 => {
+                    eprintln!("groups: unrecognized option: '{}'", s);
+                    return 1;
+                }
+                s => users.push(s),
+            }
+        }
+        let print_groups_for = |uid_or_name: Option<&str>| -> i32 {
+            let (user_name, _user_uid, group_id): (String, u32, u32) = match uid_or_name {
+                Some(name) => {
+                    // Look up by name first, then numeric id.
+                    let cn = match std::ffi::CString::new(name) {
+                        Ok(c) => c,
+                        Err(_) => return 1,
+                    };
+                    unsafe {
+                        let pw = libc::getpwnam(cn.as_ptr());
+                        if pw.is_null() {
+                            // Try numeric.
+                            if let Ok(uid) = name.parse::<u32>() {
+                                let pw2 = libc::getpwuid(uid);
+                                if pw2.is_null() {
+                                    eprintln!("groups: '{}': no such user", name);
+                                    return 1;
+                                }
+                                let n = CStr::from_ptr((*pw2).pw_name);
+                                (
+                                    n.to_string_lossy().into_owned(),
+                                    (*pw2).pw_uid,
+                                    (*pw2).pw_gid,
+                                )
+                            } else {
+                                eprintln!("groups: '{}': no such user", name);
+                                return 1;
+                            }
+                        } else {
+                            let n = CStr::from_ptr((*pw).pw_name);
+                            (n.to_string_lossy().into_owned(), (*pw).pw_uid, (*pw).pw_gid)
+                        }
+                    }
+                }
+                None => {
+                    let euid = unsafe { libc::geteuid() };
+                    unsafe {
+                        let pw = libc::getpwuid(euid);
+                        if pw.is_null() {
+                            (String::new(), euid, 0)
+                        } else {
+                            let n = CStr::from_ptr((*pw).pw_name);
+                            (n.to_string_lossy().into_owned(), (*pw).pw_uid, (*pw).pw_gid)
+                        }
+                    }
+                }
+            };
+            // getgrouplist requires a buffer; start with 32 slots.
+            let mut group_ids: Vec<libc::gid_t> = vec![0; 64];
+            let mut ngroups: i32 = group_ids.len() as i32;
+            let cn = std::ffi::CString::new(user_name.clone()).unwrap_or_default();
+            let r = unsafe {
+                libc::getgrouplist(
+                    cn.as_ptr(),
+                    group_id as _,
+                    group_ids.as_mut_ptr() as *mut _,
+                    &mut ngroups,
+                )
+            };
+            if r < 0 {
+                // Buffer too small — grow and retry.
+                group_ids.resize(ngroups as usize, 0);
+                unsafe {
+                    libc::getgrouplist(
+                        cn.as_ptr(),
+                        group_id as _,
+                        group_ids.as_mut_ptr() as *mut _,
+                        &mut ngroups,
+                    );
+                }
+            }
+            group_ids.truncate(ngroups as usize);
+            let names: Vec<String> = group_ids
+                .iter()
+                .map(|&g| unsafe {
+                    let gr = libc::getgrgid(g);
+                    if gr.is_null() {
+                        g.to_string()
+                    } else {
+                        let n = CStr::from_ptr((*gr).gr_name);
+                        n.to_string_lossy().into_owned()
+                    }
+                })
+                .collect();
+            if uid_or_name.is_some() {
+                println!("{} : {}", user_name, names.join(" "));
+            } else {
+                println!("{}", names.join(" "));
+            }
+            0
+        };
+        if users.is_empty() {
+            print_groups_for(None)
+        } else {
+            let mut status = 0;
+            for u in users {
+                if print_groups_for(Some(u)) != 0 {
+                    status = 1;
+                }
+            }
+            status
+        }
+    }
+
+    /// users — print logged-in usernames. Coreutils users(1) /
+    /// POSIX. Walks utmpx via getutxent(3) and lists every
+    /// USER_PROCESS entry (sorted, one per login); falls back to the
+    /// effective user when utmpx has no entries.
+    pub(crate) fn builtin_users(&self, args: &[String]) -> i32 {
+        for arg in args {
+            if arg.starts_with('-') && arg.len() > 1 && arg != "--" {
+                eprintln!("users: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            // POSIX `users [file]` accepts one positional arg — an
+            // alternate utmp file, honored via `utmpxname(3)` (glibc and
+            // macOS libc both export it).
+            if !arg.starts_with('-') {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    let cpath = std::ffi::CString::new(arg.as_bytes()).ok();
+                    if let Some(c) = cpath {
+                        unsafe {
+                            // utmpxname(path): set the file getutxent reads from.
+                            extern "C" {
+                                fn utmpxname(file: *const libc::c_char) -> libc::c_int;
+                            }
+                            utmpxname(c.as_ptr());
+                        }
+                    }
+                }
+            }
+        }
+        // Walk utmp via getutxent(3) — POSIX-portable on Linux/BSD/
+        // macOS. Filter `ut_type == USER_PROCESS` (zsh-level
+        // `who(1)` does the same). On systems where utmpx isn't
+        // populated (containers, ephemeral hosts), fall back to
+        // single-user output via `$USER` / `geteuid()`.
+        let mut users: Vec<String> = Vec::new();
+        unsafe {
+            libc::setutxent();
+            loop {
+                let ent = libc::getutxent();
+                if ent.is_null() {
+                    break;
+                }
+                if (*ent).ut_type == libc::USER_PROCESS {
+                    // ut_user is a fixed-size i8 array; convert
+                    // until first NUL.
+                    let raw = &(*ent).ut_user;
+                    let bytes: Vec<u8> = raw
+                        .iter()
+                        .take_while(|&&c| c != 0)
+                        .map(|&c| c as u8)
+                        .collect();
+                    if !bytes.is_empty() {
+                        if let Ok(s) = std::str::from_utf8(&bytes) {
+                            users.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            libc::endutxent();
+        }
+        users.sort();
+        if users.is_empty() {
+            // Fallback: utmp empty (containers / no logged-in
+            // sessions). Print current user — matches `who am i`
+            // when only the calling shell is "logged in".
+            let name = match std::env::var("USER") {
+                Ok(u) if !u.is_empty() => u,
+                _ => {
+                    let euid = unsafe { libc::geteuid() };
+                    let pw = unsafe { libc::getpwuid(euid) };
+                    if !pw.is_null() {
+                        let n = unsafe { CStr::from_ptr((*pw).pw_name) };
+                        n.to_string_lossy().into_owned()
+                    } else {
+                        return 0;
+                    }
+                }
+            };
+            println!("{}", name);
+        } else {
+            println!("{}", users.join(" "));
+        }
+        0
+    }
+
+    /// tput [-T TERM] [-x] [-S] CAPNAME [PARAMS...] — terminfo capability
+    /// query/emit. The capability is looked up in the terminfo entry for
+    /// `-T TERM` (default `$TERM`) by terminfo name, then by termcap code:
+    /// numbers print, booleans set the exit status (0 true, 1 false),
+    /// strings are expanded with the parameters and written raw. `cols`
+    /// and `lines` report the live terminal size; `init` / `reset` emit
+    /// the `is1..is3` / `rs1..rs3` sequences; `clear` also emits `E3`
+    /// (scrollback) unless `-x` is given. Unknown capability exits 4,
+    /// unknown terminal 3, no terminal 2.
+    pub(crate) fn builtin_tput(&self, args: &[String]) -> i32 {
+        let mut iter = args.iter().peekable();
+        let mut stdin_mode = false;
+        let mut keep_scrollback = false;
+        let mut term: Option<String> = None;
+        while let Some(arg) = iter.peek() {
+            match arg.as_str() {
+                "-T" => {
+                    iter.next();
+                    match iter.next() {
+                        Some(t) => term = Some(t.clone()),
+                        None => {
+                            eprintln!("tput: option requires an argument -- T");
+                            return 2;
+                        }
+                    }
+                }
+                s if s.starts_with("-T") && s.len() > 2 => {
+                    term = Some(s[2..].to_string());
+                    iter.next();
+                }
+                "-x" => {
+                    keep_scrollback = true;
+                    iter.next();
+                }
+                "-S" => {
+                    iter.next();
+                    stdin_mode = true;
+                }
+                "-V" | "--version" => {
+                    println!("tput (zshrs) {}", env!("CARGO_PKG_VERSION"));
+                    return 0;
+                }
+                "-h" | "--help" => {
+                    println!("Usage: tput [-T TERM] [-x] [-S] CAPNAME [PARAMS...]");
+                    return 0;
+                }
+                _ => break,
+            }
+        }
+
+        let term_name = term
+            .or_else(|| std::env::var("TERM").ok())
+            .unwrap_or_default();
+        if term_name.is_empty() {
+            eprintln!("tput: No value for $TERM and no -T specified");
+            return 2;
+        }
+        let entry = match crate::terminfo_db::load_entry(&term_name) {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("tput: unknown terminal \"{}\"", term_name);
+                return 3;
+            }
+        };
+
+        // -S stdin mode: each line is `capname [params...]`. Process
+        // every line through the same cap handler used below. Blank
+        // lines are skipped; final exit status is non-zero if ANY
+        // line failed (matches ncurses tput).
+        if stdin_mode {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            let mut status = 0;
+            for line_res in stdin.lock().lines() {
+                let line = match line_res {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let mut parts = line.split_whitespace();
+                let Some(cap) = parts.next() else {
+                    continue;
+                };
+                let rest: Vec<&str> = parts.collect();
+                let s = tput_emit_cap(&entry, cap, &rest, keep_scrollback);
+                if s != 0 {
+                    status = s;
+                }
+            }
+            return status;
+        }
+
+        let Some(cap) = iter.next() else {
+            eprintln!("tput: missing capname");
+            return 2;
+        };
+        let rest: Vec<&str> = iter.map(|s| s.as_str()).collect();
+        tput_emit_cap(&entry, cap, &rest, keep_scrollback)
+    }
+}
+
+/// Current terminal size as `(lines, cols)`: TIOCGWINSZ on the first
+/// standard descriptor that is a tty, then `$LINES` / `$COLUMNS`, then the
+/// entry's `lines` / `cols`, then 24x80 (ncurses `_nc_get_screensize`).
+fn tput_screen_size(entry: &crate::terminfo_db::TermEntry) -> (i32, i32) {
+    let mut lines = entry.num("lines");
+    let mut cols = entry.num("cols");
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, libc::STDIN_FILENO] {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
+            if ws.ws_row > 0 {
+                lines = i32::from(ws.ws_row);
+            }
+            if ws.ws_col > 0 {
+                cols = i32::from(ws.ws_col);
+            }
+            break;
+        }
+    }
+    let env_num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i32>().ok()).filter(|n| *n > 0);
+    if let Some(n) = env_num("LINES") {
+        lines = n;
+    }
+    if let Some(n) = env_num("COLUMNS") {
+        cols = n;
+    }
+    (if lines > 0 { lines } else { 24 }, if cols > 0 { cols } else { 80 })
+}
+
+/// Write the raw capability bytes to stdout with padding specs stripped.
+fn tput_write(bytes: &[u8]) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&crate::tparm::tputs_strip_padding(bytes));
+    let _ = out.flush();
+}
+
+/// Evaluate and emit one capability for the `tput` builtin; shared by the
+/// direct `tput CAP` path and the `-S` stdin loop. Exit status: 0 ok,
+/// 1 false boolean, 4 unknown capability.
+fn tput_emit_cap(
+    entry: &crate::terminfo_db::TermEntry,
+    cap: &str,
+    rest: &[&str],
+    keep_scrollback: bool,
+) -> i32 {
+    match cap {
+        "cols" | "lines" => {
+            let (lines, cols) = tput_screen_size(entry);
+            println!("{}", if cap == "cols" { cols } else { lines });
+            return 0;
+        }
+        "init" | "reset" => {
+            let names: [&str; 3] = if cap == "init" {
+                ["is1", "is2", "is3"]
+            } else {
+                ["rs1", "rs2", "rs3"]
+            };
+            for n in names {
+                if let Some(s) = entry.string(n) {
+                    tput_write(s);
+                }
+            }
+            return 0;
+        }
+        _ => {}
+    }
+
+    // Numeric: terminfo name (an absent value prints -1), then termcap code.
+    let n = entry.num(cap);
+    if n != -2 {
+        println!("{}", n);
+        return 0;
+    }
+    if crate::extensions::terminfo_caps::NUM_CODES.contains(&cap) {
+        println!("{}", entry.tc_num(cap));
+        return 0;
+    }
+    // Boolean: the exit status carries the answer.
+    match entry.flag(cap) {
+        -1 => {}
+        0 => return 1,
+        _ => return 0,
+    }
+    if crate::extensions::terminfo_caps::BOOL_CODES.contains(&cap) {
+        return if entry.tc_flag(cap) == 1 { 0 } else { 1 };
+    }
+    // String: expand with up to 9 parameters (ints, except the string-arg
+    // capabilities pfkey/pfloc/pfx/pln/pfxl whose later arguments are text).
+    let Some(raw) = entry.string(cap).or_else(|| entry.tc_string(cap)) else {
+        if entry.str_is_wrong_type(cap) && !crate::extensions::terminfo_caps::STR_CODES.contains(&cap) {
+            eprintln!("tput: unknown terminfo capability '{}'", cap);
+            return 4;
+        }
+        // Known string capability the entry does not define.
+        return 1;
+    };
+    let strarg = matches!(cap, "pfkey" | "pfloc" | "pfx" | "pln" | "pfxl");
+    let mut pars: Vec<crate::tparm::V> = vec![crate::tparm::V::Int(0); 9];
+    for (i, a) in rest.iter().enumerate().take(9) {
+        pars[i] = if strarg && i > 0 {
+            crate::tparm::V::Str((*a).to_string())
+        } else {
+            crate::tparm::V::Int(a.parse::<i64>().unwrap_or(0))
+        };
+    }
+    tput_write(&crate::tparm::tparm_params(raw, &pars));
+    if cap == "clear" && !keep_scrollback {
+        if let Some(e3) = entry.string("E3") {
+            tput_write(e3);
+        }
+    }
+    0
+}
+
+impl ShellExecutor {
+    /// zbuild --in PATHS... --out OUT — bake one or more shell
+    /// scripts into a copy of the running zshrs binary in input
+    /// order, producing a self-contained AOT executable.
+    ///
+    ///   zbuild --in *.zsh --out app           # glob expansion
+    ///   zbuild --in lib1.zsh lib2.zsh main.zsh --out app
+    ///   ./app                                  # runs all three
+    ///                                          # sequentially under
+    ///                                          # one ShellExecutor
+    ///
+    /// zsh has no project concept, so there's no manifest, no entry
+    /// point convention, no library directory walker. Order is
+    /// exactly the order of paths given to `--in` (which honors
+    /// shell glob expansion — \`*.zsh\` expands sorted by default).
+    ///
+    /// `--in` accepts ONE OR MORE paths until the next flag-style
+    /// token (anything starting with `-`). This makes glob-driven
+    /// invocations like `--in *.zsh` work naturally — every path
+    /// the glob expanded to lands as another input file.
+    ///
+    /// Flags:
+    ///   --in PATHS...  / -i PATHS...   script sources (1+, required)
+    ///   --out PATH     / -o PATH       output binary (required)
+    ///   --native / -n                  AOT-compile to native machine code
+    ///                                  (Cranelift object linked standalone)
+    ///   --help / -h                    print usage
+    pub(crate) fn builtin_zbuild(&self, args: &[String]) -> i32 {
+        let mut inputs: Vec<std::path::PathBuf> = Vec::new();
+        let mut output: Option<String> = None;
+        let mut native = false;
+        let mut i = 0;
+        while i < args.len() {
+            let arg = &args[i];
+            match arg.as_str() {
+                "--native" | "-n" => {
+                    native = true;
+                }
+                "--in" | "-i" | "--input" => {
+                    // Consume every non-flag token following --in
+                    // until we hit the next `-`-prefixed token (or
+                    // end of args). This makes `--in *.zsh` pick up
+                    // all paths the glob produced.
+                    i += 1;
+                    let start = i;
+                    while i < args.len() && !args[i].starts_with('-') {
+                        inputs.push(std::path::PathBuf::from(&args[i]));
+                        i += 1;
+                    }
+                    if i == start {
+                        eprintln!("zshrs:zbuild:1: --in requires at least one path");
+                        return 1;
+                    }
+                    continue;
+                }
+                s if s.starts_with("--in=") => {
+                    inputs.push(std::path::PathBuf::from(&s[5..]));
+                }
+                s if s.starts_with("--input=") => {
+                    inputs.push(std::path::PathBuf::from(&s[8..]));
+                }
+                "--out" | "-o" | "--output" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("zshrs:zbuild:1: --out requires a path");
+                        return 1;
+                    }
+                    output = Some(args[i].clone());
+                }
+                s if s.starts_with("--out=") => output = Some(s[6..].to_string()),
+                s if s.starts_with("--output=") => output = Some(s[9..].to_string()),
+                "--help" | "-h" => {
+                    println!("Usage: zbuild --in PATHS... --out OUT");
+                    println!();
+                    println!("Bake one or more shell scripts into an AOT-compiled");
+                    println!("standalone executable. Files run sequentially in input");
+                    println!("order under a single ShellExecutor (globals/functions");
+                    println!("from earlier files visible to later ones).");
+                    println!();
+                    println!("Examples:");
+                    println!("  zbuild --in *.zsh --out app");
+                    println!("  zbuild --in lib.zsh main.zsh --out app");
+                    println!();
+                    println!("Options:");
+                    println!("  --in / -i PATHS...  script sources (1+, required)");
+                    println!("  --out / -o PATH     output binary (required)");
+                    println!("  --native / -n       AOT-compile to native machine code");
+                    println!("                      (Cranelift object linked standalone)");
+                    return 0;
+                }
+                _ => {
+                    eprintln!("zshrs:zbuild:1: unrecognized argument: {}", arg);
+                    return 1;
+                }
+            }
+            i += 1;
+        }
+        if inputs.is_empty() {
+            eprintln!("zshrs:zbuild:1: at least one --in PATH required");
+            return 1;
+        }
+        let out_path = match output {
+            Some(p) => p,
+            None => {
+                eprintln!("zshrs:zbuild:1: --out PATH required");
+                return 1;
+            }
+        };
+        if native {
+            return match crate::aot::build_native(&inputs, std::path::Path::new(&out_path)) {
+                Ok(p) => {
+                    eprintln!("zbuild: wrote native binary {}", p.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("zshrs:zbuild:1: {}", e);
+                    1
+                }
+            };
+        }
+        match crate::aot::build(&inputs, std::path::Path::new(&out_path)) {
+            Ok(p) => {
+                eprintln!(
+                    "zbuild: wrote {} ({} file{} embedded)",
+                    p.display(),
+                    inputs.len(),
+                    if inputs.len() == 1 { "" } else { "s" }
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("zshrs:zbuild:1: {}", e);
+                1
+            }
+        }
+    }
+
+    /// logname — print login name. Coreutils logname(1) / POSIX.
+    /// Calls getlogin(3) which reads from utmp. Falls back to
+    /// \$LOGNAME if getlogin fails.
+    pub(crate) fn builtin_logname(&self, args: &[String]) -> i32 {
+        for arg in args {
+            if arg.starts_with('-') && arg.len() > 1 && arg != "--" {
+                eprintln!("logname: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            if !arg.starts_with('-') {
+                eprintln!("logname: extra operand '{}'", arg);
+                return 1;
+            }
+        }
+        let p = unsafe { libc::getlogin() };
+        if !p.is_null() {
+            let name = unsafe { std::ffi::CStr::from_ptr(p) };
+            println!("{}", name.to_string_lossy());
+            return 0;
+        }
+        // Fallback for environments without utmp (e.g. CI containers).
+        match std::env::var("LOGNAME") {
+            Ok(v) if !v.is_empty() => {
+                println!("{}", v);
+                0
+            }
+            _ => {
+                eprintln!("logname: no login name");
+                1
+            }
+        }
+    }
+
+    /// nice [-n N] [-N N] [COMMAND...] — adjust niceness of the
+    /// shell process (when no COMMAND given) or report current
+    /// niceness. Coreutils nice(1) / POSIX nice(1). Without args,
+    /// print the current niceness (like \`nice\` with no args). With
+    /// just -n N, set the niceness for the SHELL ITSELF — not for
+    /// a subsequently-exec'd command. Setting niceness for a child
+    /// command requires fork-exec which the in-process model
+    /// can't do without breaking subsequent commands; for that case
+    /// callers should use /usr/bin/nice via PATH (zshrs's command
+    /// dispatch will fall through to the external).
+    pub(crate) fn builtin_nice(&self, args: &[String]) -> i32 {
+        let mut adjust: Option<i32> = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-n" | "--adjustment" => {
+                    if let Some(s) = iter.next() {
+                        match s.parse::<i32>() {
+                            Ok(n) => adjust = Some(n),
+                            Err(_) => {
+                                eprintln!("nice: '{}': invalid adjustment", s);
+                                return 1;
+                            }
+                        }
+                    } else {
+                        eprintln!("nice: option requires an argument: -n");
+                        return 1;
+                    }
+                }
+                s if s.starts_with("-n") && s.len() > 2 => match s[2..].parse::<i32>() {
+                    Ok(n) => adjust = Some(n),
+                    Err(_) => {
+                        eprintln!("nice: '{}': invalid adjustment", &s[2..]);
+                        return 1;
+                    }
+                },
+                "--" => break,
+                s if !s.starts_with('-') => {
+                    // Bare COMMAND given. We can't fork-exec from
+                    // the in-process model. Tell the user to use
+                    // the external /usr/bin/nice for that case.
+                    eprintln!(
+                        "nice: command-launching mode unavailable in-process; use /usr/bin/nice"
+                    );
+                    return 1;
+                }
+                s => {
+                    eprintln!("nice: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let _ = iter;
+        if let Some(adj) = adjust {
+            // Apply to the shell process itself.
+            let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            let target = (cur + adj).clamp(-20, 19);
+            if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) } != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("nice: cannot set niceness: {}", err);
+                return 1;
+            }
+            return 0;
+        }
+        // No -n: print current niceness.
+        let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        println!("{}", cur);
+        0
+    }
+
+    /// arch — print machine architecture name. Coreutils arch(1)
+    /// (a synonym for `uname -m` on most systems). Useful in shell
+    /// scripts that need a quick `[[ $(arch) == arm64 ]]` check.
+    pub(crate) fn builtin_arch(&self, args: &[String]) -> i32 {
+        for arg in args {
+            if arg.starts_with('-') && arg.len() > 1 {
+                eprintln!("arch: unrecognized option: '{}'", arg);
+                return 1;
+            }
+        }
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut uts) } != 0 {
+            eprintln!("arch: uname() failed");
+            return 1;
+        }
+        // machine[] is a fixed-size i8 (or u8) array; convert to str.
+        let machine: Vec<u8> = uts
+            .machine
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        let machine_str = String::from_utf8_lossy(&machine);
+        println!("{}", machine_str);
+        0
+    }
+
+    /// dircolors [-bcp] [FILE] — coreutils dircolors(1). Parses a
+    /// dircolors database (FILE, `-` for stdin, or the compiled-in
+    /// default) and emits the shell command that sets LS_COLORS: `-b`
+    /// Bourne, `-c` csh, otherwise chosen from `$SHELL`. `-p` prints
+    /// the default database and takes no FILE.
+    pub(crate) fn builtin_dircolors(&self, args: &[String]) -> i32 {
+        let mut shell_kind: Option<bool> = None; // Some(true) = csh
+        let mut print_database = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut opts_done = false;
+        for arg in args {
+            let a = arg.as_str();
+            if opts_done || a == "-" || !a.starts_with('-') {
+                files.push(a);
+                continue;
+            }
+            match a {
+                "--" => opts_done = true,
+                "-b" | "--sh" | "--bourne-shell" => shell_kind = Some(false),
+                "-c" | "--csh" | "--c-shell" => shell_kind = Some(true),
+                "-p" | "--print-database" => print_database = true,
+                _ => {
+                    eprintln!("dircolors: unrecognized option '{}'", a);
+                    return 1;
+                }
+            }
+        }
+        if files.len() > 1 {
+            eprintln!("dircolors: extra operand '{}'", files[1]);
+            return 1;
+        }
+        if print_database {
+            if !files.is_empty() {
+                eprintln!(
+                    "dircolors: file operands cannot be combined with --print-database (-p)"
+                );
+                return 1;
+            }
+            print!("{}", DIRCOLORS_DEFAULT_DATABASE);
+            return 0;
+        }
+        let csh = match shell_kind {
+            Some(c) => c,
+            None => match env::var("SHELL") {
+                Ok(s) if !s.is_empty() => {
+                    let base = s.rsplit('/').next().unwrap_or(&s);
+                    base.ends_with("csh")
+                }
+                _ => {
+                    eprintln!(
+                        "dircolors: no SHELL environment variable, and no shell type option given"
+                    );
+                    return 1;
+                }
+            },
+        };
+
+        let (name, text) = match files.first().copied() {
+            None => ("<default>".to_string(), DIRCOLORS_DEFAULT_DATABASE.to_string()),
+            Some(f) => {
+                let mut buf = String::new();
+                let r = if f == "-" {
+                    io::stdin().read_to_string(&mut buf)
+                } else {
+                    std::fs::File::open(f).and_then(|mut fh| fh.read_to_string(&mut buf))
+                };
+                if let Err(e) = r {
+                    let msg = e.to_string();
+                    eprintln!(
+                        "dircolors: {}: {}",
+                        f,
+                        msg.split(" (os error").next().unwrap_or(&msg)
+                    );
+                    return 1;
+                }
+                (f.to_string(), buf)
+            }
+        };
+
+        match dircolors_render(
+            &text,
+            &name,
+            csh,
+            &env::var("TERM").unwrap_or_default(),
+            &env::var("COLORTERM").unwrap_or_default(),
+        ) {
+            Ok(s) => {
+                print!("{}", s);
+                0
+            }
+            Err(e) => {
+                eprintln!("dircolors: {}", e);
+                1
+            }
+        }
+    }
+
+    /// link FILE1 FILE2 — call link(2) directly to create a hard
+    /// link from FILE1 to FILE2. POSIX link(1) / coreutils link(1).
+    /// Unlike `ln`, link takes EXACTLY two args and rejects flags
+    /// (POSIX requirement).
+    pub(crate) fn builtin_link(&self, args: &[String]) -> i32 {
+        if args.len() != 2 {
+            eprintln!("link: missing operand");
+            return 1;
+        }
+        for a in args {
+            if a.starts_with('-') && a.len() > 1 {
+                // POSIX link(1) accepts no options.
+                eprintln!("link: unrecognized option: '{}'", a);
+                return 1;
+            }
+        }
+        if let Err(e) = std::fs::hard_link(&args[0], &args[1]) {
+            eprintln!("link: cannot link '{}' to '{}': {}", args[0], args[1], e);
+            return 1;
+        }
+        0
+    }
+
+    /// unlink FILE — call unlink(2) directly to remove a single
+    /// file. POSIX unlink(1) / coreutils unlink(1). Strict: takes
+    /// exactly ONE arg, no flags, no recursion. Cannot remove
+    /// directories (errors if FILE is a directory).
+    pub(crate) fn builtin_unlink(&self, args: &[String]) -> i32 {
+        if args.len() != 1 {
+            eprintln!("unlink: missing operand");
+            return 1;
+        }
+        if args[0].starts_with('-') && args[0].len() > 1 {
+            eprintln!("unlink: unrecognized option: '{}'", args[0]);
+            return 1;
+        }
+        if let Err(e) = std::fs::remove_file(&args[0]) {
+            eprintln!("unlink: cannot unlink '{}': {}", args[0], e);
+            return 1;
+        }
+        0
+    }
+
+    /// mkfifo [-m MODE] FILE... — create named pipes (FIFOs).
+    /// Coreutils mkfifo(1) / POSIX. -m sets the mode (default 0666
+    /// minus umask). Each FIFO is created independently; failures
+    /// are reported per-file and the others continue.
+    pub(crate) fn builtin_mkfifo(&self, args: &[String]) -> i32 {
+        let mut mode: libc::mode_t = 0o666;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-m" | "--mode" => {
+                    if let Some(m) = iter.next() {
+                        match libc::mode_t::from_str_radix(m, 8) {
+                            Ok(v) => mode = v,
+                            Err(_) => {
+                                eprintln!("mkfifo: invalid mode: '{}'", m);
+                                return 1;
+                            }
+                        }
+                    } else {
+                        eprintln!("mkfifo: option requires an argument -- '-m'");
+                        return 1;
+                    }
+                }
+                s if s.starts_with("--mode=") => match libc::mode_t::from_str_radix(&s[7..], 8) {
+                    Ok(v) => mode = v,
+                    Err(_) => {
+                        eprintln!("mkfifo: invalid mode: '{}'", &s[7..]);
+                        return 1;
+                    }
+                },
+                s if !s.starts_with('-') => files.push(s),
+                "-" => files.push("-"),
+                _ => {
+                    eprintln!("mkfifo: unrecognized option: '{}'", arg);
+                    return 1;
+                }
+            }
+        }
+        if files.is_empty() {
+            eprintln!("mkfifo: missing operand");
+            return 1;
+        }
+        let mut status = 0;
+        for f in files {
+            let cpath = match CString::new(f) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("mkfifo: cannot create fifo '{}': invalid path", f);
+                    status = 1;
+                    continue;
+                }
+            };
+            if unsafe { libc::mkfifo(cpath.as_ptr(), mode) } != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("mkfifo: cannot create fifo '{}': {}", f, err);
+                status = 1;
+            }
+        }
+        status
+    }
+
+    /// tsort [FILE] — topological sort, a port of GNU coreutils
+    /// `tsort.c` (see [`tsort_run`]). Reads stdin when no file is given
+    /// or `-`; exit status 1 on a loop or odd token count.
+    pub(crate) fn builtin_tsort(&self, args: &[String]) -> i32 {
+        let file: &str = args
+            .iter()
+            .find(|a| !a.starts_with('-') || a.as_str() == "-")
+            .map(|s| s.as_str())
+            .unwrap_or("-");
+        let mut text = String::new();
+        let read = if file == "-" {
+            io::stdin().read_to_string(&mut text)
+        } else {
+            std::fs::File::open(file).and_then(|mut fh| fh.read_to_string(&mut text))
+        };
+        if let Err(e) = read {
+            eprintln!("tsort: {}: {}", file, e);
+            return 1;
+        }
+        let (out, err, ok) = tsort_run(&text, file);
+        for l in out {
+            println!("{}", l);
+        }
+        for l in err {
+            eprintln!("tsort: {}", l);
+        }
+        if ok {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// sum [-rs] [FILE...] — BSD or SysV checksum.
+    /// `-r`: BSD 16-bit rotating checksum (default per POSIX).
+    /// `-s`: SysV checksum (sum-of-bytes mod 65535, then folded).
+    /// Output: `<sum> <512-byte-blocks> [name]` (BSD) or
+    ///         `<sum> <kbytes> [name]` (SysV).
+    pub(crate) fn builtin_sum(&self, args: &[String]) -> i32 {
+        let mut sysv = false;
+        let mut files: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.as_str() {
+                "-r" => sysv = false,
+                "-s" | "--sysv" => sysv = true,
+                "--bsd" => sysv = false,
+                s if !s.starts_with('-') || s == "-" => files.push(s),
+                _ => {
+                    eprintln!("zshrs:sum:1: unknown option: {}", arg);
+                    return 1;
+                }
+            }
+        }
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        let bsd_sum = |bytes: &[u8]| -> u32 {
+            let mut s: u32 = 0;
+            for &b in bytes {
+                // BSD: rotate right one bit then add — 16-bit value.
+                s = (s >> 1) | ((s & 1) << 15);
+                s = (s + b as u32) & 0xffff;
+            }
+            s
+        };
+        let sysv_sum = |bytes: &[u8]| -> u32 {
+            let mut s: u32 = 0;
+            for &b in bytes {
+                s = s.wrapping_add(b as u32);
+            }
+            // Two-stage fold: r = (s & 0xffff) + (s >> 16);
+            // then r = (r & 0xffff) + (r >> 16). Per coreutils.
+            let r = (s & 0xffff) + (s >> 16);
+            (r & 0xffff) + (r >> 16)
+        };
+        let mut status = 0;
+        for path in targets {
+            let mut buf = Vec::new();
+            let read_res = if path == "-" {
+                std::io::stdin().read_to_end(&mut buf)
+            } else {
+                match std::fs::File::open(path) {
+                    Ok(mut f) => f.read_to_end(&mut buf),
+                    Err(e) => {
+                        eprintln!("sum: {}: {}", path, e);
+                        status = 1;
+                        continue;
+                    }
+                }
+            };
+            if let Err(e) = read_res {
+                eprintln!("sum: {}: {}", path, e);
+                status = 1;
+                continue;
+            }
+            if sysv {
+                let s = sysv_sum(&buf);
+                let kbytes = buf.len().div_ceil(1024);
+                if path == "-" {
+                    println!("{} {}", s, kbytes);
+                } else {
+                    println!("{} {} {}", s, kbytes, path);
+                }
+            } else {
+                let s = bsd_sum(&buf);
+                let blocks = buf.len().div_ceil(512);
+                if path == "-" {
+                    println!("{:05} {:5}", s, blocks);
+                } else {
+                    println!("{:05} {:5} {}", s, blocks, path);
+                }
+            }
+        }
+        status
+    }
+
+    /// cksum [FILE...] — POSIX CRC-32 + byte-count + filename.
+    /// Output: `<crc> <bytes> <name>`. With no files or `-` reads
+    /// stdin (filename column omitted in that case, per coreutils).
+    /// Polynomial: 0x04C11DB7, init 0, length appended (POSIX).
+    pub(crate) fn builtin_cksum(&self, args: &[String]) -> i32 {
+        // POSIX cksum table, generated for polynomial 0x04C11DB7 with
+        // bits processed MSB-first. Built once at runtime per call;
+        // a const table would be ~1KB but the runtime cost of building
+        // is microseconds and avoids the const-array boilerplate.
+        let mut table = [0u32; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = (i as u32) << 24;
+            for _ in 0..8 {
+                c = if c & 0x8000_0000 != 0 {
+                    (c << 1) ^ 0x04C11DB7
+                } else {
+                    c << 1
+                };
+            }
+            *slot = c;
+        }
+        let crc_bytes = |bytes: &[u8]| -> (u32, u64) {
+            let mut crc: u32 = 0;
+            let mut len: u64 = 0;
+            for &b in bytes {
+                crc = (crc << 8) ^ table[((crc >> 24) ^ b as u32) as usize & 0xff];
+                len += 1;
+            }
+            // POSIX cksum appends the length as little-endian-by-byte
+            // until length consumed.
+            let mut n = len;
+            while n != 0 {
+                crc = (crc << 8) ^ table[((crc >> 24) ^ (n as u32 & 0xff)) as usize & 0xff];
+                n >>= 8;
+            }
+            (!crc, len)
+        };
+        let files: Vec<&str> = args
+            .iter()
+            .filter(|a| !a.starts_with('-') || *a == "-")
+            .map(|s| s.as_str())
+            .collect();
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        let mut status = 0;
+        for path in targets {
+            let mut buf = Vec::new();
+            let read_res = if path == "-" {
+                std::io::stdin().read_to_end(&mut buf)
+            } else {
+                match std::fs::File::open(path) {
+                    Ok(mut f) => f.read_to_end(&mut buf),
+                    Err(e) => {
+                        eprintln!("cksum: {}: {}", path, e);
+                        status = 1;
+                        continue;
+                    }
+                }
+            };
+            if let Err(e) = read_res {
+                eprintln!("cksum: {}: {}", path, e);
+                status = 1;
+                continue;
+            }
+            let (crc, len) = crc_bytes(&buf);
+            if path == "-" {
+                println!("{} {}", crc, len);
+            } else {
+                println!("{} {} {}", crc, len, path);
+            }
+        }
+        status
+    }
+
+    /// factor N... — print prime factorization of each integer arg.
+    /// Coreutils factor(1). Format: `N: p1 p2 p3 ...`. Reads stdin
+    /// if no args. Negative numbers and zero are rejected.
+    pub(crate) fn builtin_factor(&self, args: &[String]) -> i32 {
+        let factor_line = |line: &str| {
+            for tok in line.split_whitespace() {
+                let n: u64 = match tok.parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("factor: '{}' is not a valid positive integer", tok);
+                        continue;
+                    }
+                };
+                let mut x = n;
+                let mut factors: Vec<u64> = Vec::new();
+                if x < 2 {
+                    // 0 and 1 have no prime factorization. coreutils
+                    // emits `N:` with empty list. Match that.
+                    println!("{}:", n);
+                    continue;
+                }
+                while x.is_multiple_of(2) {
+                    factors.push(2);
+                    x /= 2;
+                }
+                let mut p: u64 = 3;
+                while p.saturating_mul(p) <= x {
+                    while x.is_multiple_of(p) {
+                        factors.push(p);
+                        x /= p;
+                    }
+                    p += 2;
+                }
+                if x > 1 {
+                    factors.push(x);
+                }
+                let parts: Vec<String> = factors.iter().map(|p| p.to_string()).collect();
+                println!("{}: {}", n, parts.join(" "));
+            }
+        };
+        let nums: Vec<&str> = args
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| s.as_str())
+            .collect();
+        if nums.is_empty() {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines().map_while(Result::ok) {
+                factor_line(&line);
+            }
+        } else {
+            for tok in nums {
+                factor_line(tok);
+            }
+        }
+        0
+    }
+
+    /// comm [-123] FILE1 FILE2 — line-by-line comparison of two
+    /// sorted files. Coreutils comm(1) / POSIX. Three columns:
+    /// (1) unique to FILE1, (2) unique to FILE2, (3) common.
+    /// Flags `-1`/`-2`/`-3` suppress the respective column. Either
+    /// file may be `-` for stdin. Files MUST be sorted in the same
+    /// collation; comm performs a streaming merge-compare and is
+    /// undefined-behavior on unsorted input (matches coreutils).
+    pub(crate) fn builtin_comm(&self, args: &[String]) -> i32 {
+        let mut suppress1 = false;
+        let mut suppress2 = false;
+        let mut suppress3 = false;
+        let mut files: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.as_str() {
+                "-1" => suppress1 = true,
+                "-2" => suppress2 = true,
+                "-3" => suppress3 = true,
+                "-12" | "-21" => {
+                    suppress1 = true;
+                    suppress2 = true;
+                }
+                "-13" | "-31" => {
+                    suppress1 = true;
+                    suppress3 = true;
+                }
+                "-23" | "-32" => {
+                    suppress2 = true;
+                    suppress3 = true;
+                }
+                "-123" | "-132" | "-213" | "-231" | "-312" | "-321" => {
+                    suppress1 = true;
+                    suppress2 = true;
+                    suppress3 = true;
+                }
+                "--help" => {
+                    println!("Usage: comm [-123] FILE1 FILE2");
+                    return 0;
+                }
+                s if !s.starts_with('-') || s == "-" => files.push(s),
+                _ => {
+                    eprintln!("zshrs:comm:1: unknown option: {}", arg);
+                    return 1;
+                }
+            }
+        }
+        if files.len() != 2 {
+            eprintln!("zshrs:comm:1: expected exactly 2 file arguments");
+            return 1;
+        }
+        let read_lines = |path: &str| -> std::io::Result<Vec<String>> {
+            let reader: Box<dyn BufRead> = if path == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                Box::new(BufReader::new(std::fs::File::open(path)?))
+            };
+            reader.lines().collect()
+        };
+        let lines1 = match read_lines(files[0]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zshrs:comm:1: {}: {}", files[0], e);
+                return 1;
+            }
+        };
+        let lines2 = match read_lines(files[1]) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zshrs:comm:1: {}: {}", files[1], e);
+                return 1;
+            }
+        };
+        let mut i = 0usize;
+        let mut j = 0usize;
+        let emit_col1 = |s: &str| {
+            if !suppress1 {
+                println!("{}", s);
+            }
+        };
+        let emit_col2 = |s: &str| {
+            if !suppress2 {
+                let prefix = if suppress1 { "" } else { "\t" };
+                println!("{}{}", prefix, s);
+            }
+        };
+        let emit_col3 = |s: &str| {
+            if !suppress3 {
+                let prefix = match (suppress1, suppress2) {
+                    (true, true) => "",
+                    (false, true) | (true, false) => "\t",
+                    (false, false) => "\t\t",
+                };
+                println!("{}{}", prefix, s);
+            }
+        };
+        while i < lines1.len() && j < lines2.len() {
+            match lines1[i].cmp(&lines2[j]) {
+                std::cmp::Ordering::Less => {
+                    emit_col1(&lines1[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    emit_col2(&lines2[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    emit_col3(&lines1[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        while i < lines1.len() {
+            emit_col1(&lines1[i]);
+            i += 1;
+        }
+        while j < lines2.len() {
+            emit_col2(&lines2[j]);
+            j += 1;
+        }
+        0
+    }
+
+    /// tac [-b] [-r] [-s SEP] [FILE...] — concatenate files, reverse
+    /// record order, one file at a time. coreutils tac(1): records end
+    /// with SEP (default newline); `-b` attaches SEP to the start of the
+    /// following record instead; `-r` treats SEP as a regular expression.
+    pub(crate) fn builtin_tac(&self, args: &[String]) -> i32 {
+        let mut files: Vec<&str> = Vec::new();
+        let mut before = false;
+        let mut regex_sep = false;
+        let mut separator: Vec<u8> = b"\n".to_vec();
+        let mut iter = args.iter();
+        while let Some(a) = iter.next() {
+            let s: &str = a.as_str();
+            match s {
+                "-" => files.push("-"),
+                "-b" | "--before" => before = true,
+                "-r" | "--regex" => regex_sep = true,
+                "-s" | "--separator" => match iter.next() {
+                    Some(sep) => separator = sep.as_bytes().to_vec(),
+                    None => {
+                        eprintln!("tac: option requires an argument -- 's'");
+                        return 1;
+                    }
+                },
+                _ if s.starts_with("--separator=") => {
+                    separator = s["--separator=".len()..].as_bytes().to_vec();
+                }
+                _ if s.starts_with("-s") && s.len() > 2 => separator = s.as_bytes()[2..].to_vec(),
+                "--" => {
+                    for rest in iter.by_ref() {
+                        files.push(rest);
+                    }
+                    break;
+                }
+                x if !x.starts_with('-') => files.push(x),
+                _ => {
+                    eprintln!("tac: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        if separator.is_empty() {
+            eprintln!("tac: separator cannot be empty");
+            return 1;
+        }
+        let re = if regex_sep {
+            match regex::bytes::Regex::new(&String::from_utf8_lossy(&separator)) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("tac: invalid regular expression: {}", e);
+                    return 1;
+                }
+            }
+        } else {
+            None
+        };
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        let mut status = 0;
+        for file in targets {
+            let mut data: Vec<u8> = Vec::new();
+            let read = if file == "-" {
+                std::io::stdin().lock().read_to_end(&mut data)
+            } else {
+                std::fs::File::open(file).and_then(|mut f| f.read_to_end(&mut data))
+            };
+            if let Err(e) = read {
+                eprintln!("tac: {}: {}", file, e);
+                status = 1;
+                continue;
+            }
+            // (start, end) of every separator occurrence.
+            let spans: Vec<(usize, usize)> = match &re {
+                Some(r) => r
+                    .find_iter(&data)
+                    .filter(|m| m.end() > m.start())
+                    .map(|m| (m.start(), m.end()))
+                    .collect(),
+                None => {
+                    let mut v = Vec::new();
+                    let mut pos = 0;
+                    while pos + separator.len() <= data.len() {
+                        if data[pos..pos + separator.len()] == separator[..] {
+                            v.push((pos, pos + separator.len()));
+                            pos += separator.len();
+                        } else {
+                            pos += 1;
+                        }
+                    }
+                    v
+                }
+            };
+            // Record boundaries: after each separator, or before it with -b.
+            let mut cuts: Vec<usize> = vec![0];
+            for (s, e) in spans {
+                let cut = if before { s } else { e };
+                if cut > *cuts.last().unwrap_or(&0) && cut < data.len() {
+                    cuts.push(cut);
+                }
+            }
+            cuts.push(data.len());
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            for w in cuts.windows(2).rev() {
+                if out.write_all(&data[w[0]..w[1]]).is_err() {
+                    return 1;
+                }
+            }
+        }
+        status
+    }
+
+    /// expand [-i] [-t TAB] [FILE...] — convert tabs to spaces.
+    /// coreutils expand(1); `-i` converts only leading tabs.
+    pub(crate) fn builtin_expand(&self, args: &[String]) -> i32 {
+        // Default tab stop 8.
+        let mut tabs: Vec<usize> = vec![8];
+        // -i: convert only the tabs before the first non-blank character.
+        let mut initial_only = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-t" | "--tabs" => {
+                    if let Some(s) = iter.next() {
+                        tabs = s.split([',', ' ']).filter_map(|x| x.parse().ok()).collect();
+                        if tabs.is_empty() {
+                            tabs = vec![8];
+                        }
+                    }
+                }
+                s if s.starts_with("-t") && s.len() > 2 => {
+                    tabs = s[2..]
+                        .split([',', ' '])
+                        .filter_map(|x| x.parse().ok())
+                        .collect();
+                    if tabs.is_empty() {
+                        tabs = vec![8];
+                    }
+                }
+                "-i" | "--initial" => initial_only = true,
+                "-" => files.push("-"),
+                "--" => {
+                    for rest in iter.by_ref() {
+                        files.push(rest);
+                    }
+                    break;
+                }
+                s if !s.starts_with('-') => files.push(s),
+                s => {
+                    eprintln!("expand: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let stop_for = |col: usize| -> usize {
+            if tabs.len() == 1 {
+                let t = tabs[0];
+                col + (t - col % t)
+            } else {
+                // Multi-stop: find the first stop > col, else 1-extend.
+                for &s in &tabs {
+                    if s > col {
+                        return s;
+                    }
+                }
+                col + 1
+            }
+        };
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        for file in targets {
+            let reader: Box<dyn BufRead> = if file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!("expand: {}: {}", file, e);
+                        return 1;
+                    }
+                }
+            };
+            for line in reader.lines().map_while(Result::ok) {
+                let mut col = 0usize;
+                let mut out = String::with_capacity(line.len());
+                let mut seen_nonblank = false;
+                for c in line.chars() {
+                    if c == '\t' {
+                        let target = stop_for(col);
+                        if initial_only && seen_nonblank {
+                            out.push('\t');
+                            col = target;
+                            continue;
+                        }
+                        while col < target {
+                            out.push(' ');
+                            col += 1;
+                        }
+                    } else {
+                        if c != ' ' {
+                            seen_nonblank = true;
+                        }
+                        out.push(c);
+                        col += 1;
+                    }
+                }
+                println!("{}", out);
+            }
+        }
+        0
+    }
+
+    /// unexpand [-a] [-t TAB] [FILE...] — convert spaces to tabs.
+    /// coreutils unexpand(1).  Default tabstop 8; -a converts every
+    /// run of spaces (not just leading); without -a only leading
+    /// runs collapse.
+    pub(crate) fn builtin_unexpand(&self, args: &[String]) -> i32 {
+        let mut tabstop: usize = 8;
+        let mut all_runs = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-a" | "--all" => all_runs = true,
+                "-t" | "--tabs" => {
+                    if let Some(s) = iter.next() {
+                        if let Ok(n) = s.parse() {
+                            tabstop = n;
+                            all_runs = true;
+                        }
+                    }
+                }
+                s if s.starts_with("-t") && s.len() > 2 => {
+                    if let Ok(n) = s[2..].parse() {
+                        tabstop = n;
+                        all_runs = true;
+                    }
+                }
+                "-" => files.push("-"),
+                "--" => {
+                    for rest in iter.by_ref() {
+                        files.push(rest);
+                    }
+                    break;
+                }
+                s if !s.starts_with('-') => files.push(s),
+                s => {
+                    eprintln!("unexpand: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        for file in targets {
+            let reader: Box<dyn BufRead> = if file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!("unexpand: {}: {}", file, e);
+                        return 1;
+                    }
+                }
+            };
+            for line in reader.lines().map_while(Result::ok) {
+                let mut out = String::with_capacity(line.len());
+                let mut col = 0usize;
+                let chars: Vec<char> = line.chars().collect();
+                let mut i = 0;
+                let mut leading = true;
+                while i < chars.len() {
+                    if chars[i] == ' ' && (all_runs || leading) {
+                        // Count run of spaces.
+                        let start_col = col;
+                        let mut j = i;
+                        while j < chars.len() && chars[j] == ' ' {
+                            j += 1;
+                            col += 1;
+                        }
+                        // Compress as many tabs as possible.
+                        let mut cur = start_col;
+                        let next_stop = |c: usize| (c / tabstop + 1) * tabstop;
+                        while cur + (next_stop(cur) - cur) <= col {
+                            let s = next_stop(cur);
+                            out.push('\t');
+                            cur = s;
+                        }
+                        // Pad remainder with spaces.
+                        for _ in cur..col {
+                            out.push(' ');
+                        }
+                        i = j;
+                    } else {
+                        out.push(chars[i]);
+                        if chars[i] != ' ' && chars[i] != '\t' {
+                            leading = false;
+                        }
+                        if chars[i] == '\t' {
+                            col = (col / tabstop + 1) * tabstop;
+                        } else {
+                            col += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                println!("{}", out);
+            }
+        }
+        0
+    }
+
+    /// sha256sum [FILE...] — write SHA-256 of each file (or stdin
+    /// when no FILE / '-'). coreutils-style 'HEX  PATH' output.
+    pub(crate) fn builtin_sha256sum(&self, args: &[String]) -> i32 {
+        // Validate flags: silent-drop accepted any unknown -X. coreutils
+        // sha256sum specifically supports -b/-t/--binary/--text (binary
+        // mode marks the name with `*`, GNU style), - (stdin), and `--`.
+        // Anything else errors.
+        let mut binary = false;
+        let mut files: Vec<&str> = Vec::new();
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-" => files.push("-"),
+                "-b" | "--binary" => binary = true,
+                "-t" | "--text" => binary = false,
+                "--" => {
+                    for rest in iter.by_ref() {
+                        files.push(rest);
+                    }
+                    break;
+                }
+                s if !s.starts_with('-') => files.push(s),
+                s => {
+                    eprintln!("sha256sum: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let targets: Vec<&str> = if files.is_empty() { vec!["-"] } else { files };
+        let mut status = 0;
+        for f in targets {
+            let mut hasher = Sha256::new();
+            let result: std::io::Result<()> = (|| {
+                let mut buf = [0u8; 65536];
+                if f == "-" {
+                    let stdin = std::io::stdin();
+                    let mut h = stdin.lock();
+                    loop {
+                        let n = h.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                } else {
+                    let mut file = std::fs::File::open(f)?;
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    let hex = format!("{:x}", hasher.finalize());
+                    let sep = if binary { " *" } else { "  " };
+                    println!("{}{}{}", hex, sep, f);
+                }
+                Err(e) => {
+                    eprintln!("sha256sum: {}: {}", f, e);
+                    status = 1;
+                }
+            }
+        }
+        status
+    }
+
+    /// base64 [-d] [FILE] — encode/decode base64. coreutils
+    /// base64(1) without --wrap (defaults to 76-char wrap on
+    /// encode; 0 disables).
+    pub(crate) fn builtin_base64(&self, args: &[String]) -> i32 {
+        const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut decode = false;
+        let mut wrap: usize = 76;
+        let mut file: Option<&str> = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-d" | "--decode" => decode = true,
+                "-w" | "--wrap" => {
+                    if let Some(s) = iter.next() {
+                        wrap = s.parse().unwrap_or(76);
+                    }
+                }
+                s if s.starts_with("--wrap=") => {
+                    wrap = s[7..].parse().unwrap_or(76);
+                }
+                "-i" | "--ignore-garbage" => {} // accepted, default behaviour
+                "--" => {}                      // end of options
+                "-" => file = Some("-"),
+                s if !s.starts_with('-') => file = Some(s),
+                s => {
+                    eprintln!("base64: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let mut input = Vec::new();
+        match file {
+            Some(f) if f != "-" => match std::fs::File::open(f) {
+                Ok(mut h) => {
+                    let _ = h.read_to_end(&mut input);
+                }
+                Err(e) => {
+                    eprintln!("base64: {}: {}", f, e);
+                    return 1;
+                }
+            },
+            _ => {
+                let stdin = std::io::stdin();
+                let _ = stdin.lock().read_to_end(&mut input);
+            }
+        }
+        if decode {
+            // Strip whitespace then decode 4-char groups.
+            let cleaned: Vec<u8> = input
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            let mut out: Vec<u8> = Vec::with_capacity(cleaned.len() * 3 / 4);
+            let mut buf = [0u8; 4];
+            let mut have = 0usize;
+            for &c in &cleaned {
+                if c == b'=' {
+                    break;
+                }
+                let v = match c {
+                    b'A'..=b'Z' => c - b'A',
+                    b'a'..=b'z' => c - b'a' + 26,
+                    b'0'..=b'9' => c - b'0' + 52,
+                    b'+' => 62,
+                    b'/' => 63,
+                    _ => continue,
+                };
+                buf[have] = v;
+                have += 1;
+                if have == 4 {
+                    out.push((buf[0] << 2) | (buf[1] >> 4));
+                    out.push((buf[1] << 4) | (buf[2] >> 2));
+                    out.push((buf[2] << 6) | buf[3]);
+                    have = 0;
+                }
+            }
+            // Handle trailing 2/3 chars.
+            if have == 2 {
+                out.push((buf[0] << 2) | (buf[1] >> 4));
+            } else if have == 3 {
+                out.push((buf[0] << 2) | (buf[1] >> 4));
+                out.push((buf[1] << 4) | (buf[2] >> 2));
+            }
+            let _ = std::io::stdout().write_all(&out);
+        } else {
+            let mut out = String::with_capacity(input.len() * 4 / 3 + 4);
+            let mut col = 0usize;
+            let push_char = |c: u8, out: &mut String, col: &mut usize| {
+                out.push(c as char);
+                *col += 1;
+                if wrap > 0 && *col >= wrap {
+                    out.push('\n');
+                    *col = 0;
+                }
+            };
+            let mut i = 0;
+            while i + 3 <= input.len() {
+                let n = ((input[i] as u32) << 16)
+                    | ((input[i + 1] as u32) << 8)
+                    | (input[i + 2] as u32);
+                push_char(ALPHA[((n >> 18) & 0x3f) as usize], &mut out, &mut col);
+                push_char(ALPHA[((n >> 12) & 0x3f) as usize], &mut out, &mut col);
+                push_char(ALPHA[((n >> 6) & 0x3f) as usize], &mut out, &mut col);
+                push_char(ALPHA[(n & 0x3f) as usize], &mut out, &mut col);
+                i += 3;
+            }
+            let rem = input.len() - i;
+            if rem == 1 {
+                let n = (input[i] as u32) << 16;
+                push_char(ALPHA[((n >> 18) & 0x3f) as usize], &mut out, &mut col);
+                push_char(ALPHA[((n >> 12) & 0x3f) as usize], &mut out, &mut col);
+                push_char(b'=', &mut out, &mut col);
+                push_char(b'=', &mut out, &mut col);
+            } else if rem == 2 {
+                let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+                push_char(ALPHA[((n >> 18) & 0x3f) as usize], &mut out, &mut col);
+                push_char(ALPHA[((n >> 12) & 0x3f) as usize], &mut out, &mut col);
+                push_char(ALPHA[((n >> 6) & 0x3f) as usize], &mut out, &mut col);
+                push_char(b'=', &mut out, &mut col);
+            }
+            if col != 0 {
+                out.push('\n');
+            }
+            print!("{}", out);
+        }
+        0
+    }
+
+    /// nproc — print number of online CPUs. coreutils nproc(1).
+    /// --all uses CPU count from sysconf(_SC_NPROCESSORS_CONF);
+    /// default uses _SC_NPROCESSORS_ONLN (the schedulable subset).
+    pub(crate) fn builtin_nproc(&self, args: &[String]) -> i32 {
+        // coreutils nproc accepts --all and --ignore=N. Validate
+        // unknown flags rather than the previous silent accept.
+        let mut want_all = false;
+        let mut ignore: i64 = 0;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--all" => want_all = true,
+                s if s.starts_with("--ignore=") => {
+                    ignore = s[9..].parse().unwrap_or(0);
+                }
+                "--ignore" => match iter.next() {
+                    Some(n) => ignore = n.parse().unwrap_or(0),
+                    None => {
+                        eprintln!("nproc: option '--ignore' requires an argument");
+                        return 1;
+                    }
+                },
+                "--" => {}
+                s if s.starts_with('-') && s.len() > 1 => {
+                    eprintln!("nproc: invalid option: '{}'", s);
+                    return 1;
+                }
+                _ => {}
+            }
+        }
+        let n = unsafe {
+            if want_all {
+                libc::sysconf(libc::_SC_NPROCESSORS_CONF)
+            } else {
+                libc::sysconf(libc::_SC_NPROCESSORS_ONLN)
+            }
+        };
+        let mut count = if n <= 0 { 1 } else { n as i64 };
+        count = (count - ignore).max(1);
+        println!("{}", count);
+        0
+    }
+
+    /// expr ARG... — evaluate expression. POSIX expr(1).
+    /// Subset port: integer arithmetic (+ - * / %), string match
+    /// ': REGEX', length STRING, substr STRING POS LEN, index
+    /// STRING CHARS. Recognizes the closing arg list directly
+    /// (single-pass shunting-yard would be heavier than needed
+    /// for the common scripts).
+    pub(crate) fn builtin_expr(&self, args: &[String]) -> i32 {
+        if args.is_empty() {
+            eprintln!("expr: missing operand");
+            return 2;
+        }
+        // Strip optional leading '--'.
+        let mut argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        if argv[0] == "--" {
+            argv.remove(0);
+        }
+        // Single-arg shortcuts.
+        if argv.len() == 1 {
+            println!("{}", argv[0]);
+            return if argv[0].is_empty() || argv[0] == "0" {
+                1
+            } else {
+                0
+            };
+        }
+        // 'length STRING' / 'substr STR POS LEN' / 'index STR CHARS'.
+        match argv[0] {
+            "length" if argv.len() == 2 => {
+                let n = argv[1].chars().count();
+                println!("{}", n);
+                return if n == 0 { 1 } else { 0 };
+            }
+            "substr" if argv.len() == 4 => {
+                let pos: i64 = argv[2].parse().unwrap_or(1);
+                let len: i64 = argv[3].parse().unwrap_or(0);
+                let s = argv[1];
+                let start = (pos - 1).max(0) as usize;
+                let end = (start + len.max(0) as usize).min(s.chars().count());
+                if start >= s.chars().count() || len <= 0 {
+                    println!();
+                    return 1;
+                }
+                let out: String = s.chars().skip(start).take(end - start).collect();
+                println!("{}", out);
+                return if out.is_empty() { 1 } else { 0 };
+            }
+            "index" if argv.len() == 3 => {
+                let s = argv[1];
+                let chars = argv[2];
+                for (i, c) in s.char_indices() {
+                    if chars.contains(c) {
+                        // 1-based; coreutils returns char index, not byte.
+                        let n = s[..i].chars().count() + 1;
+                        println!("{}", n);
+                        return 0;
+                    }
+                }
+                println!("0");
+                return 1;
+            }
+            _ => {}
+        }
+        // Three-arg infix ops: STR OP STR. Numeric for + - * / %,
+        // string for = != < > <= >=, ':' for prefix match.
+        if argv.len() == 3 {
+            let a = argv[0];
+            let op = argv[1];
+            let b = argv[2];
+            let try_int = |s: &str| -> Option<i64> { s.parse().ok() };
+            let result: String = match op {
+                "+" | "-" | "*" | "/" | "%" => {
+                    let ai = try_int(a).unwrap_or(0);
+                    let bi = try_int(b).unwrap_or(0);
+                    let v = match op {
+                        "+" => ai + bi,
+                        "-" => ai - bi,
+                        "*" => ai * bi,
+                        "/" => {
+                            if bi == 0 {
+                                eprintln!("expr: division by zero");
+                                return 2;
+                            }
+                            ai / bi
+                        }
+                        "%" => {
+                            if bi == 0 {
+                                eprintln!("expr: division by zero");
+                                return 2;
+                            }
+                            ai % bi
+                        }
+                        _ => 0,
+                    };
+                    v.to_string()
+                }
+                "=" | "==" => (a == b).to_string(),
+                "!=" => (a != b).to_string(),
+                "<" => match (try_int(a), try_int(b)) {
+                    (Some(x), Some(y)) => (x < y).to_string(),
+                    _ => (a < b).to_string(),
+                },
+                ">" => match (try_int(a), try_int(b)) {
+                    (Some(x), Some(y)) => (x > y).to_string(),
+                    _ => (a > b).to_string(),
+                },
+                "<=" => match (try_int(a), try_int(b)) {
+                    (Some(x), Some(y)) => (x <= y).to_string(),
+                    _ => (a <= b).to_string(),
+                },
+                ">=" => match (try_int(a), try_int(b)) {
+                    (Some(x), Some(y)) => (x >= y).to_string(),
+                    _ => (a >= b).to_string(),
+                },
+                ":" => {
+                    // Anchored regex match; if pattern has a capture
+                    // group, output the capture; else the match length.
+                    let re = match regex::Regex::new(&format!("^{}", b)) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            eprintln!("expr: invalid regex: {}", b);
+                            return 2;
+                        }
+                    };
+                    if let Some(c) = re.captures(a) {
+                        if let Some(g1) = c.get(1) {
+                            g1.as_str().to_string()
+                        } else {
+                            c.get(0).map(|m| m.range().len()).unwrap_or(0).to_string()
+                        }
+                    } else {
+                        "0".to_string()
+                    }
+                }
+                _ => {
+                    eprintln!("expr: unknown operator: {}", op);
+                    return 2;
+                }
+            };
+            println!("{}", result);
+            return if result.is_empty() || result == "0" || result == "false" {
+                1
+            } else {
+                0
+            };
+        }
+        // Fallback: just print joined.
+        println!("{}", argv.join(" "));
+        0
+    }
+
+    /// printenv [VAR...] — print env. coreutils printenv(1).
+    /// No args: print all env vars in `environ` order, as printenv(1) does.
+    /// Args: print VAR's value per arg, exit 1 if any unset.
+    pub(crate) fn builtin_printenv(&self, args: &[String]) -> i32 {
+        // coreutils printenv has -0 / --null (NUL-terminate output).
+        // Old impl ignored flags silently and treated \`-0\` as a
+        // variable name lookup, which always failed since no env var
+        // is named \`-0\`.
+        let mut zero_term = false;
+        let mut names: Vec<&str> = Vec::new();
+        for arg in args {
+            match arg.as_str() {
+                "-0" | "--null" => zero_term = true,
+                "--" => {} // end of options
+                s if !s.starts_with('-') => names.push(s),
+                s => {
+                    eprintln!("printenv: unrecognized option: '{}'", s);
+                    return 1;
+                }
+            }
+        }
+        let term: char = if zero_term { '\0' } else { '\n' };
+        if names.is_empty() {
+            // environ order: the order the shell added the variables.
+            for (k, v) in std::env::vars() {
+                print!("{}={}{}", k, v, term);
+            }
+            return 0;
+        }
+        let mut status = 0;
+        for name in names {
+            match std::env::var(name) {
+                Ok(v) => print!("{}{}", v, term),
+                Err(_) => status = 1,
+            }
+        }
+        status
+    }
+
+    /// tty — print the controlling-terminal device path. coreutils
+    /// tty(1). -s suppresses output (just sets the exit code).
+    pub(crate) fn builtin_tty(&self, args: &[String]) -> i32 {
+        let mut silent = false;
+        for arg in args {
+            match arg.as_str() {
+                "-s" | "--silent" | "--quiet" => silent = true,
+                "--" => {}
+                s if s.starts_with('-') && s.len() > 1 => {
+                    eprintln!("tty: unrecognized option: '{}'", s);
+                    return 1;
+                }
+                _ => {} // bare arg ignored — coreutils tty takes no operands
+            }
+        }
+        unsafe {
+            let p = libc::ttyname(0);
+            if p.is_null() {
+                if !silent {
+                    println!("not a tty");
+                }
+                return 1;
+            }
+            if !silent {
+                let s = std::ffi::CStr::from_ptr(p);
+                println!("{}", s.to_string_lossy());
+            }
+        }
+        0
+    }
+
+    /// yes [STRING] — print STRING (or 'y') forever. coreutils
+    /// yes(1). Honors SIGPIPE: when stdout is piped and the consumer
+    /// closes, the write fails and we exit 0 silently.
+    pub(crate) fn builtin_yes(&self, args: &[String]) -> i32 {
+        // coreutils yes: \`yes --help\` / \`yes --version\` print
+        // help/version and exit when --help/--version is the sole
+        // arg. With multiple args (\`yes --help foo\`), --help is
+        // treated as part of the literal string to repeat (matches
+        // GNU yes 9.x exactly).
+        if args.len() == 1 {
+            match args[0].as_str() {
+                "--help" => {
+                    println!("Usage: yes [STRING]...");
+                    println!("Repeatedly output STRING, or 'y' if STRING omitted.");
+                    return 0;
+                }
+                "--version" => {
+                    println!("yes (zshrs) {}", env!("CARGO_PKG_VERSION"));
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+        let line = if args.is_empty() {
+            "y\n".to_string()
+        } else {
+            format!("{}\n", args.join(" "))
+        };
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        // Buffer ~64KB worth of repeats per write to amortize syscall.
+        let mut buf = String::with_capacity(65536);
+        while buf.len() + line.len() <= 65536 {
+            buf.push_str(&line);
+        }
+        loop {
+            if out.write_all(buf.as_bytes()).is_err() {
+                return 0; // SIGPIPE / closed consumer
+            }
+        }
+    }
+
+    /// nl [-b STYLE] [FILE...] — number lines. Direct port of
+    /// coreutils nl(1) for the most-used flag set.
+    pub(crate) fn builtin_nl(&self, args: &[String]) -> i32 {
+        // GNU coreutils nl(1). Numbering styles per section: `a` (all),
+        // `t` (non-empty, body default), `n` (none, header/footer
+        // default), `pREGEX` (lines matching REGEX). Number formats
+        // (-n): `ln` left, `rn` right (default), `rz` right zero-pad.
+        // Logical pages: input lines of exactly DELIM*3/2/1 (default
+        // `\:`) switch to header/body/footer, are replaced by empty
+        // output lines, and reset numbering unless -p. GNU convention
+        // is followed where BSD differs (unnumbered lines emit spaces
+        // in place of number AND separator; delimiter lines emit an
+        // empty line).
+        #[derive(Clone)]
+        enum NlStyle {
+            All,
+            NonEmpty,
+            None,
+            Pat(regex::Regex),
+        }
+        fn parse_style(s: &str, opt: char) -> Result<NlStyle, i32> {
+            match s.chars().next() {
+                Some('a') => Ok(NlStyle::All),
+                Some('t') => Ok(NlStyle::NonEmpty),
+                Some('n') => Ok(NlStyle::None),
+                Some('p') => match regex::Regex::new(&s[1..]) {
+                    Ok(re) => Ok(NlStyle::Pat(re)),
+                    Err(e) => {
+                        eprintln!("nl: invalid regular expression: {}", e);
+                        Err(1)
+                    }
+                },
+                _ => {
+                    eprintln!("nl: invalid numbering style: '-{}{}'", opt, s);
+                    Err(1)
+                }
+            }
+        }
+        let mut body = NlStyle::NonEmpty;
+        let mut header = NlStyle::None;
+        let mut footer = NlStyle::None;
+        let mut delim = "\\:".to_string();
+        let mut start = 1i64;
+        let mut step = 1i64;
+        let mut join_blanks = 1i64; // -l
+        let mut fmt = "rn".to_string(); // -n
+        let mut renumber = true; // -p clears
+        let mut sep = "\t".to_string();
+        let mut width = 6usize;
+        let mut files: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        let mut no_more_opts = false;
+        // Short opts take attached (`-nrz`) or separate (`-n rz`) args.
+        macro_rules! optarg {
+            ($rest:expr, $name:expr) => {{
+                if !$rest.is_empty() {
+                    $rest.to_string()
+                } else {
+                    i += 1;
+                    match args.get(i) {
+                        Some(v) => v.clone(),
+                        None => {
+                            eprintln!("nl: option requires an argument -- '{}'", $name);
+                            return 1;
+                        }
+                    }
+                }
+            }};
+        }
+        while i < args.len() {
+            let arg = args[i].as_str();
+            if no_more_opts || arg == "-" || !arg.starts_with('-') {
+                files.push(arg.to_string());
+                i += 1;
+                continue;
+            }
+            if arg == "--" {
+                no_more_opts = true;
+                i += 1;
+                continue;
+            }
+            let (opt, rest): (&str, &str) = if let Some(long) = arg.strip_prefix("--") {
+                match long.split_once('=') {
+                    Some((k, v)) => (k, v),
+                    None => (long, ""),
+                }
+            } else {
+                (&arg[1..2], &arg[2..])
+            };
+            match opt {
+                "b" | "body-numbering" => {
+                    let v = optarg!(rest, 'b');
+                    match parse_style(&v, 'b') {
+                        Ok(st) => body = st,
+                        Err(rc) => return rc,
+                    }
+                }
+                "h" | "header-numbering" => {
+                    let v = optarg!(rest, 'h');
+                    match parse_style(&v, 'h') {
+                        Ok(st) => header = st,
+                        Err(rc) => return rc,
+                    }
+                }
+                "f" | "footer-numbering" => {
+                    let v = optarg!(rest, 'f');
+                    match parse_style(&v, 'f') {
+                        Ok(st) => footer = st,
+                        Err(rc) => return rc,
+                    }
+                }
+                "d" | "section-delimiter" => {
+                    let v = optarg!(rest, 'd');
+                    // GNU: a single-char arg keeps ':' as 2nd char.
+                    delim = if v.chars().count() == 1 {
+                        format!("{}:", v)
+                    } else {
+                        v
+                    };
+                }
+                "i" | "line-increment" => {
+                    let v = optarg!(rest, 'i');
+                    step = v.parse().unwrap_or(1);
+                }
+                "l" | "join-blank-lines" => {
+                    let v = optarg!(rest, 'l');
+                    join_blanks = v.parse::<i64>().unwrap_or(1).max(1);
+                }
+                "n" | "number-format" => {
+                    let v = optarg!(rest, 'n');
+                    match v.as_str() {
+                        "ln" | "rn" | "rz" => fmt = v,
+                        _ => {
+                            eprintln!("nl: invalid line numbering format: '{}'", v);
+                            return 1;
+                        }
+                    }
+                }
+                "p" | "no-renumber" => {
+                    renumber = false;
+                    // -p takes no arg; attached chars are more short opts
+                    // (rare) — treat as error to stay simple and loud.
+                    if !rest.is_empty() {
+                        eprintln!("nl: unrecognized option: '{}'", arg);
+                        return 1;
+                    }
+                }
+                "s" | "number-separator" => {
+                    sep = optarg!(rest, 's');
+                }
+                "v" | "starting-line-number" => {
+                    let v = optarg!(rest, 'v');
+                    start = v.parse().unwrap_or(1);
+                }
+                "w" | "number-width" => {
+                    let v = optarg!(rest, 'w');
+                    width = v.parse().unwrap_or(6).max(1);
+                }
+                _ => {
+                    eprintln!("nl: unrecognized option: '{}'", arg);
+                    return 1;
+                }
+            }
+            i += 1;
+        }
+        if files.is_empty() {
+            files.push("-".to_string());
+        }
+        let hdr_delim = format!("{0}{0}{0}", delim);
+        let body_delim = format!("{0}{0}", delim);
+        let mut n = start;
+        let mut section = 1u8; // 0=header 1=body 2=footer
+        let mut blank_run = 0i64;
+        for file in &files {
+            let reader: Box<dyn BufRead> = if file == "-" {
+                Box::new(BufReader::new(std::io::stdin()))
+            } else {
+                match std::fs::File::open(file) {
+                    Ok(f) => Box::new(BufReader::new(f)),
+                    Err(e) => {
+                        eprintln!("nl: {}: {}", file, e);
+                        return 1;
+                    }
+                }
+            };
+            for line in reader.lines().map_while(Result::ok) {
+                // Section delimiters — full-line match only.
+                let new_section = if line == hdr_delim {
+                    Some(0u8)
+                } else if line == body_delim {
+                    Some(1u8)
+                } else if line == delim {
+                    Some(2u8)
+                } else {
+                    None
+                };
+                if let Some(sec) = new_section {
+                    section = sec;
+                    if renumber {
+                        n = start;
+                    }
+                    blank_run = 0;
+                    println!();
+                    continue;
+                }
+                let style = match section {
+                    0 => &header,
+                    2 => &footer,
+                    _ => &body,
+                };
+                let blank = line.is_empty();
+                let do_number = match style {
+                    NlStyle::All => {
+                        // -l NUM: only the NUM-th of a run of blanks
+                        // gets a number (GNU join-blank-lines).
+                        if blank {
+                            blank_run += 1;
+                            if blank_run == join_blanks {
+                                blank_run = 0;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            blank_run = 0;
+                            true
+                        }
+                    }
+                    NlStyle::NonEmpty => {
+                        blank_run = 0;
+                        !blank
+                    }
+                    NlStyle::None => {
+                        blank_run = 0;
+                        false
+                    }
+                    NlStyle::Pat(re) => {
+                        blank_run = 0;
+                        re.is_match(&line)
+                    }
+                };
+                if do_number {
+                    match fmt.as_str() {
+                        "ln" => println!("{:<width$}{}{}", n, sep, line, width = width),
+                        "rz" => println!("{:0>width$}{}{}", n, sep, line, width = width),
+                        _ => println!("{:>width$}{}{}", n, sep, line, width = width),
+                    }
+                    n += step;
+                } else {
+                    // GNU: spaces replace both the number and the
+                    // separator on unnumbered lines.
+                    println!("{}{}", " ".repeat(width + sep.len()), line);
+                }
+            }
+        }
+        0
+    }
+
+    /// env [-i] [NAME=VALUE]... [COMMAND [ARG]...] — print env or
+    /// run COMMAND with modified environment. Direct port of
+    /// coreutils env(1) for the most-used invocations.
+    pub(crate) fn builtin_env(&mut self, args: &[String]) -> i32 {
+        let mut clear_env = false;
+        let mut unset: Vec<String> = Vec::new();
+        let mut assignments: Vec<(String, String)> = Vec::new();
+        let mut cmd_start: Option<usize> = None;
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if a == "-i" || a == "--ignore-environment" {
+                clear_env = true;
+                i += 1;
+                continue;
+            }
+            if a == "-u" || a == "--unset" {
+                if i + 1 < args.len() {
+                    unset.push(args[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+                eprintln!("env: -u: missing argument");
+                return 125;
+            }
+            if let Some(name) = a.strip_prefix("--unset=") {
+                unset.push(name.to_string());
+                i += 1;
+                continue;
+            }
+            if a == "--" {
+                cmd_start = Some(i + 1);
+                break;
+            }
+            if let Some(eq) = a.find('=') {
+                if !a[..eq].is_empty() && !a.starts_with('-') {
+                    assignments.push((a[..eq].to_string(), a[eq + 1..].to_string()));
+                    i += 1;
+                    continue;
+                }
+            }
+            if !a.starts_with('-') {
+                cmd_start = Some(i);
+                break;
+            }
+            // Unknown -X flag; emit error like coreutils.
+            eprintln!("env: invalid option: {}", a);
+            return 125;
+        }
+
+        let cmd_args: Vec<&str> = match cmd_start {
+            Some(s) => args[s..].iter().map(|x| x.as_str()).collect(),
+            None => Vec::new(),
+        };
+
+        // Build the env: optionally clear, drop -u names, apply
+        // assignments.
+        // c:Src/exec.c:758-768 — zsh runs `env` as an external command, and
+        // for every external command "If ARGV0 is in the commands environment,
+        // we use that as argv[0]" and then `unsetenv("ARGV0")`. So `env` never
+        // sees the shell's ARGV0: `ARGV0=foo env` does not list it. An ARGV0
+        // given to env itself (`env ARGV0=x cmd`) is env's own operand and
+        // still passes through below.
+        let env_overrides: Vec<(String, String)> = if clear_env {
+            assignments.clone()
+        } else {
+            let mut out: Vec<(String, String)> = std::env::vars()
+                .filter(|(k, _)| k != "ARGV0" && !unset.contains(k)) // c:768
+                .collect();
+            for (k, v) in &assignments {
+                out.retain(|(ek, _)| ek != k);
+                out.push((k.clone(), v.clone()));
+            }
+            out
+        };
+
+        if cmd_args.is_empty() {
+            // env(1) prints `environ` in array order — the order the shell
+            // added the variables (c:Src/params.c:5448 addenv appends), with
+            // env's own NAME=VALUE operands last. Sorting diverged from every
+            // external `env`.
+            for (k, v) in env_overrides {
+                println!("{}={}", k, v);
+            }
+            return 0;
+        }
+
+        // Run the command with the modified environment. Spawn via
+        // std::process::Command since we're a coreutils-style env
+        // shim, not a shell-level builtin.
+        let mut cmd = std::process::Command::new(cmd_args[0]);
+        cmd.args(&cmd_args[1..]);
+        if clear_env {
+            cmd.env_clear();
+        }
+        cmd.env_remove("ARGV0"); // c:Src/exec.c:768 — before env's own assignments
+        for u in &unset {
+            cmd.env_remove(u);
+        }
+        for (k, v) in &assignments {
+            cmd.env(k, v);
+        }
+        // The shell's SIGCHLD reaper (`waitpid(-1)`, c:Src/signals.c:285
+        // wait_for_processes) runs on any thread and collected this child
+        // before `status()` could, so `status()` failed with ECHILD and every
+        // `env CMD` returned 127. Hold signals across the wait exactly as the
+        // external-command spawn does (vm_helper.rs, ForegroundWaitGuard).
+        // The guard only blocks SIGCHLD in THIS thread; the kernel hands it
+        // to any other thread of the process, whose reaper still takes the
+        // child, so `Command::status()` kept failing with ECHILD (`env CMD`
+        // returned 127 at random on Linux). Wait through wait_pid_status,
+        // which claims the reaper's record on ECHILD like every external.
+        let status_result = {
+            let _wait_guard = crate::fusevm_bridge::ForegroundWaitGuard::enter();
+            cmd.spawn()
+                .and_then(|child| crate::fusevm_bridge::wait_pid_status(child.id() as libc::pid_t))
+        };
+        match status_result {
+            Ok(status) => status.code().unwrap_or(127),
+            Err(_) => 127,
+        }
+    }
+
+    pub(crate) fn builtin_whoami(&self, args: &[String]) -> i32 {
+        // coreutils whoami(1) prints the EFFECTIVE user name, not
+        // \$USER. After 'sudo whoami', \$USER may still be the
+        // original (depending on sudo config) — but whoami should
+        // print the effective user. Direct port via geteuid +
+        // getpwuid.
+        // whoami takes no operands. Reject unknown flags (was
+        // silently ignored via the unused _args arg).
+        for arg in args {
+            if arg.starts_with('-') && arg.len() > 1 && arg != "--" {
+                eprintln!("whoami: unrecognized option: '{}'", arg);
+                return 1;
+            }
+            if !arg.starts_with('-') {
+                eprintln!("whoami: extra operand '{}'", arg);
+                return 1;
+            }
+        }
+        let euid = unsafe { libc::geteuid() };
+        unsafe {
+            let pw = libc::getpwuid(euid);
+            if !pw.is_null() {
+                let name = CStr::from_ptr((*pw).pw_name);
+                println!("{}", name.to_string_lossy());
+                return 0;
+            }
+        }
+        // Fallback: numeric uid (matches coreutils 'cannot find name'
+        // error case).
+        eprintln!("whoami: cannot find name for user ID {}", euid);
+        1
+    }
+
+    pub(crate) fn builtin_id(&self, args: &[String]) -> i32 {
+        // coreutils id(1) port: -u/-g/-G with -n name modifier, plus
+        // the default 'uid=N(name) gid=N(name) groups=...' form.
+
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+
+        // Parse flag combinations: -u, -g, -G, -un, -gn, -Gn, -nu, etc.
+        let mut want_uid = false;
+        let mut want_gid = false;
+        let mut want_groups = false;
+        let mut want_name = false;
+        for arg in args {
+            if let Some(s) = arg.strip_prefix('-') {
+                for c in s.chars() {
+                    match c {
+                        'u' => want_uid = true,
+                        'g' => want_gid = true,
+                        'G' => want_groups = true,
+                        'n' => want_name = true,
+                        'r' => {} // -r: real id (we already use real uid/gid)
+                        // coreutils id rejects unknown flags. Old
+                        // \`_ => {}\` accepted any letter and the
+                        // remaining letters fell through to the
+                        // default print-everything path.
+                        _ => {
+                            eprintln!("id: invalid option -- '{}'", c);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let lookup_user_name = |uid: u32| -> Option<String> {
+            unsafe {
+                let pw = libc::getpwuid(uid);
+                if pw.is_null() {
+                    return None;
+                }
+                let name = CStr::from_ptr((*pw).pw_name);
+                Some(name.to_string_lossy().into_owned())
+            }
+        };
+        let lookup_group_name = |gid: u32| -> Option<String> {
+            unsafe {
+                let gr = libc::getgrgid(gid);
+                if gr.is_null() {
+                    return None;
+                }
+                let name = CStr::from_ptr((*gr).gr_name);
+                Some(name.to_string_lossy().into_owned())
+            }
+        };
+
+        if want_uid {
+            if want_name {
+                println!(
+                    "{}",
+                    lookup_user_name(uid).unwrap_or_else(|| uid.to_string())
+                );
+            } else {
+                println!("{}", uid);
+            }
+            return 0;
+        }
+        if want_gid {
+            if want_name {
+                println!(
+                    "{}",
+                    lookup_group_name(gid).unwrap_or_else(|| gid.to_string())
+                );
+            } else {
+                println!("{}", gid);
+            }
+            return 0;
+        }
+        if want_groups {
+            // getgrouplist(name, base_gid, gids[], &count). First call
+            // gets the count; second populates the array.
+            let user_name = lookup_user_name(uid).unwrap_or_default();
+            let cname = std::ffi::CString::new(user_name.as_bytes()).unwrap_or_default();
+            let mut count: libc::c_int = 32;
+            let mut gids: Vec<libc::gid_t> = vec![0; count as usize];
+            let rc = unsafe {
+                libc::getgrouplist(
+                    cname.as_ptr(),
+                    gid as _,
+                    gids.as_mut_ptr() as *mut _,
+                    &mut count,
+                )
+            };
+            if rc < 0 {
+                gids.resize(count as usize, 0);
+                unsafe {
+                    libc::getgrouplist(
+                        cname.as_ptr(),
+                        gid as _,
+                        gids.as_mut_ptr() as *mut _,
+                        &mut count,
+                    );
+                }
+            }
+            gids.truncate(count.max(0) as usize);
+            let parts: Vec<String> = gids
+                .iter()
+                .map(|g| {
+                    if want_name {
+                        lookup_group_name(*g).unwrap_or_else(|| g.to_string())
+                    } else {
+                        g.to_string()
+                    }
+                })
+                .collect();
+            println!("{}", parts.join(" "));
+            return 0;
+        }
+
+        // Default form: uid=N(name) gid=N(name) groups=N(name),...
+        let user = lookup_user_name(uid).unwrap_or_else(|| uid.to_string());
+        let group = lookup_group_name(gid).unwrap_or_else(|| gid.to_string());
+        print!("uid={}({}) gid={}({})", uid, user, gid, group);
+        if euid != uid {
+            let eu = lookup_user_name(euid).unwrap_or_else(|| euid.to_string());
+            print!(" euid={}({})", euid, eu);
+        }
+        if egid != gid {
+            let eg = lookup_group_name(egid).unwrap_or_else(|| egid.to_string());
+            print!(" egid={}({})", egid, eg);
+        }
+        // Supplementary groups list
+        let cname = std::ffi::CString::new(user.as_bytes()).unwrap_or_default();
+        let mut count: libc::c_int = 32;
+        let mut gids: Vec<libc::gid_t> = vec![0; count as usize];
+        let rc = unsafe {
+            libc::getgrouplist(
+                cname.as_ptr(),
+                gid as _,
+                gids.as_mut_ptr() as *mut _,
+                &mut count,
+            )
+        };
+        if rc < 0 {
+            gids.resize(count as usize, 0);
+            unsafe {
+                libc::getgrouplist(
+                    cname.as_ptr(),
+                    gid as _,
+                    gids.as_mut_ptr() as *mut _,
+                    &mut count,
+                );
+            }
+        }
+        gids.truncate(count.max(0) as usize);
+        if !gids.is_empty() {
+            let parts: Vec<String> = gids
+                .iter()
+                .map(|g| {
+                    let name = lookup_group_name(*g).unwrap_or_else(|| g.to_string());
+                    format!("{}({})", g, name)
+                })
+                .collect();
+            print!(" groups={}", parts.join(","));
+        }
+        println!();
+        0
+    }
+
+    pub(crate) fn builtin_hostname(&self, args: &[String]) -> i32 {
+        // hostname(1) — accepts:
+        // -s / --short: short hostname (everything before the first '.')
+        // -d / --domain: domain part only (everything after first '.')
+        // -f / --fqdn / --long: full hostname (default behaviour)
+        // -i / --ip-address: numeric IP for the hostname
+        // bare arg: sets the hostname via sethostname(2) (root only)
+        let mut short = false;
+        let mut domain_only = false;
+        let mut ip = false;
+        let mut new_name: Option<&str> = None;
+        for arg in args {
+            match arg.as_str() {
+                "-s" | "--short" => short = true,
+                "-d" | "--domain" => domain_only = true,
+                "-f" | "--fqdn" | "--long" => {}
+                "-i" | "--ip-address" => ip = true,
+                "--" => {}
+                s if s.starts_with('-') && s.len() > 1 => {
+                    // hostname(1) errors on unknown flags. Old impl
+                    // accepted any -X silently then printed the
+                    // hostname as-if -X were a no-op.
+                    eprintln!("hostname: invalid option: '{}'", s);
+                    return 1;
+                }
+                name => new_name = Some(name),
+            }
+        }
+
+        if let Some(name) = new_name {
+            let rc = unsafe { libc::sethostname(name.as_ptr() as *const libc::c_char, name.len() as _) };
+            if rc != 0 {
+                eprintln!(
+                    "hostname: cannot set hostname: {}",
+                    std::io::Error::last_os_error()
+                );
+                return 1;
+            }
+            return 0;
+        }
+
+        let mut buf = [0u8; 256];
+        // c_char is i8 on most targets but u8 on aarch64-linux; cast through
+        // libc::c_char so this builds on every Unix target the matrix covers.
+        let result = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if result != 0 {
+            eprintln!("hostname: cannot get hostname");
+            return 1;
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let host = String::from_utf8_lossy(&buf[..len]).into_owned();
+
+        if ip {
+            // Resolve the hostname via getaddrinfo and print the
+            // first IPv4/IPv6 result. Same approach as
+            // hostname(1)'s -i.
+            if let Ok(mut addrs) = (host.as_str(), 0u16).to_socket_addrs() {
+                if let Some(a) = addrs.next() {
+                    println!("{}", a.ip());
+                    return 0;
+                }
+            }
+            // Fall through to printing the host if resolution failed.
+        }
+        if short {
+            let s = host.split('.').next().unwrap_or(&host);
+            println!("{}", s);
+        } else if domain_only {
+            let d: String = host
+                .split_once('.')
+                .map(|x| x.1)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            println!("{}", d);
+        } else {
+            println!("{}", host);
+        }
+        0
+    }
+
+    pub(crate) fn builtin_uname(&self, args: &[String]) -> i32 {
+        // coreutils uname(1) port: combinable flags emit selected
+        // fields space-separated in canonical order. -a is short for
+        // every field. With no flags, default is -s (kernel name).
+        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut uts) } != 0 {
+            eprintln!("uname: cannot get system info");
+            return 1;
+        }
+
+        let sysname = unsafe { std::ffi::CStr::from_ptr(uts.sysname.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let nodename = unsafe { std::ffi::CStr::from_ptr(uts.nodename.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let version = unsafe { std::ffi::CStr::from_ptr(uts.version.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let machine = unsafe { std::ffi::CStr::from_ptr(uts.machine.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // -p / -o aren't in struct utsname; coreutils synthesizes them
+        // from the machine and sysname respectively. Match that.
+        let processor = machine.clone();
+        let os = if sysname == "Linux" {
+            "GNU/Linux".to_string()
+        } else {
+            sysname.clone()
+        };
+
+        let mut want_s = false;
+        let mut want_n = false;
+        let mut want_r = false;
+        let mut want_v = false;
+        let mut want_m = false;
+        let mut want_p = false;
+        let mut want_o = false;
+        let mut all = false;
+        for arg in args {
+            if let Some(s) = arg.strip_prefix('-') {
+                for c in s.chars() {
+                    match c {
+                        's' => want_s = true,
+                        'n' => want_n = true,
+                        'r' => want_r = true,
+                        'v' => want_v = true,
+                        'm' => want_m = true,
+                        'p' => want_p = true,
+                        'o' => want_o = true,
+                        'a' => all = true,
+                        // coreutils uname errors on unknown short
+                        // flags. Old \`_ => {}\` silently dropped them
+                        // and the default behavior (sysname) ran.
+                        _ => {
+                            eprintln!("uname: invalid option -- '{}'", c);
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        if all {
+            // coreutils -a output order: sysname nodename release
+            // version machine [processor [os]]. processor/os are
+            // suppressed when 'unknown'; we always have machine so
+            // include processor; os synthesized too.
+            println!(
+                "{} {} {} {} {} {} {}",
+                sysname, nodename, release, version, machine, processor, os
+            );
+            return 0;
+        }
+        if !want_s && !want_n && !want_r && !want_v && !want_m && !want_p && !want_o {
+            want_s = true; // default
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if want_s {
+            parts.push(sysname);
+        }
+        if want_n {
+            parts.push(nodename);
+        }
+        if want_r {
+            parts.push(release);
+        }
+        if want_v {
+            parts.push(version);
+        }
+        if want_m {
+            parts.push(machine);
+        }
+        if want_p {
+            parts.push(processor);
+        }
+        if want_o {
+            parts.push(os);
+        }
+        println!("{}", parts.join(" "));
+        0
+    }
+
+    /// Parse a `date -d` string into a Unix timestamp. Supports `@SECS`,
+    /// absolute dates/times (ISO-8601 forms, `YYYY/MM/DD`, ctime-style,
+    /// bare `HH:MM[:SS]`), the words now/today/yesterday/tomorrow, and
+    /// relative offsets (`[+-]N unit[s]`, `next|last unit`, `... ago`)
+    /// with units second/minute/hour/day/week/month/year. A trailing
+    /// `Z`/`UTC`/`GMT` token (or `utc` being set) selects UTC.
+    fn parse_date_string(input: &str, mut utc: bool, now: i64) -> Option<i64> {
+        let input = input.trim();
+        if let Some(secs) = input.strip_prefix('@') {
+            return secs.trim().parse::<i64>().ok();
+        }
+        // (field, amount): 0 sec, 1 min, 2 hour, 3 mday, 4 mon, 5 year
+        let mut rel: Vec<(u8, i64)> = Vec::new();
+        let mut abs_parts: Vec<String> = Vec::new();
+        let toks: Vec<&str> = input.split_whitespace().collect();
+        let unit_field = |u: &str| -> Option<(u8, i64)> {
+            let u = u.trim_end_matches('s');
+            Some(match u {
+                "sec" | "second" => (0, 1),
+                "min" | "minute" => (1, 1),
+                "hour" => (2, 1),
+                "day" => (3, 1),
+                "week" => (3, 7),
+                "fortnight" => (3, 14),
+                "month" => (4, 1),
+                "year" => (5, 1),
+                _ => return None,
+            })
+        };
+        let mut i = 0;
+        while i < toks.len() {
+            let t = toks[i].to_ascii_lowercase();
+            match t.as_str() {
+                "now" | "today" => {}
+                "yesterday" => rel.push((3, -1)),
+                "tomorrow" => rel.push((3, 1)),
+                "utc" | "gmt" | "z" => utc = true,
+                "ago" => {
+                    if let Some(last) = rel.last_mut() {
+                        last.1 = -last.1;
+                    } else {
+                        return None;
+                    }
+                }
+                "next" | "last" => {
+                    let (f, m) = unit_field(toks.get(i + 1)?.to_ascii_lowercase().as_str())?;
+                    rel.push((f, if t == "next" { m } else { -m }));
+                    i += 1;
+                }
+                _ => {
+                    let signed = t.strip_prefix('+').unwrap_or(&t);
+                    if let Ok(n) = signed.parse::<i64>() {
+                        if let Some((f, m)) = toks
+                            .get(i + 1)
+                            .and_then(|u| unit_field(&u.to_ascii_lowercase()))
+                        {
+                            rel.push((f, n * m));
+                            i += 1;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    abs_parts.push(toks[i].to_string());
+                }
+            }
+            i += 1;
+        }
+        let mut abs = abs_parts.join(" ");
+        if let Some(stripped) = abs.strip_suffix('Z') {
+            utc = true;
+            abs = stripped.to_string();
+        }
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let t_now = now as libc::time_t;
+        unsafe {
+            if utc {
+                libc::gmtime_r(&t_now, &mut tm);
+            } else {
+                libc::localtime_r(&t_now, &mut tm);
+            }
+        }
+        if !abs.is_empty() {
+            let formats: [(&str, bool, bool); 11] = [
+                // (format, sets the date, sets the time)
+                ("%Y-%m-%d %H:%M:%S", true, true),
+                ("%Y-%m-%dT%H:%M:%S", true, true),
+                ("%Y-%m-%d %H:%M", true, true),
+                ("%Y-%m-%dT%H:%M", true, true),
+                ("%Y-%m-%d", true, false),
+                ("%Y/%m/%d %H:%M:%S", true, true),
+                ("%Y/%m/%d", true, false),
+                ("%a %b %e %H:%M:%S %Y", true, true),
+                ("%b %e %Y", true, false),
+                ("%H:%M:%S", false, true),
+                ("%H:%M", false, true),
+            ];
+            let c_abs = std::ffi::CString::new(abs.as_str()).ok()?;
+            let mut matched = false;
+            for (fmt, sets_date, sets_time) in formats {
+                let c_fmt = std::ffi::CString::new(fmt).ok()?;
+                let mut parsed: libc::tm = unsafe { std::mem::zeroed() };
+                let end = unsafe { libc::strptime(c_abs.as_ptr(), c_fmt.as_ptr(), &mut parsed) };
+                if end.is_null() || unsafe { *end } != 0 {
+                    continue;
+                }
+                if sets_date {
+                    tm.tm_year = parsed.tm_year;
+                    tm.tm_mon = parsed.tm_mon;
+                    tm.tm_mday = parsed.tm_mday;
+                }
+                if sets_time {
+                    tm.tm_hour = parsed.tm_hour;
+                    tm.tm_min = parsed.tm_min;
+                    tm.tm_sec = parsed.tm_sec;
+                } else {
+                    tm.tm_hour = 0;
+                    tm.tm_min = 0;
+                    tm.tm_sec = 0;
+                }
+                matched = true;
+                break;
+            }
+            if !matched {
+                return None;
+            }
+        }
+        for (field, n) in rel {
+            let n = n as libc::c_int;
+            match field {
+                0 => tm.tm_sec += n,
+                1 => tm.tm_min += n,
+                2 => tm.tm_hour += n,
+                3 => tm.tm_mday += n,
+                4 => tm.tm_mon += n,
+                _ => tm.tm_year += n,
+            }
+        }
+        tm.tm_isdst = -1;
+        let ts = unsafe {
+            if utc {
+                libc::timegm(&mut tm)
+            } else {
+                libc::mktime(&mut tm)
+            }
+        };
+        if ts == -1 && tm.tm_year != 69 {
+            return None;
+        }
+        Some(ts as i64)
+    }
+
+    pub(crate) fn builtin_date(&self, args: &[String]) -> i32 {
+        // coreutils date(1) port: adds -u (UTC), -r FILE (mtime of
+        // FILE), -R / --rfc-2822, -I / --iso-8601, -d STRING (see
+        // parse_date_string).
+
+        let mut utc = false;
+        let mut format: Option<String> = None;
+        let mut date_str: Option<String> = None;
+        let mut reference: Option<String> = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            if let Some(s) = arg.strip_prefix('+') {
+                format = Some(s.to_string());
+            } else if arg == "-u" || arg == "--utc" || arg == "--universal" {
+                utc = true;
+            } else if arg == "-r" || arg == "--reference" {
+                if let Some(r) = iter.next() {
+                    reference = Some(r.clone());
+                }
+            } else if let Some(r) = arg.strip_prefix("--reference=") {
+                reference = Some(r.to_string());
+            } else if arg == "-R" || arg == "--rfc-2822" || arg == "--rfc-email" {
+                format = Some("%a, %d %b %Y %H:%M:%S %z".to_string());
+            } else if arg == "-I" || arg == "--iso-8601" {
+                format = Some("%Y-%m-%d".to_string());
+            } else if let Some(prec) = arg.strip_prefix("--iso-8601=") {
+                format = Some(
+                    match prec {
+                        "date" => "%Y-%m-%d",
+                        "hours" => "%Y-%m-%dT%H%z",
+                        "minutes" => "%Y-%m-%dT%H:%M%z",
+                        "seconds" => "%Y-%m-%dT%H:%M:%S%z",
+                        "ns" => "%Y-%m-%dT%H:%M:%S,%N%z",
+                        _ => "%Y-%m-%d",
+                    }
+                    .to_string(),
+                );
+            } else if arg == "-d" || arg == "--date" {
+                match iter.next() {
+                    Some(d) => date_str = Some(d.clone()),
+                    None => {
+                        eprintln!("zshrs:date:1: argument expected: -d");
+                        return 1;
+                    }
+                }
+            } else if let Some(d) = arg.strip_prefix("--date=") {
+                date_str = Some(d.to_string());
+            } else if arg == "--" {
+                // end of options
+            } else if arg.starts_with('-') && arg.len() > 1 {
+                // coreutils date errors on unknown flags. Old impl
+                // silently dropped them and produced default output.
+                eprintln!("zshrs:date:1: unrecognized option: '{}'", arg);
+                return 1;
+            }
+        }
+
+        // Determine the timestamp.
+        let ts: i64 = if let Some(refpath) = reference {
+            match std::fs::metadata(&refpath) {
+                Ok(meta) => meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                Err(e) => {
+                    eprintln!("zshrs:date:1: {}: {}", refpath, e);
+                    return 1;
+                }
+            }
+        } else {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            match date_str {
+                Some(d) => match Self::parse_date_string(&d, utc, now) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("zshrs:date:1: invalid date '{}'", d);
+                        return 1;
+                    }
+                },
+                None => now,
+            }
+        };
+
+        let tm = unsafe {
+            let t = ts as libc::time_t;
+            if utc {
+                *libc::gmtime(&t)
+            } else {
+                *libc::localtime(&t)
+            }
+        };
+        let fmt_str = format.unwrap_or_else(|| "%a %b %e %H:%M:%S %Z %Y".to_string());
+        // c_char is i8 on most targets, u8 on aarch64-linux; use c_char so
+        // strftime + CStr::from_ptr accept the same pointer type per-target.
+        let mut buf = [0 as libc::c_char; 1024];
+        let fmt_cstr = std::ffi::CString::new(fmt_str.as_str()).unwrap_or_default();
+        let len = unsafe { libc::strftime(buf.as_mut_ptr(), buf.len(), fmt_cstr.as_ptr(), &tm) };
+        if len > 0 {
+            let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+            println!("{}", s.to_string_lossy());
+        }
+        0
+    }
+
+    pub(crate) fn builtin_mktemp(&self, args: &[String]) -> i32 {
+        // coreutils mktemp(1) port. Replaces the in-template
+        // 'XXXXXX' run with a random a-z0-9 suffix, retries on
+        // collision (real mktemp uses O_EXCL so two parallel
+        // mktemp(1) invocations don't pick the same name).
+
+        let mut dir = false;
+        let mut want_tmpdir_flag = false;
+        let mut quiet = false;
+        let mut dry_run = false;
+        let mut explicit_tmpdir: Option<String> = None;
+        let mut template: Option<&str> = None;
+        let mut iter = args.iter();
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-d" | "--directory" => dir = true,
+                "-t" => {
+                    // Treat the template arg as a basename; place
+                    // under \$TMPDIR. (coreutils -t is deprecated
+                    // but still accepted; flag without -p.)
+                    want_tmpdir_flag = true;
+                }
+                "-p" | "--tmpdir" => {
+                    // Next arg is the dir to use as base.
+                    if let Some(d) = iter.next() {
+                        explicit_tmpdir = Some(d.clone());
+                    }
+                }
+                "-q" | "--quiet" => quiet = true, // suppress file-creation errors
+                "-u" | "--dry-run" => dry_run = true, // print a name without creating it
+                "--" => {}             // end of options
+                a if !a.starts_with('-') => template = Some(a),
+                a => {
+                    eprintln!("mktemp: unrecognized option: '{}'", a);
+                    return 1;
+                }
+            }
+        }
+
+        let tmpdir = explicit_tmpdir
+            .unwrap_or_else(|| std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()));
+        let base = template.unwrap_or("tmp.XXXXXXXXXX");
+
+        // Produce a random a-z0-9 suffix of the requested length.
+        // Real PRNG, not ms-tick parity (the previous impl produced
+        // 10 copies of the same letter).
+        let gen_suffix = |len: usize| -> String {
+            let alphabet: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+            let mut rng = rand::thread_rng();
+            (0..len)
+                .map(|_| alphabet[rng.gen_range(0..alphabet.len())] as char)
+                .collect()
+        };
+
+        // Build a candidate filename by replacing the longest
+        // run of consecutive 'X's with a random suffix of the same
+        // length (matches mktemp's behavior).
+        let make_name = |t: &str| -> String {
+            let bytes = t.as_bytes();
+            // Find longest X-run.
+            let mut best_start = 0usize;
+            let mut best_len = 0usize;
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'X' {
+                    let s = i;
+                    while i < bytes.len() && bytes[i] == b'X' {
+                        i += 1;
+                    }
+                    let len = i - s;
+                    if len > best_len {
+                        best_start = s;
+                        best_len = len;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if best_len == 0 {
+                // No X's: append .RANDOM to match real mktemp default.
+                return format!("{}.{}", t, gen_suffix(6));
+            }
+            let suffix = gen_suffix(best_len);
+            let mut out = String::with_capacity(t.len());
+            out.push_str(&t[..best_start]);
+            out.push_str(&suffix);
+            out.push_str(&t[best_start + best_len..]);
+            out
+        };
+
+        // -t implies under \$TMPDIR using template as basename.
+        let try_path = |name: String| -> std::path::PathBuf {
+            if want_tmpdir_flag || !std::path::Path::new(&name).is_absolute() {
+                std::path::Path::new(&tmpdir).join(&name)
+            } else {
+                std::path::PathBuf::from(&name)
+            }
+        };
+
+        // Up to 100 collision retries (real mktemp tries TMP_MAX).
+        for _ in 0..100 {
+            let path = try_path(make_name(base));
+            if dry_run {
+                if path.exists() {
+                    continue;
+                }
+                println!("{}", path.display());
+                return 0;
+            }
+            if dir {
+                let result = std::fs::DirBuilder::new().mode(0o700).create(&path);
+                match result {
+                    Ok(_) => {
+                        println!("{}", path.display());
+                        return 0;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!("mktemp: {}: {}", path.display(), e);
+                        }
+                        return 1;
+                    }
+                }
+            } else {
+                let result = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path);
+                match result {
+                    Ok(_) => {
+                        // Lock down to 0600 to match mktemp.
+                        #[cfg(unix)]
+                        {
+                            let _ = std::fs::set_permissions(
+                                &path,
+                                std::fs::Permissions::from_mode(0o600),
+                            );
+                        }
+                        println!("{}", path.display());
+                        return 0;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!("mktemp: {}: {}", path.display(), e);
+                        }
+                        return 1;
+                    }
+                }
+            }
+        }
+        if !quiet {
+            eprintln!("mktemp: too many collisions");
+        }
+        1
+    }
+
+    /// `cp` — in-process recursive copy. zshrs extension (not in
+    /// upstream zsh — `zsh/files` ships `ln`/`mv`/`rm`/`chmod`/
+    /// `chown`/`mkdir`/`rmdir`/`sync` but no `cp`). Thin method
+    /// wrapper around the free fn `cp_impl` so the
+    /// `reg_overridable!` macro in fusevm_bridge can dispatch to it
+    /// the same way as every other coreutils-style builtin.
+    pub(crate) fn builtin_cp(&self, args: &[String]) -> i32 {
+        cp_impl(args)
+    }
+}
+
+// =====================================================================
+// rlimits dispatcher bridges. Build a `struct options` (zsh.h:1416)
+// from the leading short-option run and delegate to the C-faithful
+// free ported in `src/ported/builtins/rlimits.rs`. This lives outside
+// `src/ported/` because it is the dispatcher slice (analogue of
+// `Src/builtin.c:execbuiltin` + `parseopts`), not a port of
+// `rlimits.c` itself.
+// =====================================================================
+
+use crate::ported::builtins::rlimits::{
+    bin_limit as rl_bin_limit, bin_ulimit as rl_bin_ulimit, bin_unlimit as rl_bin_unlimit,
+};
+// sc_bin_sched / cl_bin_clone re-import deleted along with the wrappers.
+use crate::ported::zsh_h::{options, MAX_OPS};
+
+impl ShellExecutor {
+    // bin_limit / bin_unlimit / bin_ulimit wrappers deleted — the
+    // bridge handlers now route directly through `dispatch_builtin`,
+    // which goes through `execbuiltin` (BUILTINS table optstr parse +
+    // HandlerFunc call). The optstrs ("sh"/"hs"/NULL) come from the
+    // BUILTINS entries themselves at src/ported/builtin.rs:9053-9082,
+    // not from manual `build_short_opts` calls.
+
+    // bin_sched / bin_clone wrappers deleted — both routed through
+    // dispatch_builtin which goes via execbuiltin → BUILTINS[name]
+    // (sched.c:375 + clone.c:110). The 12-line ops-construct wrappers
+    // were Rust-only adapters duplicating what execbuiltin's call
+    // shape already provides.
+}
+
+// build_short_opts deleted — was a Rust-only short-opt parser
+// duplicating execbuiltin's optstr walk. All callers (zattr family,
+// zsocket, chgrp, mkdir, etc.) now route through dispatch_builtin
+// which goes via execbuiltin → BUILTINS[name].optstr → automatic
+// parsing.
+
+// ─────────────────────────────────────────────────────────
+// Extracted from `impl ShellExecutor` per the FAKE DUP audit:
+// these zshrs-specific builtins / autoload-style helpers don't
+// need executor state, so they live as free ported.
+// ─────────────────────────────────────────────────────────
+
+/// readarray/mapfile - read lines into array (bash)
+pub(crate) fn readarray(args: &[String]) -> i32 {
+    // bash readarray / mapfile: read lines from a fd into an array.
+    // Direct port of bash's read_builtin_array_loadable. zsh has no
+    // direct equivalent (use `read -A`), but plugin code that
+    // toggles between bash/zsh frequently calls this.
+
+    let mut array_name = "MAPFILE".to_string();
+    let mut delimiter: u8 = b'\n';
+    let mut count = 0usize; // 0 = unlimited
+    let mut skip = 0usize;
+    let mut strip_trailing = false;
+    let mut callback: Option<String> = None;
+    let mut callback_quantum = 0usize;
+    let mut fd: i32 = 0;
+    let mut origin: Option<usize> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-d" => {
+                i += 1;
+                // bash: `-d ''` delimits on NUL.
+                if i < args.len() {
+                    delimiter = args[i].as_bytes().first().copied().unwrap_or(0);
+                }
+            }
+            "-n" => {
+                i += 1;
+                if i < args.len() {
+                    count = args[i].parse().unwrap_or(0);
+                }
+            }
+            "-O" => {
+                i += 1;
+                // Origin: first index assigned; the array is not cleared.
+                if i < args.len() {
+                    origin = args[i].parse().ok();
+                }
+            }
+            "-s" => {
+                i += 1;
+                if i < args.len() {
+                    skip = args[i].parse().unwrap_or(0);
+                }
+            }
+            "-t" => strip_trailing = true,
+            "-C" => {
+                i += 1;
+                if i < args.len() {
+                    callback = Some(args[i].clone());
+                }
+            }
+            "-c" => {
+                i += 1;
+                if i < args.len() {
+                    callback_quantum = args[i].parse().unwrap_or(5000);
+                }
+            }
+            "-u" => {
+                i += 1;
+                if i < args.len() {
+                    fd = args[i].parse().unwrap_or(0);
+                }
+            }
+            s if !s.starts_with('-') => {
+                array_name = s.to_string();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Read entire input from the chosen fd, then split on delim.
+    // Using libc::read on the raw fd so -u N picks any open fd
+    // (was hardcoded stdin).
+    let mut input: Vec<u8> = Vec::new();
+    if fd == 0 {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        if handle.read_to_end(&mut input).is_err() {
+            return 1;
+        }
+    } else {
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            input.extend_from_slice(&buf[..n as usize]);
+        }
+    }
+
+    // Split on `delimiter` into records. bash KEEPS the delimiter byte
+    // at the end of each element unless `-t` (strip_trailing) removes it
+    // (`mapfile L` on "x\ny\n" → ("x\n" "y\n"); `-t` → ("x" "y")). Rust's
+    // split() drops the delimiter, so re-append it when not stripping —
+    // for every chunk that was actually followed by a delimiter (all but a
+    // final record with no trailing delimiter). A trailing empty chunk
+    // produced by a final delimiter byte is not a record.
+    let delim_char = delimiter as char;
+    let chunks: Vec<&[u8]> = input.split(|b| *b == delimiter).collect();
+    let n_chunks = chunks.len();
+    let mut lines: Vec<String> = Vec::new();
+    let mut line_count = 0usize;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if idx + 1 == n_chunks && chunk.is_empty() {
+            continue; // trailing empty after the final delimiter
+        }
+        line_count += 1;
+        if line_count <= skip {
+            continue;
+        }
+        let mut line = String::from_utf8_lossy(chunk).to_string();
+        let had_delim = idx + 1 < n_chunks; // this chunk was followed by delim
+        // A NUL delimiter cannot live in a shell string; bash drops it.
+        if !strip_trailing && had_delim && delimiter != 0 {
+            line.push(delim_char);
+        }
+        lines.push(line);
+        if count > 0 && lines.len() >= count {
+            break;
+        }
+    }
+
+    match origin {
+        Some(o) => {
+            // `-O origin`: keep what is there, pad up to `origin` (bash holes), overwrite from it.
+            let mut cur = crate::ported::params::getaparam(&array_name).unwrap_or_default();
+            let old_len = cur.len();
+            if cur.len() < o {
+                cur.resize(o, String::new());
+            }
+            for (k, l) in lines.into_iter().enumerate() {
+                match cur.get_mut(o + k) {
+                    Some(slot) => *slot = l,
+                    None => cur.push(l),
+                }
+            }
+            crate::ported::params::setaparam(&array_name, cur);
+            if o > old_len {
+                crate::bash_arrays::note_subscript_set(&array_name, old_len, o);
+            }
+        }
+        None => {
+            crate::bash_arrays::clear(&array_name);
+            crate::ported::params::setaparam(&array_name, lines);
+        }
+    }
+    let _ = (callback, callback_quantum);
+    0
+}
+
+pub(crate) fn shopt(args: &[String]) -> i32 {
+    use crate::dash_mode::{bash_shopt_get, bash_shopt_row, bash_shopt_set, BASH_SHOPTS};
+
+    // bash(1), The Shopt Builtin. The name list, the defaults and the
+    // storage location of each flag live in `dash_mode::BASH_SHOPTS`;
+    // this fn is the argument parsing and the output formats.
+    //
+    // Two output shapes:
+    //   plain    `NAME<TAB>on|off`         (columns, bash's `shopt` listing)
+    //   `-p`     `shopt -s|-u NAME`        (re-inputtable)
+    // and one status rule, quoted from bash(1): "The return status when
+    // listing options is zero if all optnames are enabled, non-zero
+    // otherwise." It applies to `-q` AND to the printing forms —
+    // `bash -c 'shopt -p cdable_vars'` prints `shopt -u cdable_vars` and
+    // exits 1.
+    let mut set: Option<bool> = None;
+    let mut print_p = false;
+    let mut quiet = false;
+    let mut set_o = false; // `-o`: restrict names to the `set -o` table
+    let mut opts: Vec<String> = Vec::new();
+
+    // bash groups short flags: `shopt -so errexit`, `shopt -ps`, `shopt -qs`
+    // are all real spellings (`bash -c 'shopt -so'` lists the enabled
+    // `set -o` options; `bash -c 'shopt -ps'` prints the enabled shopts in
+    // re-inputtable form). Parsing each argv word as ONE flag rejected them
+    // as option NAMES: `shopt -so` printed
+    // "shopt: -so: invalid shell option name" and exited 1.
+    let mut bad_flag: Option<String> = None;
+    // `--` ends flag parsing (`bash -c 'shopt -- dotglob'` queries dotglob).
+    let mut end_of_flags = false;
+    for arg in args {
+        let is_flag = !end_of_flags && arg.len() > 1 && arg.starts_with('-');
+        if arg.as_str() == "--" && !end_of_flags {
+            end_of_flags = true;
+            continue;
+        }
+        if !is_flag {
+            opts.push(arg.clone());
+            continue;
+        }
+        for c in arg.chars().skip(1) {
+            match c {
+                's' => set = Some(true),
+                'u' => set = Some(false),
+                'p' => print_p = true,
+                'q' => quiet = true,
+                'o' => set_o = true,
+                _ => {
+                    if bad_flag.is_none() {
+                        bad_flag = Some(format!("-{c}"));
+                    }
+                }
+            }
+        }
+    }
+    // bash: `shopt -Z` → "shopt: -Z: invalid option" + the usage line,
+    // status 2 (`bash -c 'shopt -Z'; echo $?`).
+    if let Some(f) = bad_flag {
+        eprintln!("zshrs: shopt: {f}: invalid option");
+        eprintln!("shopt: usage: shopt [-pqsu] [-o] [optname ...]");
+        return 2;
+    }
+
+    // `-o` names come from bash's `set -o` table, not the shopt table.
+    // bash(1): "Restricts the values of optname to be those defined for
+    // the -o option to the set builtin."
+    if set_o {
+        return shopt_o(set, print_p, quiet, &opts);
+    }
+
+    // No names: list the table in its (alphabetical) order, in whichever of
+    // the two shapes was asked for, and return 0.
+    //
+    // `-s` / `-u` FILTER that listing rather than suppressing it — bash(1):
+    // "If either -s or -u is used with no optname arguments, shopt shows
+    // only those options which are set or unset, respectively."
+    //   bash -c 'shopt -s'   → the 13 default-on rows, `NAME<TAB>on`
+    //   bash -c 'shopt -ps'  → `shopt -s NAME` for those same 13
+    //   bash -c 'shopt -q'   → nothing at all, status 0
+    // zshrs printed nothing for `-s`/`-u` and printed the FULL table for
+    // `-q`; both are fixed here.
+    if opts.is_empty() {
+        for (name, _, _) in BASH_SHOPTS {
+            let on = bash_shopt_get(name).unwrap_or(false);
+            if set.is_some_and(|want| want != on) || quiet {
+                continue;
+            }
+            if print_p {
+                println!("shopt {} {}", if on { "-s" } else { "-u" }, name);
+            } else {
+                println!("{:<20}\t{}", name, if on { "on" } else { "off" });
+            }
+        }
+        return 0;
+    }
+
+    // bash rejects an unknown name before doing anything:
+    //   bash -c 'shopt -p zznope'
+    //   bash: line 1: shopt: zznope: invalid shell option name
+    // status 1. zshrs previously accepted any string and reported it `-u`.
+    let mut bad = false;
+    for opt in &opts {
+        if bash_shopt_row(opt).is_none() {
+            eprintln!("zshrs: shopt: {}: invalid shell option name", opt);
+            bad = true;
+        }
+    }
+
+    if let Some(enable) = set {
+        for opt in &opts {
+            bash_shopt_set(opt, enable);
+        }
+        return if bad { 1 } else { 0 };
+    }
+
+    // Query. Status is 0 only when EVERY named option is enabled.
+    let mut all_set = true;
+    for opt in &opts {
+        let Some(on) = bash_shopt_get(opt) else {
+            all_set = false;
+            continue;
+        };
+        if !on {
+            all_set = false;
+        }
+        if !quiet {
+            if print_p {
+                println!("shopt {} {}", if on { "-s" } else { "-u" }, opt);
+            } else {
+                println!("{:<20}\t{}", opt, if on { "on" } else { "off" });
+            }
+        }
+    }
+    if bad || !all_set {
+        1
+    } else {
+        0
+    }
+}
+
+/// `shopt -o` — the same three shapes over bash's `set -o` name table
+/// (bash(1): "Restricts the values of optname to be those defined for the
+/// -o option to the set builtin"). State is shared with `set -o` through
+/// `dash_mode::bash_set_o*`, so `shopt -so errexit` and `set -o errexit`
+/// are one flag.
+fn shopt_o(set: Option<bool>, print_p: bool, quiet: bool, opts: &[String]) -> i32 {
+    use crate::dash_mode::{bash_set_o, bash_set_o_get, BASH_SET_O};
+    let known = |n: &str| BASH_SET_O.iter().any(|(b, _)| *b == n);
+    // `-p` under `-o` prints in the `set` builtin's re-inputtable form, not
+    // shopt's: `bash -c 'shopt -po errexit'` → `set +o errexit`. zshrs
+    // printed `shopt -uo errexit`, which is not a spelling bash emits at all.
+    let print_line = |on: bool, name: &str| {
+        println!("set {}o {}", if on { '-' } else { '+' }, name);
+    };
+    // The two `-o` shapes pad DIFFERENTLY in bash, so they cannot share one
+    // width. The no-name listing goes through bash's `set -o` lister and
+    // pads to 15 (`allexport      \toff`); a NAMED query goes through
+    // shopt's own printer and pads to 20 (`errexit             \toff`).
+    // Names longer than the width print unpadded, exactly as `{:<w$}` does.
+    const O_LIST_WIDTH: usize = 15;
+    const O_NAMED_WIDTH: usize = 20;
+    if opts.is_empty() {
+        // Same `-s`/`-u` filter and `-q` silence as the shopt table above.
+        for (name, _) in BASH_SET_O {
+            let on = bash_set_o_get(name);
+            if set.is_some_and(|want| want != on) || quiet {
+                continue;
+            }
+            if print_p {
+                print_line(on, name);
+            } else {
+                println!(
+                    "{:<w$}\t{}",
+                    name,
+                    if on { "on" } else { "off" },
+                    w = O_LIST_WIDTH
+                );
+            }
+        }
+        return 0;
+    }
+    let mut bad = false;
+    for opt in opts {
+        if !known(opt) {
+            eprintln!("zshrs: shopt: {}: invalid option name", opt);
+            bad = true;
+        }
+    }
+    if let Some(enable) = set {
+        for opt in opts {
+            let _ = bash_set_o(opt, enable);
+        }
+        return if bad { 1 } else { 0 };
+    }
+    let mut all_set = true;
+    for opt in opts {
+        if !known(opt) {
+            all_set = false;
+            continue;
+        }
+        let on = bash_set_o_get(opt);
+        if !on {
+            all_set = false;
+        }
+        if !quiet {
+            if print_p {
+                print_line(on, opt);
+            } else {
+                println!(
+                    "{:<w$}\t{}",
+                    opt,
+                    if on { "on" } else { "off" },
+                    w = O_NAMED_WIDTH
+                );
+            }
+        }
+    }
+    if bad || !all_set {
+        1
+    } else {
+        0
+    }
+}
+/// zsleep - sleep with fractional seconds
+pub(crate) fn zsleep(args: &[String]) -> i32 {
+    // zsh/Src/Modules/system.c sleep_main accepts a single
+    // non-negative numeric arg (NaN / negative / inf are
+    // rejected). Direct port of bin_zsleep in zsh's mod_zselect:
+    // negative-or-non-finite -> no-op exit 0; valid duration
+    // sleeps via nanosleep.
+    if args.is_empty() {
+        eprintln!("zshrs:zsleep:1: missing argument");
+        return 1;
+    }
+
+    let secs: f64 = match args[0].parse() {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("zshrs:zsleep:1: invalid number: {}", args[0]);
+            return 1;
+        }
+    };
+
+    // Duration::from_secs_f64 panics on negative / NaN / +inf.
+    // zsh's sleep just returns 0 for non-positive durations.
+    // Also clamp the upper bound: secs >= u64::MAX as f64 (~1.8e19)
+    // also panics; cap at i64::MAX seconds (≈292 years) to be safe.
+    if !secs.is_finite() || secs <= 0.0 {
+        return 0;
+    }
+    let capped = if secs > i64::MAX as f64 {
+        i64::MAX as f64
+    } else {
+        secs
+    };
+    std::thread::sleep(std::time::Duration::from_secs_f64(capped));
+    0
+}
+
+// ─── find ───────────────────────────────────────────────────────────────
+//
+// zshrs-only extension. Honest scope: GNU-find-compatible enough to run
+// real scripts in-process (no fork+exec) without silent divergence. The
+// previous impl handled only -name / -type / -maxdepth and silently
+// dropped every other predicate into a `_ => {}` arm — `find . -mtime +1`
+// would treat `+1` as a path. This rewrite errors on unknown predicates
+// and implements the common ones.
+
+#[derive(Debug, Clone)]
+enum FindPredicate {
+    Name(String),    // -name PATTERN — glob against basename
+    IName(String),   // -iname — case-insensitive variant
+    Path(String),    // -path PATTERN — glob against full path
+    Regex(String),   // -regex RE — Rust regex against full path
+    Type(char),      // -type {f,d,l,p,s,b,c}
+    /// (cmp, days, kind) — cmp is `+`/`-`/`=`; kind is m/a/c (mtime/atime/ctime)
+    Time(char, i64, char), // -mtime / -atime / -ctime / -mmin / -amin / -cmin
+    /// (cmp, bytes) — cmp is `+`/`-`/`=`
+    Size(char, u64), // -size N[ckMG]
+    Empty,           // -empty — zero-len file OR empty dir
+    Newer(String),   // -newer FILE — newer than FILE's mtime
+}
+
+#[derive(Debug, Clone)]
+enum FindAction {
+    Print,                   // default
+    Print0,                  // -print0
+    Delete,                  // -delete
+    Exec(Vec<String>, bool), // -exec CMD ARGS... ; (false) or + (true)
+}
+
+/// Parse one `[ckMG]` suffix as a byte multiplier. `c`=1, `k`=1024,
+/// `M`=1024², `G`=1024³ (coreutils default uses kibibytes when no
+/// suffix; here we default to 512-byte blocks per coreutils when no
+/// suffix is present).
+fn parse_size_suffix(s: &str) -> Option<(u64, u64)> {
+    if s.is_empty() {
+        return None;
+    }
+    let last = s.chars().last().unwrap();
+    let (num_str, mult) = match last {
+        'c' => (&s[..s.len() - 1], 1u64),
+        'k' => (&s[..s.len() - 1], 1024u64),
+        'M' => (&s[..s.len() - 1], 1024 * 1024),
+        'G' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        'b' => (&s[..s.len() - 1], 512u64), // coreutils default block
+        _ if last.is_ascii_digit() => (s, 512u64),
+        _ => return None,
+    };
+    let n: u64 = num_str.parse().ok()?;
+    Some((n, mult))
+}
+
+/// Parse `+N` / `-N` / `N` prefix: returns (cmp char, abs value).
+fn parse_cmp_num(s: &str) -> Option<(char, u64)> {
+    let (cmp, rest) = match s.chars().next()? {
+        '+' => ('+', &s[1..]),
+        '-' => ('-', &s[1..]),
+        _ => ('=', s),
+    };
+    let n: u64 = rest.parse().ok()?;
+    Some((cmp, n))
+}
+
+fn parse_cmp_i64(s: &str) -> Option<(char, i64)> {
+    parse_cmp_num(s).map(|(c, n)| (c, n as i64))
+}
+
+/// Match the predicate against an entry. `meta_full` is the post-follow
+/// metadata (or symlink_metadata when not following); `path` is the
+/// full path including starting prefix; `depth` is the entry's depth
+/// from the starting path (0 = the starting path itself).
+fn predicate_matches(
+    pred: &FindPredicate,
+    path: &std::path::Path,
+    meta: &std::fs::Metadata,
+    depth: usize,
+    newer_thresholds: &std::collections::HashMap<String, std::time::SystemTime>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match pred {
+        FindPredicate::Name(pat) => {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            crate::vm_helper::glob_match_static(name, pat)
+        }
+        FindPredicate::IName(pat) => {
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let pat_lc = pat.to_ascii_lowercase();
+            crate::vm_helper::glob_match_static(&name, &pat_lc)
+        }
+        FindPredicate::Path(pat) => {
+            let s = path.to_string_lossy();
+            crate::vm_helper::glob_match_static(&s, pat)
+        }
+        FindPredicate::Regex(re) => {
+            let s = path.to_string_lossy();
+            regex::Regex::new(re)
+                .map(|r| r.is_match(&s))
+                .unwrap_or(false)
+        }
+        FindPredicate::Type(c) => match c {
+            'f' => meta.is_file(),
+            'd' => meta.is_dir(),
+            'l' => meta.file_type().is_symlink(),
+            'p' => (meta.mode() & libc::S_IFMT as u32) == libc::S_IFIFO as u32,
+            's' => (meta.mode() & libc::S_IFMT as u32) == libc::S_IFSOCK as u32,
+            'b' => (meta.mode() & libc::S_IFMT as u32) == libc::S_IFBLK as u32,
+            'c' => (meta.mode() & libc::S_IFMT as u32) == libc::S_IFCHR as u32,
+            _ => false,
+        },
+        FindPredicate::Time(cmp, days, kind) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let entry_t = match kind {
+                'm' => meta.mtime(),
+                'a' => meta.atime(),
+                'c' => meta.ctime(),
+                _ => return false,
+            };
+            // Age in days, rounded down (coreutils semantics).
+            let age_days = (now - entry_t) / 86400;
+            match cmp {
+                '+' => age_days > *days,
+                '-' => age_days < *days,
+                _ => age_days == *days,
+            }
+        }
+        FindPredicate::Size(cmp, bytes) => {
+            let size = meta.size();
+            match cmp {
+                '+' => size > *bytes,
+                '-' => size < *bytes,
+                _ => size == *bytes,
+            }
+        }
+        FindPredicate::Empty => {
+            if meta.is_file() {
+                meta.size() == 0
+            } else if meta.is_dir() {
+                std::fs::read_dir(path)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        FindPredicate::Newer(reference) => {
+            let other = match newer_thresholds.get(reference) {
+                Some(t) => *t,
+                None => return false,
+            };
+            meta.modified().map(|m| m > other).unwrap_or(false)
+        }
+    }
+    .into()
+}
+
+/// A parsed `find` expression. Primaries combine with `-a`/`-and`
+/// (implicit between adjacent primaries), `-o`/`-or`, `!`/`-not` and
+/// `( … )`, with the usual precedence `!` > `-a` > `-o` and
+/// short-circuit evaluation.
+#[derive(Debug, Clone)]
+enum FindExpr {
+    Pred(FindPredicate),
+    Action(FindAction),
+    /// `-prune`: true, and the entry's directory is not descended into.
+    Prune,
+    /// Global options (`-maxdepth`, `-xdev`, …) evaluate to true.
+    True,
+    Not(Box<FindExpr>),
+    And(Box<FindExpr>, Box<FindExpr>),
+    Or(Box<FindExpr>, Box<FindExpr>),
+}
+
+impl FindExpr {
+    fn has_action(&self) -> bool {
+        match self {
+            FindExpr::Action(_) => true,
+            FindExpr::Not(e) => e.has_action(),
+            FindExpr::And(a, b) | FindExpr::Or(a, b) => a.has_action() || b.has_action(),
+            _ => false,
+        }
+    }
+}
+
+/// Per-walk state shared by every entry: global options and the
+/// -newer reference times.
+struct FindWalkOpts {
+    max_depth: Option<usize>,
+    min_depth: Option<usize>,
+    xdev: bool,
+    follow: bool,
+    newer_thresholds: std::collections::HashMap<String, std::time::SystemTime>,
+}
+
+/// Run one action on an entry. The result is the action's truth value
+/// (`-exec` is true on exit 0, `-delete` on success, `-print*` always).
+fn find_run_action(
+    action: &FindAction,
+    start: &std::path::Path,
+    meta: &std::fs::Metadata,
+    exit_status: &mut i32,
+) -> bool {
+    match action {
+        FindAction::Print => {
+            println!("{}", start.display());
+            true
+        }
+        FindAction::Print0 => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(start.display().to_string().as_bytes());
+            let _ = std::io::stdout().write_all(&[0u8]);
+            true
+        }
+        FindAction::Delete => {
+            let r = if meta.is_dir() {
+                std::fs::remove_dir(start)
+            } else {
+                std::fs::remove_file(start)
+            };
+            if let Err(e) = r {
+                eprintln!("find: cannot delete '{}': {}", start.display(), e);
+                *exit_status = 1;
+                return false;
+            }
+            true
+        }
+        FindAction::Exec(template, _plus) => {
+            let argv: Vec<String> = template
+                .iter()
+                .map(|t| t.replace("{}", &start.display().to_string()))
+                .collect();
+            match argv.split_first() {
+                Some((cmd, rest)) => match std::process::Command::new(cmd).args(rest).status() {
+                    Ok(s) => s.success(),
+                    Err(_) => {
+                        *exit_status = 1;
+                        false
+                    }
+                },
+                None => false,
+            }
+        }
+    }
+}
+
+/// Evaluate `expr` for one entry, short-circuiting `-a` / `-o`.
+fn find_eval(
+    expr: &FindExpr,
+    start: &std::path::Path,
+    meta: &std::fs::Metadata,
+    depth: usize,
+    opts: &FindWalkOpts,
+    pruned: &mut bool,
+    exit_status: &mut i32,
+) -> bool {
+    match expr {
+        FindExpr::Pred(p) => predicate_matches(p, start, meta, depth, &opts.newer_thresholds),
+        FindExpr::Action(a) => find_run_action(a, start, meta, exit_status),
+        FindExpr::Prune => {
+            *pruned = true;
+            true
+        }
+        FindExpr::True => true,
+        FindExpr::Not(e) => !find_eval(e, start, meta, depth, opts, pruned, exit_status),
+        FindExpr::And(a, b) => {
+            find_eval(a, start, meta, depth, opts, pruned, exit_status)
+                && find_eval(b, start, meta, depth, opts, pruned, exit_status)
+        }
+        FindExpr::Or(a, b) => {
+            find_eval(a, start, meta, depth, opts, pruned, exit_status)
+                || find_eval(b, start, meta, depth, opts, pruned, exit_status)
+        }
+    }
+}
+
+/// Walks the tree, evaluating `expr` on every entry. Honors -prune (a
+/// directory whose evaluation reached `-prune` is not descended into),
+/// -maxdepth, -mindepth, -xdev and -L.
+fn find_walk(
+    start: &std::path::Path,
+    expr: &FindExpr,
+    opts: &FindWalkOpts,
+    cur_depth: usize,
+    visited_devs: &mut std::collections::HashSet<u64>,
+    exit_status: &mut i32,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    // Get metadata using follow vs symlink-aware lookup.
+    let meta_res = if opts.follow {
+        std::fs::metadata(start)
+    } else {
+        std::fs::symlink_metadata(start)
+    };
+    let meta = match meta_res {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    // -xdev check: only descend into dirs on the same fs as the
+    // starting path. The starting path's dev is recorded on first
+    // call; subsequent entries with a different dev are skipped.
+    if opts.xdev {
+        let dev = meta.dev();
+        if visited_devs.is_empty() {
+            visited_devs.insert(dev);
+        } else if !visited_devs.contains(&dev) {
+            return;
+        }
+    }
+
+    // Entries shallower than -mindepth are neither tested nor acted on.
+    let mut pruned = false;
+    if opts.min_depth.map(|n| cur_depth >= n).unwrap_or(true) {
+        find_eval(expr, start, &meta, cur_depth, opts, &mut pruned, exit_status);
+    }
+
+    // Descend into dirs unless pruned or depth-capped.
+    if meta.is_dir() && !pruned {
+        if let Some(md) = opts.max_depth {
+            if cur_depth >= md {
+                return;
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(start) {
+            let mut children: Vec<_> = entries.flatten().collect();
+            children.sort_by_key(|e| e.file_name());
+            for entry in children {
+                find_walk(
+                    &entry.path(),
+                    expr,
+                    opts,
+                    cur_depth + 1,
+                    visited_devs,
+                    exit_status,
+                );
+            }
+        }
+    }
+}
+
+/// Recursive-descent parser for the `find` expression grammar:
+/// `or := and { (-o|-or) and }`, `and := not { [-a|-and] not }`,
+/// `not := (!|-not) not | primary`, `primary := ( or ) | test | action`.
+/// Errors are reported on stderr; `Err(status)` is the exit status.
+struct FindParser<'a> {
+    args: &'a [String],
+    i: usize,
+    opts: FindWalkOpts,
+}
+
+impl FindParser<'_> {
+    fn peek(&self) -> Option<&str> {
+        self.args.get(self.i).map(String::as_str)
+    }
+
+    fn parse_or(&mut self) -> Result<FindExpr, i32> {
+        let mut lhs = self.parse_and()?;
+        while matches!(self.peek(), Some("-o" | "-or")) {
+            self.i += 1;
+            let rhs = self.parse_and()?;
+            lhs = FindExpr::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self) -> Result<FindExpr, i32> {
+        let mut lhs = self.parse_not()?;
+        loop {
+            match self.peek() {
+                None | Some("-o" | "-or" | ")") => return Ok(lhs),
+                Some("-a" | "-and") => self.i += 1,
+                Some(_) => {}
+            }
+            let rhs = self.parse_not()?;
+            lhs = FindExpr::And(Box::new(lhs), Box::new(rhs));
+        }
+    }
+
+    fn parse_not(&mut self) -> Result<FindExpr, i32> {
+        if matches!(self.peek(), Some("!" | "-not")) {
+            self.i += 1;
+            return Ok(FindExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<FindExpr, i32> {
+        let args = self.args;
+        let i = self.i;
+        let Some(a) = args.get(i).map(String::as_str) else {
+            eprintln!("find: invalid expression; expected an expression after the last operator");
+            return Err(1);
+        };
+        let operand = args.get(i + 1);
+        match (a, operand) {
+            ("(", _) => {
+                self.i += 1;
+                let inner = self.parse_or()?;
+                if self.peek() != Some(")") {
+                    eprintln!("find: invalid expression; expected ')'");
+                    return Err(1);
+                }
+                self.i += 1;
+                Ok(inner)
+            }
+            (")" | "-o" | "-or" | "-a" | "-and", _) => {
+                eprintln!("find: invalid expression; unexpected '{}'", a);
+                Err(1)
+            }
+            ("-name", Some(v)) => self.pred(2, FindPredicate::Name(v.clone())),
+            ("-iname", Some(v)) => self.pred(2, FindPredicate::IName(v.clone())),
+            ("-path" | "-wholename", Some(v)) => self.pred(2, FindPredicate::Path(v.clone())),
+            ("-regex", Some(v)) => self.pred(2, FindPredicate::Regex(v.clone())),
+            ("-type", Some(v)) => {
+                let c = v.chars().next().unwrap_or('?');
+                self.pred(2, FindPredicate::Type(c))
+            }
+            ("-maxdepth", Some(v)) => {
+                self.opts.max_depth.get_or_insert(v.parse().unwrap_or(0));
+                self.i += 2;
+                Ok(FindExpr::True)
+            }
+            ("-mindepth", Some(v)) => {
+                self.opts.min_depth.get_or_insert(v.parse().unwrap_or(0));
+                self.i += 2;
+                Ok(FindExpr::True)
+            }
+            ("-mtime" | "-atime" | "-ctime", Some(v)) => {
+                let kind = a.chars().nth(1).unwrap_or('m');
+                match parse_cmp_i64(v) {
+                    Some((cmp, n)) => self.pred(2, FindPredicate::Time(cmp, n, kind)),
+                    None => {
+                        eprintln!("find: invalid argument for {}: '{}'", a, v);
+                        Err(1)
+                    }
+                }
+            }
+            ("-mmin" | "-amin" | "-cmin", Some(v)) => {
+                // Convert minutes → days fraction by dividing; coarse but
+                // matches the same `(now - entry) / 86400` reduction.
+                let kind = a.chars().nth(1).unwrap_or('m');
+                match parse_cmp_i64(v) {
+                    Some((cmp, n)) => self.pred(2, FindPredicate::Time(cmp, n / (24 * 60), kind)),
+                    None => {
+                        eprintln!("find: invalid argument for {}: '{}'", a, v);
+                        Err(1)
+                    }
+                }
+            }
+            ("-size", Some(s)) => {
+                let (cmp, rest) = match s.chars().next() {
+                    Some('+') => ('+', &s[1..]),
+                    Some('-') => ('-', &s[1..]),
+                    _ => ('=', s.as_str()),
+                };
+                match parse_size_suffix(rest) {
+                    Some((n, mult)) => self.pred(2, FindPredicate::Size(cmp, n * mult)),
+                    None => {
+                        eprintln!("find: invalid argument for -size: '{}'", s);
+                        Err(1)
+                    }
+                }
+            }
+            ("-empty", _) => self.pred(1, FindPredicate::Empty),
+            ("-newer", Some(ref_path)) => {
+                match std::fs::metadata(ref_path).and_then(|m| m.modified()) {
+                    Ok(m) => {
+                        self.opts.newer_thresholds.insert(ref_path.clone(), m);
+                        self.pred(2, FindPredicate::Newer(ref_path.clone()))
+                    }
+                    Err(_) => {
+                        eprintln!("find: '{}': No such file or directory", ref_path);
+                        Err(1)
+                    }
+                }
+            }
+            ("-prune", _) => {
+                self.i += 1;
+                Ok(FindExpr::Prune)
+            }
+            ("-xdev" | "-mount", _) => {
+                self.opts.xdev = true;
+                self.i += 1;
+                Ok(FindExpr::True)
+            }
+            ("-follow", _) => {
+                self.opts.follow = true;
+                self.i += 1;
+                Ok(FindExpr::True)
+            }
+            ("-print", _) => {
+                self.i += 1;
+                Ok(FindExpr::Action(FindAction::Print))
+            }
+            ("-print0", _) => {
+                self.i += 1;
+                Ok(FindExpr::Action(FindAction::Print0))
+            }
+            ("-delete", _) => {
+                self.i += 1;
+                Ok(FindExpr::Action(FindAction::Delete))
+            }
+            ("-exec", _) => {
+                // Slurp args up to `;` or `+`.
+                let mut tmpl = Vec::new();
+                let mut plus = false;
+                self.i += 1;
+                while self.i < args.len() {
+                    if args[self.i] == ";" {
+                        self.i += 1;
+                        break;
+                    }
+                    if args[self.i] == "+" {
+                        plus = true;
+                        self.i += 1;
+                        break;
+                    }
+                    tmpl.push(args[self.i].clone());
+                    self.i += 1;
+                }
+                if tmpl.is_empty() {
+                    eprintln!("find: missing argument for -exec");
+                    return Err(1);
+                }
+                Ok(FindExpr::Action(FindAction::Exec(tmpl, plus)))
+            }
+            // Unknown predicate — REJECT loudly. Previously this
+            // arm silently swallowed unknown flags and adjacent
+            // `+N` / `-N` args got pushed as paths.
+            _ => {
+                eprintln!("find: unknown predicate '{}'", a);
+                Err(1)
+            }
+        }
+    }
+
+    /// Consume `n` args and yield the test primary `p`.
+    fn pred(&mut self, n: usize, p: FindPredicate) -> Result<FindExpr, i32> {
+        self.i += n;
+        Ok(FindExpr::Pred(p))
+    }
+}
+
+pub(crate) fn find_impl(args: &[String]) -> i32 {
+    let mut paths: Vec<&str> = Vec::new();
+    let mut follow = false;
+    let mut exit_status: i32 = 0;
+    let mut i = 0;
+
+    // Collect paths up front — they appear BEFORE the first
+    // predicate per find(1) usage. Any arg starting with `-` or
+    // `(` ends the path list.
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') || a == "(" || a == "!" {
+            break;
+        }
+        paths.push(a);
+        i += 1;
+    }
+    if paths.is_empty() {
+        paths.push(".");
+    }
+
+    // Top-level flags (before predicates per GNU find).
+    while i < args.len() && matches!(args[i].as_str(), "-L" | "-H" | "-P" | "-D" | "-O") {
+        match args[i].as_str() {
+            "-L" => follow = true,
+            "-P" | "-H" => follow = false,
+            "-D" | "-O" => {
+                i += 1; // these take an argument (debug-opts, optimization-level)
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut parser = FindParser {
+        args,
+        i,
+        opts: FindWalkOpts {
+            max_depth: None,
+            min_depth: None,
+            xdev: false,
+            follow,
+            newer_thresholds: std::collections::HashMap::new(),
+        },
+    };
+    let parsed = if parser.i < args.len() {
+        match parser.parse_or() {
+            Ok(e) => Some(e),
+            Err(rc) => return rc,
+        }
+    } else {
+        None
+    };
+    if let Some(stray) = parser.peek() {
+        eprintln!("find: invalid expression; unexpected '{}'", stray);
+        return 1;
+    }
+    // GNU find: an expression with no action gets `( expr ) -print`.
+    let print = FindExpr::Action(FindAction::Print);
+    let expr = match parsed {
+        None => print,
+        Some(e) if e.has_action() => e,
+        Some(e) => FindExpr::And(Box::new(e), Box::new(print)),
+    };
+    let opts = parser.opts;
+
+    let mut visited_devs = std::collections::HashSet::new();
+    for p in &paths {
+        let path = std::path::Path::new(p);
+        if !path.exists() {
+            eprintln!("find: '{}': No such file or directory", p);
+            exit_status = 1;
+            continue;
+        }
+        find_walk(path, &expr, &opts, 0, &mut visited_devs, &mut exit_status);
+    }
+    exit_status
+}
+
+pub(crate) fn cp_impl(args: &[String]) -> i32 {
+    let mut recursive = false;
+    let mut force = false;
+    let mut interactive = false;
+    // -n: never overwrite. coreutils -f / -i / -n are mutually
+    // exclusive, last one wins.
+    let mut no_clobber = false;
+    let mut preserve = false;
+    let mut verbose = false;
+    let mut files: Vec<&str> = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "-r" | "-R" | "--recursive" => recursive = true,
+            "-f" | "--force" => {
+                force = true;
+                interactive = false;
+                no_clobber = false;
+            }
+            "-i" | "--interactive" => {
+                interactive = true;
+                force = false;
+                no_clobber = false;
+            }
+            "-n" | "--no-clobber" => {
+                no_clobber = true;
+                force = false;
+                interactive = false;
+            }
+            "-p" | "--preserve" => preserve = true,
+            "-v" | "--verbose" => verbose = true,
+            "--" => {} // end of options
+            s if !s.starts_with('-') || s == "-" => files.push(s),
+            s => {
+                // coreutils cp rejects unknown flags.
+                eprintln!("cp: unrecognized option: '{}'", s);
+                return 1;
+            }
+        }
+    }
+
+    if files.len() < 2 {
+        eprintln!("cp: missing file operand");
+        return 1;
+    }
+
+    let target = files.pop().unwrap();
+    let target_path = std::path::Path::new(target);
+    let is_dir = target_path.is_dir();
+
+    // Per-file continue-on-error per coreutils (was return 1 on
+    // first failure, leaving the rest unprocessed).
+    let mut cp_status = 0;
+    for src in files {
+        let src_path = std::path::Path::new(src);
+        let dest = if is_dir {
+            format!(
+                "{}/{}",
+                target,
+                src_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| src.to_string())
+            )
+        } else {
+            target.to_string()
+        };
+
+        let dest_path = std::path::Path::new(&dest);
+        if dest_path.exists() && !force {
+            if no_clobber {
+                if verbose {
+                    println!("'{}' -> '{}' (skipped, target exists)", src, dest);
+                }
+                continue;
+            }
+            if interactive {
+                eprint!("cp: overwrite '{}'? ", dest);
+                let mut response = String::new();
+                if std::io::stdin().read_line(&mut response).is_err()
+                    || !response.trim().eq_ignore_ascii_case("y")
+                {
+                    continue;
+                }
+            }
+        }
+
+        let result = if src_path.is_dir() {
+            if recursive {
+                ShellExecutor::copy_dir_recursive(src_path, dest_path)
+            } else {
+                eprintln!("cp: -r not specified; omitting directory '{}'", src);
+                cp_status = 1;
+                continue;
+            }
+        } else {
+            std::fs::copy(src, &dest).map(|_| ())
+        };
+
+        if let Err(e) = result {
+            eprintln!("cp: cannot copy '{}' to '{}': {}", src, dest, e);
+            cp_status = 1;
+            continue;
+        }
+
+        // -p: preserve mode, ownership, atime/mtime — coreutils
+        // cp(1) `-p` semantics. std::fs::copy already replicates
+        // mode bits, but timestamps and uid/gid require explicit
+        // chown(2) + utimensat(2) syscalls.
+        if preserve {
+            if let Ok(meta) = std::fs::metadata(src) {
+                let dest_c = std::ffi::CString::new(dest.as_bytes()).ok();
+                if let Some(c) = dest_c {
+                    unsafe {
+                        // chown(dest, uid, gid) — fails silently if
+                        // not root (matches coreutils behaviour).
+                        libc::chown(c.as_ptr(), meta.uid(), meta.gid());
+                    }
+                    // utimensat(AT_FDCWD, dest, [atime, mtime], 0)
+                    let times = [
+                        libc::timespec {
+                            tv_sec: meta.atime() as libc::time_t,
+                            tv_nsec: meta.atime_nsec(),
+                        },
+                        libc::timespec {
+                            tv_sec: meta.mtime() as libc::time_t,
+                            tv_nsec: meta.mtime_nsec(),
+                        },
+                    ];
+                    unsafe {
+                        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0);
+                    }
+                }
+            }
+        }
+
+        if verbose {
+            println!("'{}' -> '{}'", src, dest);
+        }
+    }
+    cp_status
+}
+
+/// Counts of what the newest recorder shard holds — the state startup
+/// replays — as `(shard file name, [(label, count)])`. `None` when there is
+/// no shard or it cannot be read.
+/// zshrs-original — no C counterpart.
+#[cfg(feature = "daemon")]
+pub fn recorded_state_counts() -> Option<(String, Vec<(&'static str, usize)>)> {
+    use crate::daemon::shard::{list_shards, read_canonical_shard};
+    let paths = crate::daemon::paths::CachePaths::resolve().ok()?;
+    let path = list_shards(&paths)
+        .ok()?
+        .into_iter()
+        .filter(|p| p.to_str().is_some_and(|s| s.ends_with("-recorder.rkyv")))
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())?;
+    let shard = read_canonical_shard(&path).ok()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    // Several subsystems are stored twice or only in `extras` (keyed by
+    // subsystem) while the typed field stays empty: count distinct names
+    // across both rather than adding them.
+    let distinct = |typed: Vec<&String>, key: &str| -> usize {
+        let mut names: std::collections::HashSet<&String> = typed.into_iter().collect();
+        if let Some(m) = shard.extras.get(key) {
+            names.extend(m.keys());
+        }
+        names.len()
+    };
+    let zstyle_patterns: Vec<&String> = shard.zstyle.iter().map(|(k, _)| k).collect();
+    Some((
+        name,
+        vec![
+            ("aliases", shard.aliases.len()),
+            ("functions", shard.functions.len()),
+            ("autoload bodies", shard.autoload_functions.len()),
+            ("completions", distinct(shard.compdef.keys().collect(), "completion")),
+            ("zstyles", distinct(zstyle_patterns, "zstyles_end")),
+            ("bindkeys", distinct(shard.bindkeys.keys().collect(), "bindkeys_end")),
+            ("widgets", distinct(Vec::new(), "widgets_end")),
+            ("modules", distinct(shard.zmodload.iter().collect(), "modules_end")),
+            ("params", distinct(shard.params.keys().collect(), "params_end")),
+            ("plugins", recorded_plugins(&shard).len()),
+            ("sourced files", shard.sourced_files.len()),
+        ],
+    ))
+}
+
+/// Plugins in a recorder shard: the ones the recorder stored, plus any its
+/// sourced files and fpath place in a known framework layout (shards written
+/// before the recorder detected plugins carry none).
+/// zshrs-original — no C counterpart.
+#[cfg(feature = "daemon")]
+pub fn recorded_plugins(shard: &crate::daemon::shard::CanonicalShard) -> Vec<(String, String)> {
+    crate::daemon::recorder_shard::shard_plugins(shard)
+}
+
+#[cfg(not(feature = "daemon"))]
+pub fn recorded_state_counts() -> Option<(String, Vec<(&'static str, usize)>)> {
+    None
+}
+
+/// One tsort node: `count` = unprinted predecessors, `top` = the
+/// successor list with the newest relation first (C: `->top`).
+/// zshrs-original — no C counterpart.
+struct TsortItem {
+    name: String,
+    count: usize,
+    printed: bool,
+    qlink: Option<usize>,
+    top: Vec<usize>,
+}
+
+/// c: coreutils tsort.c `detect_loop` — returns true once a loop was
+/// reported (names pushed to `err`) and one relation removed.
+/// zshrs-original — no C counterpart.
+fn tsort_detect_loop(
+    items: &mut [TsortItem],
+    lp: &mut Option<usize>,
+    k: usize,
+    err: &mut Vec<String>,
+) -> bool {
+    if items[k].count == 0 {
+        return false;
+    }
+    let Some(loop_head) = *lp else {
+        *lp = Some(k);
+        return false;
+    };
+    for pi in 0..items[k].top.len() {
+        if items[k].top[pi] != loop_head {
+            continue;
+        }
+        if items[k].qlink.is_some() {
+            while let Some(l) = *lp {
+                let tmp = items[l].qlink;
+                err.push(items[l].name.clone());
+                if l == k {
+                    let s = items[k].top.remove(pi);
+                    items[s].count -= 1;
+                    break;
+                }
+                items[l].qlink = None;
+                *lp = tmp;
+            }
+            while let Some(l) = *lp {
+                let tmp = items[l].qlink;
+                items[l].qlink = None;
+                *lp = tmp;
+            }
+            return true;
+        }
+        items[k].qlink = *lp;
+        *lp = Some(k);
+        break;
+    }
+    false
+}
+
+/// c: coreutils tsort.c `tsort` — topological sort of the `A B` pairs in
+/// `text`. Zero-count items queue in sorted name order, successors are
+/// released newest relation first, and a loop is reported and broken by
+/// dropping one relation. Returns (stdout lines, stderr lines without the
+/// `tsort: ` prefix, ok). `file` names the input in diagnostics.
+/// zshrs-original — no C counterpart.
+fn tsort_run(text: &str, file: &str) -> (Vec<String>, Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    let mut err: Vec<String> = Vec::new();
+    let mut items: Vec<TsortItem> = Vec::new();
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pending: Option<usize> = None;
+    for tok in text.split([' ', '\t', '\n']).filter(|t| !t.is_empty()) {
+        let k = *index.entry(tok.to_string()).or_insert_with(|| {
+            items.push(TsortItem {
+                name: tok.to_string(),
+                count: 0,
+                printed: false,
+                qlink: None,
+                top: Vec::new(),
+            });
+            items.len() - 1
+        });
+        match pending.take() {
+            Some(j) => {
+                // c: record_relation — a self relation is ignored.
+                if items[j].name != items[k].name {
+                    items[k].count += 1;
+                    items[j].top.insert(0, k);
+                }
+            }
+            None => pending = Some(k),
+        }
+    }
+    if pending.is_some() {
+        err.push(format!("{}: input contains an odd number of tokens", file));
+        return (out, err, false);
+    }
+
+    // The tree walk visits items in sorted name order.
+    let order: Vec<usize> = index.values().copied().collect();
+    let mut ok = true;
+    let mut n_strings = items.len();
+    while n_strings > 0 {
+        // T4. Scan for zeros.
+        let mut queue: VecDeque<usize> = order
+            .iter()
+            .copied()
+            .filter(|&k| items[k].count == 0 && !items[k].printed)
+            .collect();
+        while let Some(head) = queue.pop_front() {
+            out.push(items[head].name.clone());
+            items[head].printed = true;
+            n_strings -= 1;
+            for s in items[head].top.clone() {
+                items[s].count -= 1;
+                if items[s].count == 0 {
+                    queue.push_back(s);
+                }
+            }
+        }
+        if n_strings > 0 {
+            err.push(format!("{}: input contains a loop:", file));
+            ok = false;
+            let mut lp: Option<usize> = None;
+            loop {
+                for &k in &order {
+                    if tsort_detect_loop(&mut items, &mut lp, k, &mut err) {
+                        break;
+                    }
+                }
+                if lp.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    (out, err, ok)
+}
+
+/// The compiled-in default dircolors database (GNU coreutils
+/// `dircolors --print-database`).
+const DIRCOLORS_DEFAULT_DATABASE: &str = include_str!("dircolors_default.db");
+
+/// c: coreutils dircolors.c `dc_parse_stream` + `dc_output` — turn a
+/// database `text` (named `name` in diagnostics) into the shell command
+/// that sets LS_COLORS. `term` / `colorterm` (the `$TERM` / `$COLORTERM`
+/// values) select the matching sections. Err carries the diagnostic without the `dircolors: ` prefix.
+/// zshrs-original — no C counterpart.
+fn dircolors_render(text: &str, name: &str, csh: bool, term: &str, colorterm: &str) -> Result<String, String> {
+    // Database keywords (case-insensitive) and the `ls` indicator
+    // each sets.
+    const SLOTS: &[(&str, &str)] = &[
+        ("NORMAL", "no"),
+        ("NORM", "no"),
+        ("FILE", "fi"),
+        ("RESET", "rs"),
+        ("DIR", "di"),
+        ("LNK", "ln"),
+        ("LINK", "ln"),
+        ("SYMLINK", "ln"),
+        ("ORPHAN", "or"),
+        ("MISSING", "mi"),
+        ("FIFO", "pi"),
+        ("PIPE", "pi"),
+        ("SOCK", "so"),
+        ("BLK", "bd"),
+        ("BLOCK", "bd"),
+        ("CHR", "cd"),
+        ("CHAR", "cd"),
+        ("DOOR", "do"),
+        ("EXEC", "ex"),
+        ("LEFT", "lc"),
+        ("RIGHT", "rc"),
+        ("END", "ec"),
+        ("ENDCODE", "ec"),
+        ("SUID", "su"),
+        ("SETUID", "su"),
+        ("SGID", "sg"),
+        ("SETGID", "sg"),
+        ("STICKY", "st"),
+        ("STICKY_OTHER_WRITABLE", "tw"),
+        ("OTHER_WRITABLE", "ow"),
+        ("CAPABILITY", "ca"),
+        ("MULTIHARDLINK", "mh"),
+        ("CLRTOEOL", "cl"),
+    ];
+    let fnmatch = |pat: &str, s: &str| -> bool {
+        match (CString::new(pat), CString::new(s)) {
+            (Ok(p), Ok(s)) => unsafe { libc::fnmatch(p.as_ptr(), s.as_ptr(), 0) == 0 },
+            _ => false,
+        }
+    };
+    // `TERM`/`COLORTERM` lines gate what follows until the next such
+    // line: a run of them is an OR, and a match enables the section.
+    let mut term_seen = false;
+    let mut term_match = false;
+    let mut prev_was_term = false;
+    let mut out = String::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (keyword, rest) = match line.split_once(char::is_whitespace) {
+            Some((k, r)) => (k, r.trim_start()),
+            None => {
+                return Err(format!("{}:{}: invalid line;  missing second token", name, idx + 1));
+            }
+        };
+        // A `#` that starts a word ends the argument.
+        let mut arg_end = rest.len();
+        let mut prev_ws = true;
+        for (i, ch) in rest.char_indices() {
+            if ch == '#' && prev_ws {
+                arg_end = i;
+                break;
+            }
+            prev_ws = ch.is_whitespace();
+        }
+        let arg = rest[..arg_end].trim_end();
+        if arg.is_empty() {
+            return Err(format!("{}:{}: invalid line;  missing second token", name, idx + 1));
+        }
+        let kw_upper = keyword.to_ascii_uppercase();
+        if kw_upper == "TERM" || kw_upper == "COLORTERM" {
+            let matched = if kw_upper == "TERM" {
+                fnmatch(arg, term)
+            } else {
+                !colorterm.is_empty() && fnmatch(arg, colorterm)
+            };
+            if !prev_was_term {
+                term_match = false;
+            }
+            term_match |= matched;
+            term_seen = true;
+            prev_was_term = true;
+            continue;
+        }
+        prev_was_term = false;
+        if term_seen && !term_match {
+            continue;
+        }
+        if let Some((_, code)) = SLOTS.iter().find(|(k, _)| *k == kw_upper) {
+            out.push_str(&format!("{}={}:", code, arg));
+        } else if keyword.starts_with('*') {
+            out.push_str(&format!("{}={}:", keyword, arg));
+        } else if keyword.starts_with('.') {
+            out.push_str(&format!("*{}={}:", keyword, arg));
+        }
+        // COLOR / OPTIONS / EIGHTBIT and unknown keywords: ignored.
+    }
+    let quoted = out.replace('\'', "'\\''");
+    Ok(if csh {
+        format!("setenv LS_COLORS '{}'\n", quoted)
+    } else {
+        format!("LS_COLORS='{}';\nexport LS_COLORS\n", quoted)
+    })
+}
+
+/// Existence requirement on the components (coreutils
+/// `canonicalize_mode_t`). zshrs-original — no C counterpart.
+#[derive(Clone, Copy, PartialEq)]
+enum RealpathNeed {
+    All,
+    AllButLast,
+    Nothing,
+}
+
+/// `canonicalize_filename_mode`: `need` governs which components
+/// must exist, `logical` folds `..` before expanding symlinks,
+/// `nosym` leaves symlinks alone.
+fn realpath_canonicalize(
+    path: &std::path::Path,
+    need: RealpathNeed,
+    logical: bool,
+    nosym: bool,
+) -> io::Result<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::path::{Component, PathBuf};
+    let cwd = std::env::current_dir()?;
+    let mut result = PathBuf::from("/");
+    let mut queue: VecDeque<OsString> = VecDeque::new();
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    for comp in full.components() {
+        match comp {
+            Component::Normal(c) => queue.push_back(c.to_os_string()),
+            Component::ParentDir => {
+                if logical || nosym {
+                    queue.pop_back();
+                } else {
+                    queue.push_back(OsString::from(".."));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut links = 0;
+    while let Some(c) = queue.pop_front() {
+        if c == ".." {
+            result.pop();
+            continue;
+        }
+        let next = result.join(&c);
+        let is_last = queue.is_empty();
+        match std::fs::symlink_metadata(&next) {
+            Ok(md) if md.file_type().is_symlink() && !nosym => {
+                links += 1;
+                if links > 40 {
+                    return Err(io::Error::from_raw_os_error(libc::ELOOP));
+                }
+                let target = std::fs::read_link(&next)?;
+                if target.is_absolute() {
+                    result = PathBuf::from("/");
+                }
+                for comp in target.components().rev() {
+                    match comp {
+                        Component::Normal(t) => queue.push_front(t.to_os_string()),
+                        Component::ParentDir => queue.push_front(OsString::from("..")),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(md) => {
+                if !is_last && need != RealpathNeed::Nothing && !md.is_dir() && !nosym {
+                    return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+                }
+                result = next;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if need == RealpathNeed::All || (need == RealpathNeed::AllButLast && !is_last) {
+                    return Err(e);
+                }
+                result = next;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(result)
+}
+
+/// Path of `target` relative to `base`, both absolute and
+/// canonical.
+fn realpath_relative_to(target: &std::path::Path, base: &std::path::Path) -> String {
+    let t: Vec<_> = target.components().collect();
+    let b: Vec<_> = base.components().collect();
+    let common = t.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    let mut parts: Vec<String> = vec!["..".to_string(); b.len() - common];
+    parts.extend(
+        t[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+#[cfg(test)]
+mod add_zsh_hook_tests {
+    //! Tests for the `add-zsh-hook` builtin — the SHELL-LEVEL hook
+    //! registration mechanism (`<hook>_functions` paramtab arrays;
+    //! port of `Src/Functions/Misc/add-zsh-hook`). Distinct from the
+    //! C-module HOOKTAB / `runhookdef` system, which is tested in
+    //! `src/ported/module.rs`.
+    use crate::vm_helper::ShellExecutor;
+
+    #[test]
+    fn add_zsh_hook_registers_function_in_paramtab_array() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        let rc = exec.builtin_add_zsh_hook(&["chpwd".to_string(), "my_fn".to_string()]);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            exec.array("chpwd_functions").unwrap(),
+            vec!["my_fn".to_string()]
+        );
+        // Cleanup so other tests aren't polluted.
+        crate::ported::params::setaparam("chpwd_functions", Vec::new());
+    }
+
+    #[test]
+    fn add_zsh_hook_appends_distinct_functions_in_order() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        crate::ported::params::setaparam("precmd_functions", Vec::new());
+        exec.builtin_add_zsh_hook(&["precmd".to_string(), "alpha".to_string()]);
+        exec.builtin_add_zsh_hook(&["precmd".to_string(), "beta".to_string()]);
+        exec.builtin_add_zsh_hook(&["precmd".to_string(), "gamma".to_string()]);
+        assert_eq!(
+            exec.array("precmd_functions").unwrap(),
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        crate::ported::params::setaparam("precmd_functions", Vec::new());
+    }
+
+    #[test]
+    fn add_zsh_hook_is_idempotent_for_duplicate_function() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        crate::ported::params::setaparam("preexec_functions", Vec::new());
+        exec.builtin_add_zsh_hook(&["preexec".to_string(), "solo".to_string()]);
+        exec.builtin_add_zsh_hook(&["preexec".to_string(), "solo".to_string()]);
+        exec.builtin_add_zsh_hook(&["preexec".to_string(), "solo".to_string()]);
+        assert_eq!(
+            exec.array("preexec_functions").unwrap(),
+            vec!["solo".to_string()]
+        );
+        crate::ported::params::setaparam("preexec_functions", Vec::new());
+    }
+
+    #[test]
+    fn add_zsh_hook_d_removes_target_function_only() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        crate::ported::params::setaparam("zshexit_functions", Vec::new());
+        exec.builtin_add_zsh_hook(&["zshexit".to_string(), "keep_a".to_string()]);
+        exec.builtin_add_zsh_hook(&["zshexit".to_string(), "drop_me".to_string()]);
+        exec.builtin_add_zsh_hook(&["zshexit".to_string(), "keep_b".to_string()]);
+        let rc = exec.builtin_add_zsh_hook(&[
+            "-d".to_string(),
+            "zshexit".to_string(),
+            "drop_me".to_string(),
+        ]);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            exec.array("zshexit_functions").unwrap(),
+            vec!["keep_a".to_string(), "keep_b".to_string()],
+            "-d must only remove the named function, not every entry"
+        );
+        crate::ported::params::setaparam("zshexit_functions", Vec::new());
+    }
+
+    #[test]
+    fn add_zsh_hook_d_on_missing_function_is_noop() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        crate::ported::params::setaparam("periodic_functions", Vec::new());
+        exec.builtin_add_zsh_hook(&["periodic".to_string(), "alone".to_string()]);
+        let rc = exec.builtin_add_zsh_hook(&[
+            "-d".to_string(),
+            "periodic".to_string(),
+            "never_registered".to_string(),
+        ]);
+        assert_eq!(rc, 0);
+        assert_eq!(
+            exec.array("periodic_functions").unwrap(),
+            vec!["alone".to_string()]
+        );
+        crate::ported::params::setaparam("periodic_functions", Vec::new());
+    }
+
+    #[test]
+    fn add_zsh_hook_rejects_too_few_args_no_state_change() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        let rc_no_args = exec.builtin_add_zsh_hook(&[]);
+        let rc_one_arg = exec.builtin_add_zsh_hook(&["zshaddhistory".to_string()]);
+        assert_eq!(rc_no_args, 1);
+        assert_eq!(rc_one_arg, 1);
+        // Error path must not populate the array.
+        assert!(
+            exec.array("zshaddhistory_functions").is_none()
+                || exec.array("zshaddhistory_functions").unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn add_zsh_hook_d_rejects_too_few_args() {
+        let _g = crate::test_util::global_state_lock();
+        let mut exec = ShellExecutor::new();
+        let rc = exec.builtin_add_zsh_hook(&["-d".to_string(), "chpwd".to_string()]);
+        assert_eq!(rc, 1);
+    }
+}
+
+/// zshrs-extension builtins folded into `builtintab` at runtime by
+/// `createbuiltintable` (the `znative` package manager, the ztest/zassert
+/// framework, `watch`/`sched`) but absent from the static `BUILTINS` port
+/// table. `whence`/`type`/`where`/`which` scan `BUILTINS`, so without these
+/// helpers they misclassify these first-class builtins as external/"none".
+/// Lives outside `src/ported/` (Rust-only, no C counterpart) so the
+/// port-drift gate stays clean — same arrangement as the daemon `z*`
+/// `is_zshrs_builtin` check that `bin_whence` already calls.
+pub fn extension_builtin_defs() -> impl Iterator<Item = &'static crate::ported::zsh_h::builtin> {
+    crate::pkg::builtin::bintab
+        .iter()
+        .chain(crate::extensions::ztest::bintab.iter())
+        .chain(crate::ported::modules::watch::bintab.iter())
+}
+
+/// True if `name` is a zshrs builtin that the static `BUILTINS` port table
+/// does not list, so `whence`/`type`/`command` classify it as `builtin`:
+///
+///  * the folded extension bintabs (znative, ztest, watch), and
+///  * every fusevm-registered builtin — the authoritative VM registry
+///    (`fusevm::shell_builtins::is_builtin`) that the compiler resolves a
+///    literal command name against. This covers the zshrs-original builtins
+///    (`async`, `await`, `barrier`, `peach`, `doctor`, `dbview`, …) AND the
+///    coreutils shadows (`cat`, `head`, `sort`, `cut`, …) that zshrs runs
+///    in-process. Without this they dispatch on a literal name but report
+///    `none`/external — a builtin that `whence` can't see.
+///  * host-registered native commands (`extensions/native_cmds.rs`) — the
+///    sibling runtimes a fat binary links in (`git`, `arb`, `stryke` in the
+///    zshrs-native build). They dispatch through `try_run_registered_builtin`
+///    like the rest, so they must classify the same way; the table is empty in
+///    the thin shell, where this term is always false.
+///  * commands a cdylib registered through `znative load` / `zmodload -R`
+///    (`extensions/plugin_host.rs`), which dispatch in-process by name.
+pub fn is_extension_builtin(name: &str) -> bool {
+    !is_undefined_contrib_function(name)
+        && (fusevm::shell_builtins::is_builtin(name)
+            || LOCAL_ONLY_BUILTINS.contains(&name)
+            || crate::native_cmds::is_registered(name)
+            || crate::plugin_host::is_plugin_command(name)
+            || extension_builtin_defs().any(|b| b.node.nam == name))
+}
+
+/// zshrs builtins that `register_builtins` installs on the VM and
+/// `try_run_registered_builtin` dispatches by name, but which the pinned
+/// `fusevm` release's shared name registry does not know yet (its
+/// `shell_builtins::is_builtin` is the table `is_extension_builtin`
+/// consults first). Without this list `whence -w`/`type` report such a
+/// name as `none` even though calling it runs the builtin.
+///
+/// Keep in sync with `fusevm_bridge::try_run_registered_builtin`; an
+/// entry graduates off this list once fusevm ships the name.
+///
+/// The coreutils-shaped entries below are NOT optional bookkeeping. Each
+/// one has a dispatch arm in `fusevm_bridge` and therefore ANSWERS when the
+/// user types the name — but the pinned fusevm registry doesn't list them,
+/// so `whence -w paste` reported `command`, `whence -a paste` showed only
+/// `/usr/bin/paste`, and `${+builtins[paste]}` was 0. The shell ran its own
+/// implementation while every tool you could ask about it pointed at the
+/// system binary, which is the worst of both: `command paste -sd, -` and
+/// `paste -sd, -` behaved differently with nothing to explain why. The
+/// names registered through `reg_overridable!` (cat, head, sort, …) never
+/// had this problem because fusevm knows them.
+pub const LOCAL_ONLY_BUILTINS: &[&str] = &[
+    "provenance",
+    // zshrs-original (`src/extensions/banner.rs`); fusevm has no ID for it,
+    // so a literal `zbanner` reaches `try_run_registered_builtin`.
+    "zbanner",
+    // zshrs-original (`autoload_prewarm.rs`), same: no fusevm ID.
+    "prewarm-autoloads",
+    // Dispatched by `fusevm_bridge`'s command-name match arms.
+    "arch",
+    "base64",
+    "cksum",
+    "comm",
+    "dircolors",
+    "env",
+    "expand",
+    "expr",
+    "factor",
+    "fold",
+    "groups",
+    "link",
+    "logname",
+    "mkfifo",
+    "nice",
+    "nl",
+    "nproc",
+    "pany",
+    "par_lines",
+    "par_walk",
+    "pfirst",
+    "pmap_chunked",
+    "psort",
+    "puniq",
+    "paste",
+    "printenv",
+    "sha256sum",
+    "shuf",
+    "sum",
+    "tac",
+    "tput",
+    "tsort",
+    "tty",
+    "unexpand",
+    "unlink",
+    "users",
+    "yes",
+    "zbuild",
+];
+
+// ---------------------------------------------------------------------
+// Parallel list / file / tree builtins — ports of strykelang's `puniq`,
+// `pfirst`, `pany`, `psort`, `pmap_chunked`, `par_lines` and `par_walk`.
+// The algorithms live in `par_ops.rs`; this block is argument parsing and
+// the per-item `zshrs --zsh -c` subprocess the sibling `pmap`/`pgrep` use.
+// ---------------------------------------------------------------------
+
+/// Run `f` on this PROCESS's rayon pool. A pipeline stage or `$(...)` is a forked
+/// child: the parent's pool has no threads there, so a bare `par_iter` blocks
+/// forever (see `fork_safe_pool`). Falls back to the caller's thread when no
+/// pool can be built.
+fn par_install<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match crate::fork_safe_pool::pool() {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
+/// Environment variable (and chunk-loop variable) the `{}` placeholder reads.
+const PAR_ARG_ENV: &str = "__ZSHRS_P_ARG__";
+
+/// Rewrite `{}` to `${=VAR}`: the `=` flag word-splits the item on `$IFS`,
+/// the same expansion `pmap` gives its items.
+fn par_parametrise(template: &str) -> String {
+    template.replace("{}", &format!("${{={}}}", PAR_ARG_ENV))
+}
+
+/// Items for `puniq` / `psort`: the operands, or stdin lines when there are none.
+fn par_items_or_stdin(operands: &[String]) -> Vec<String> {
+    if !operands.is_empty() {
+        return operands.to_vec();
+    }
+    let mut text = String::new();
+    let _ = io::stdin().read_to_string(&mut text);
+    text.lines().map(str::to_string).collect()
+}
+
+fn par_print_lines(items: &[String]) {
+    let out = io::stdout();
+    let mut out = out.lock();
+    for item in items {
+        let _ = writeln!(out, "{item}");
+    }
+}
+
+/// Run `template` once per item inside ONE `zshrs --zsh -c` process, feeding the
+/// items NUL-separated on fd 3 (so a template that reads stdin cannot eat them).
+/// Returns (status, stdout, stderr); status is 1 when any template run failed.
+fn par_run_chunk(exe: &std::path::Path, template: &str, items: &[Vec<u8>]) -> (i32, Vec<u8>, Vec<u8>) {
+    use std::process::{Command, Stdio};
+    let script = format!(
+        "__zshrs_pfail=0; while IFS= read -r -d '' -u3 {var}; do {{ {tmpl}\n}} || __zshrs_pfail=1; done 3<&0 </dev/null; exit $__zshrs_pfail",
+        var = PAR_ARG_ENV,
+        tmpl = par_parametrise(template),
+    );
+    let mut child = match Command::new(exe)
+        .args(["--zsh", "-c", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return (1, Vec::new(), Vec::new()),
+    };
+    let mut feed = Vec::new();
+    for item in items {
+        feed.extend_from_slice(item);
+        feed.push(0);
+    }
+    let stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(&feed);
+        }
+    });
+    let out = child.wait_with_output();
+    let _ = writer.join();
+    match out {
+        Ok(o) => (o.status.code().unwrap_or(1), o.stdout, o.stderr),
+        Err(_) => (1, Vec::new(), Vec::new()),
+    }
+}
+
+/// Run every chunk in parallel and write the results in chunk order.
+/// Returns 0 when every template run succeeded, else 1.
+fn par_run_chunks(name: &str, template: &str, chunks: &[Vec<Vec<u8>>]) -> i32 {
+    use rayon::prelude::*;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("zshrs:{name}:1: current_exe: {e}");
+            return 1;
+        }
+    };
+    let results: Vec<(i32, Vec<u8>, Vec<u8>)> = par_install(|| {
+        chunks
+            .par_iter()
+            .map(|chunk| par_run_chunk(&exe, template, chunk))
+            .collect()
+    });
+    let mut any_fail = false;
+    for (status, stdout, stderr) in results {
+        let _ = io::stdout().write_all(&stdout);
+        let _ = io::stderr().write_all(&stderr);
+        any_fail |= status != 0;
+    }
+    i32::from(any_fail)
+}
+
+/// Run `template` for `item` in a fresh `zshrs --zsh -c`, output discarded.
+fn par_test_item(exe: &std::path::Path, parametrised: &str, item: &str) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new(exe)
+        .args(["--zsh", "-c", parametrised])
+        .env(PAR_ARG_ENV, item)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+impl ShellExecutor {
+    /// puniq [ITEM...] — distinct items in first-occurrence order, hash-partitioned
+    /// across the worker pool. Reads stdin lines when no ITEM is given.
+    /// Port of strykelang `puniq` (`par_list::puniq_run`).
+    ///
+    /// Usage:
+    ///   puniq a b a c          # a b c
+    ///   cat big.log | puniq
+    pub(crate) fn builtin_puniq(&mut self, args: &[String]) -> i32 {
+        let items = par_items_or_stdin(args);
+        let out = par_install(|| crate::par_ops::puniq_run(items, rayon::current_num_threads()));
+        par_print_lines(&out);
+        0
+    }
+
+    /// psort [-n] [-r] [ITEM...] — parallel stable sort (`-n` numeric, `-r`
+    /// reverse). Reads stdin lines when no ITEM is given. Port of strykelang `psort`.
+    ///
+    /// Usage:
+    ///   psort -nr 10 9 100
+    ///   cat big.txt | psort
+    pub(crate) fn builtin_psort(&mut self, args: &[String]) -> i32 {
+        let mut spec = crate::par_ops::SortSpec::default();
+        let mut rest = args;
+        while let Some(first) = rest.first() {
+            if first == "--" {
+                rest = &rest[1..];
+                break;
+            }
+            let Some(flags) = first.strip_prefix('-').filter(|f| !f.is_empty()) else {
+                break;
+            };
+            for c in flags.chars() {
+                match c {
+                    'n' => spec.numeric = true,
+                    'r' => spec.reverse = true,
+                    _ => {
+                        eprintln!("zshrs:psort:1: bad option: -{c}");
+                        return 1;
+                    }
+                }
+            }
+            rest = &rest[1..];
+        }
+        let items = par_items_or_stdin(rest);
+        par_print_lines(&par_install(|| crate::par_ops::psort_run(items, spec)));
+        0
+    }
+
+    /// pfirst 'cmd {}' ITEM... — print the FIRST item (lowest position) for which
+    /// `cmd` succeeds; status 1 and no output when none does. Items after the best
+    /// match found so far are not tested. Port of strykelang `pfirst`.
+    ///
+    /// Usage:
+    ///   pfirst 'test -x {}/bin/zsh' /usr /opt/homebrew /usr/local
+    pub(crate) fn builtin_pfirst(&mut self, args: &[String]) -> i32 {
+        if args.len() < 2 {
+            eprintln!("zshrs:pfirst:1: requires 'command {{}}' followed by arguments");
+            return 1;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zshrs:pfirst:1: current_exe: {e}");
+                return 1;
+            }
+        };
+        let tmpl = par_parametrise(&args[0]);
+        let items = &args[1..];
+        match par_install(|| crate::par_ops::pfirst_run(items, |item| par_test_item(&exe, &tmpl, item))) {
+            Some(i) => {
+                println!("{}", items[i]);
+                0
+            }
+            None => 1,
+        }
+    }
+
+    /// pany 'cmd {}' ITEM... — status 0 when `cmd` succeeds for any item, else 1;
+    /// prints nothing. Once one item passes the others are skipped. Port of
+    /// strykelang `pany`.
+    ///
+    /// Usage:
+    ///   pany 'grep -q TODO {}' *.rs && echo "has TODOs"
+    pub(crate) fn builtin_pany(&mut self, args: &[String]) -> i32 {
+        if args.len() < 2 {
+            eprintln!("zshrs:pany:1: requires 'command {{}}' followed by arguments");
+            return 1;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("zshrs:pany:1: current_exe: {e}");
+                return 1;
+            }
+        };
+        let tmpl = par_parametrise(&args[0]);
+        i32::from(!par_install(|| crate::par_ops::pany_run(&args[1..], |item| par_test_item(&exe, &tmpl, item))))
+    }
+
+    /// pmap_chunked N 'cmd {}' ITEM... — like `pmap`, but ITEMs are handed to the
+    /// pool in chunks of N and each chunk runs in ONE shell process, so the
+    /// per-process startup is paid once per N items. Output is in item order.
+    /// Port of strykelang `pmap_chunked`.
+    ///
+    /// Usage:
+    ///   pmap_chunked 50 'gzip {}' *.log
+    pub(crate) fn builtin_pmap_chunked(&mut self, args: &[String]) -> i32 {
+        if args.len() < 3 {
+            eprintln!("zshrs:pmap_chunked:1: requires CHUNK 'command {{}}' followed by arguments");
+            return 1;
+        }
+        let Some(size) = args[0].parse::<usize>().ok().filter(|n| *n > 0) else {
+            eprintln!("zshrs:pmap_chunked:1: {}: chunk size must be a positive integer", args[0]);
+            return 1;
+        };
+        let items: Vec<String> = args[2..].to_vec();
+        let chunks: Vec<Vec<Vec<u8>>> = crate::par_ops::chunk_items(&items, size)
+            .into_iter()
+            .map(|c| c.iter().map(|i| i.as_bytes().to_vec()).collect())
+            .collect();
+        par_run_chunks("pmap_chunked", &args[1], &chunks)
+    }
+
+    /// par_lines 'cmd {}' FILE — run `cmd` once per line of FILE with `{}` replaced
+    /// by the line. FILE is memory-mapped and cut into line-aligned ranges that
+    /// run in parallel; output is written in file order. Port of strykelang
+    /// `par_lines`.
+    ///
+    /// Usage:
+    ///   par_lines 'echo got {}' access.log
+    pub(crate) fn builtin_par_lines(&mut self, args: &[String]) -> i32 {
+        if args.len() != 2 {
+            eprintln!("zshrs:par_lines:1: usage: par_lines 'command {{}}' FILE");
+            return 1;
+        }
+        let file = match std::fs::File::open(&args[1]) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("zshrs:par_lines:1: {}: {e}", args[1]);
+                return 1;
+            }
+        };
+        // SAFETY: the map is read-only and dropped before returning; a concurrent
+        // truncation of FILE by another process is the usual mmap caveat.
+        let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("zshrs:par_lines:1: {}: mmap: {e}", args[1]);
+                return 1;
+            }
+        };
+        let data: &[u8] = &mmap;
+        let ranges = crate::par_ops::line_aligned_chunks(data, rayon::current_num_threads() * 8);
+        let chunks: Vec<Vec<Vec<u8>>> = ranges
+            .into_iter()
+            .map(|(s, e)| crate::par_ops::lines_in_range(data, s, e))
+            .collect();
+        par_run_chunks("par_lines", &args[0], &chunks)
+    }
+
+    /// par_walk 'cmd {}' PATH... — run `cmd` once per file and directory under each
+    /// PATH (the PATHs themselves included) with `{}` replaced by the path. The
+    /// tree is walked in parallel, names sorted within a directory; output is in
+    /// walk order. Port of strykelang `par_walk`.
+    ///
+    /// Usage:
+    ///   par_walk 'test -f {} && wc -l {}' src
+    pub(crate) fn builtin_par_walk(&mut self, args: &[String]) -> i32 {
+        if args.len() < 2 {
+            eprintln!("zshrs:par_walk:1: usage: par_walk 'command {{}}' PATH...");
+            return 1;
+        }
+        let roots: Vec<std::path::PathBuf> = args[1..].iter().map(std::path::PathBuf::from).collect();
+        let paths = par_install(|| crate::par_ops::collect_paths(&roots));
+        if paths.is_empty() {
+            return 0;
+        }
+        let size = crate::par_ops::auto_chunk_size(paths.len(), rayon::current_num_threads());
+        let items: Vec<Vec<u8>> = {
+            use std::os::unix::ffi::OsStrExt;
+            paths.iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect()
+        };
+        let chunks: Vec<Vec<Vec<u8>>> = items.chunks(size).map(<[_]>::to_vec).collect();
+        par_run_chunks("par_walk", &args[0], &chunks)
+    }
+}
+
+#[cfg(test)]
+mod coreutils_port_tests {
+    //! tsort / dircolors / realpath against the GNU coreutils behaviour
+    //! (expected values taken from coreutils 9.x runs).
+    use super::*;
+
+    fn tsort(text: &str) -> (String, Vec<String>, bool) {
+        let (out, err, ok) = tsort_run(text, "-");
+        (out.join(" "), err, ok)
+    }
+
+    #[test]
+    fn tsort_roots_sorted_then_fifo() {
+        assert_eq!(tsort("z a\nm a\nq m\n").0, "q z m a");
+        assert_eq!(tsort("c d\nb d\na b\nz y\n").0, "a c z b y d");
+    }
+
+    #[test]
+    fn tsort_releases_newest_relation_first() {
+        assert_eq!(tsort("a x\na y\na b\n").0, "a b y x");
+    }
+
+    #[test]
+    fn tsort_loop_reports_and_breaks() {
+        let (out, err, ok) = tsort("a b\nb c\nc a\nc d\nd e\ne d\nq a\n");
+        assert_eq!(out, "q a b c d e");
+        assert_eq!(
+            err,
+            vec![
+                "-: input contains a loop:",
+                "a",
+                "b",
+                "c",
+                "-: input contains a loop:",
+                "d",
+                "e"
+            ]
+        );
+        assert!(!ok);
+    }
+
+    #[test]
+    fn tsort_odd_token_count() {
+        let (out, err, ok) = tsort("a b c\n");
+        assert!(out.is_empty() && !ok);
+        assert_eq!(err, vec!["-: input contains an odd number of tokens"]);
+    }
+
+    #[test]
+    fn dircolors_sections_and_extensions() {
+        let db = "DIR 01;34\n*.x 3 # c\n.y 4\nTERM foo*\nEXEC 9\nTERM *\nSOCK 7\n";
+        assert_eq!(
+            dircolors_render(db, "f", false, "xterm", "").unwrap(),
+            "LS_COLORS='di=01;34:*.x=3:*.y=4:so=7:';\nexport LS_COLORS\n"
+        );
+        assert_eq!(
+            dircolors_render(db, "f", true, "xterm", "").unwrap(),
+            "setenv LS_COLORS 'di=01;34:*.x=3:*.y=4:so=7:'\n"
+        );
+    }
+
+    #[test]
+    fn dircolors_missing_argument_is_an_error() {
+        assert_eq!(
+            dircolors_render("DIR\n", "-", false, "", "").unwrap_err(),
+            "-:1: invalid line;  missing second token"
+        );
+    }
+
+    #[test]
+    fn dircolors_default_database_gated_on_term() {
+        let on = dircolors_render(DIRCOLORS_DEFAULT_DATABASE, "d", false, "xterm", "").unwrap();
+        assert!(on.starts_with("LS_COLORS='rs=0:di=01;34:ln=01;36:mh=00:"));
+        let off = dircolors_render(DIRCOLORS_DEFAULT_DATABASE, "d", false, "dumb", "").unwrap();
+        assert_eq!(off, "LS_COLORS='';\nexport LS_COLORS\n");
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("zshrs-realpath-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    #[test]
+    fn realpath_existence_modes() {
+        let d = scratch("modes");
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let canon = |p: &std::path::Path, n| realpath_canonicalize(p, n, false, false);
+        let missing_last = d.join("sub/nope");
+        let missing_mid = d.join("nope/leaf");
+        assert_eq!(canon(&missing_last, RealpathNeed::AllButLast).unwrap(), missing_last);
+        assert!(canon(&missing_last, RealpathNeed::All).is_err());
+        assert!(canon(&missing_mid, RealpathNeed::AllButLast).is_err());
+        assert_eq!(canon(&missing_mid, RealpathNeed::Nothing).unwrap(), missing_mid);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn realpath_logical_folds_dotdot_before_symlinks() {
+        let d = scratch("logical");
+        std::fs::create_dir_all(d.join("real/deep")).unwrap();
+        std::fs::create_dir(d.join("other")).unwrap();
+        std::os::unix::fs::symlink(d.join("real/deep"), d.join("link")).unwrap();
+        let p = d.join("link/../other");
+        // Physical: `..` applies to the symlink target (real/), so `other`
+        // is missing there.
+        assert!(realpath_canonicalize(&p, RealpathNeed::All, false, false).is_err());
+        // Logical: `..` folds against `link` textually, landing on d/other.
+        assert_eq!(
+            realpath_canonicalize(&p, RealpathNeed::All, true, false).unwrap(),
+            d.join("other")
+        );
+        // -s leaves the symlink unexpanded.
+        assert_eq!(
+            realpath_canonicalize(&d.join("link"), RealpathNeed::All, false, true).unwrap(),
+            d.join("link")
+        );
+        assert_eq!(
+            realpath_canonicalize(&d.join("link"), RealpathNeed::All, false, false).unwrap(),
+            d.join("real/deep")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn realpath_symlink_loop_is_eloop() {
+        let d = scratch("loop");
+        std::os::unix::fs::symlink(d.join("b"), d.join("a")).unwrap();
+        std::os::unix::fs::symlink(d.join("a"), d.join("b")).unwrap();
+        let e = realpath_canonicalize(&d.join("a"), RealpathNeed::AllButLast, false, false)
+            .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::ELOOP));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn realpath_relative() {
+        use std::path::Path;
+        assert_eq!(realpath_relative_to(Path::new("/a/b/c"), Path::new("/a/x")), "../b/c");
+        assert_eq!(realpath_relative_to(Path::new("/a/b"), Path::new("/a/b")), ".");
+        assert_eq!(realpath_relative_to(Path::new("/a/b/c"), Path::new("/a")), "b/c");
+    }
+}

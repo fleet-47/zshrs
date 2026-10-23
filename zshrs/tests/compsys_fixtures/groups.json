@@ -1,0 +1,53 @@
+{
+ "schema": "compsys-fixture-groups/1",
+ "note": "Grouping for the consolidated report. A group says WHAT THE CELL TOUCHES — the surface the two shells disagree on — not what the Rust bug is: none of these fixtures has been traced to a line of zshrs, and a group that claimed otherwise would be asserting something no run in this directory measured. Each fixture names its own group; nothing here is inferred from a title.",
+ "order": [
+  "shell-core-parameters",
+  "line-token-rewrite",
+  "multiline-buffer",
+  "completer-machinery",
+  "description-escapes",
+  "listing-render",
+  "menu-navigation",
+  "zle-editing-crash",
+  "upstream-defect"
+ ],
+ "groups": {
+  "shell-core-parameters": {
+   "title": "Shell-core parameters, reached through compsys",
+   "what": "Not completion bugs. They are in this evidence base because the completion system runs on them: an append that loses $@ reprices every description _description renders, and a name the reference shell refuses to create changes what a completion leaves in the parameter table. The append cell (argv_append_discards_positionals) was fixed in d555917f07 and is now a guard; the other two still diverge."
+  },
+  "line-token-rewrite": {
+   "title": "The word on the line is rewritten during completion",
+   "what": "zshrs replaces the typed word with what it resolved to, where zsh keeps the word and offers matches. Both cells are `zsh -f` defaults — no compsys, no zstyle — so nothing in the completion system is involved."
+  },
+  "multiline-buffer": {
+   "title": "Completing on a continuation line",
+   "what": "Every one of these carries a control that runs the same completion on ONE physical line and AGREES, so the newline is the variable, not the completion. Owned by compsys_parity, the only harness whose buffer may contain a newline."
+  },
+  "completer-machinery": {
+   "title": "The completer machinery: specs, tags, compstate, widget context",
+   "what": "What _alternative, _values, compset, compadd and $compstate hand back. Mostly hermetic generated completers, so the case carries its own completer source and no host state is in the picture."
+  },
+  "description-escapes": {
+   "title": "Escapes in descriptions and formats",
+   "what": "%-escapes that one shell expanded and the other printed literally. Both cells are now guards: 44a3b4841c ported printfmt's escape switch from zle_tricky.c:2438-2535, and they are kept so the escapes cannot go literal again — reached once through compadd -X and once through the `format` zstyle, which is why there are two."
+  },
+  "listing-render": {
+   "title": "Drawing the listing, and redrawing around it",
+   "what": "What reaches the terminal once matches exist: the erase-to-end-of-line after each row, the line redrawn under the list, the count in the ask prompt, and what survives a window resize. Two of these are now guards — the erase-to-end-of-line and the window shrink, both fixed in 44a3b4841c; the rest still diverge."
+  },
+  "menu-navigation": {
+   "title": "Moving through a menu",
+   "what": "The completion itself agrees; what diverges is the state after a navigation key. Each cell's control is the same buffer without that key."
+  },
+  "zle-editing-crash": {
+   "title": "ZLE editing: a crash, not a difference",
+   "what": "zshrs panicked. There was no zsh-versus-zshrs rendering to compare — the process died — so the cell asserted the crash. Fixed in 44a3b4841c and now a guard, which is a stronger cell than it was: it no longer asserts a crash, it asserts that the two shells transpose the same words."
+  },
+  "upstream-defect": {
+   "title": "A defect in the REFERENCE shell",
+   "what": "Pinned so a dead shell is not read as a slow one on the next sweep. Says nothing about zshrs, and is not run by default."
+  }
+ }
+}

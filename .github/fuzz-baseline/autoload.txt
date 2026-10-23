@@ -1,0 +1,8 @@
+# parity-fuzz --mode autoload baseline: normalized signatures of KNOWN gaps.
+# A divergence whose signature is here is allowed; a NEW one fails CI.
+# Regenerate: parity-fuzz --mode autoload --count N --verify 3  (copy NEW-signature lines).
+#
+# whence -v now reports the fpath source. One re-autoload-after-+X ordering
+# edge remains: a function loaded via `autoload +X`, re-declared, then run,
+# reports "from zsh" because the lazy-load restore captures a clobbered name.
+autoload -Uz af_plain; whence -v af_plain

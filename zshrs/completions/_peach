@@ -1,0 +1,16 @@
+#compdef peach
+
+# Parallel for-each: `peach 'cmd {}' ITEM...` runs the template once per
+# ITEM on the worker pool, `{}` replaced by the item, output streamed as
+# each run finishes (no ordering).
+#
+# zshrs builtin. Arguments mirror builtin_peach
+# (src/extensions/ext_builtins.rs): argv[0] is the template, argv[1..] the
+# items (at least one), no options; keep in sync. Each item runs
+# `zshrs --zsh -c TEMPLATE` with {} bound to the item, word-split on IFS.
+# Items are arbitrary words; files are only the common case.
+# Bundled into ~/.zshrs/functions by build.rs.
+
+_arguments \
+    '1:command template ({} is replaced by each item):_cmdstring' \
+    '*:item:_default'

@@ -1,0 +1,102 @@
+# parity-fuzz --mode pattern baseline: normalized signatures of KNOWN gaps.
+# A divergence whose signature is here is allowed; a NEW one fails CI.
+# Regenerate: parity-fuzz --mode pattern --count N --verify 3  (copy NEW-signature lines).
+#
+# No known gaps — 4000 cases run clean (four seeds).
+#
+# Covers EXTENDED_GLOB pattern matching: the `(#...)` glob flags, `^neg`,
+# `pat~except`, `(a|b)` alternation, `(pat)#` closures, `<n-m>` ranges and
+# character classes.
+#
+# The mode already existed and ran clean, but was NOT gated in CI, so nothing
+# stopped a regression in it. Gating is what makes that clean run mean
+# something. `trap` and `redir` sat in exactly this state and each turned out
+# to be hiding real bugs once their vocabulary was widened — a clean ungated
+# mode is an untested mode, not a correct one.
+#
+# The divergence this mode found was a real port bug and is FIXED:
+#
+#   `(#M)` was inert — it could not turn `(#m)` back off:
+#
+#       [[ abc = (#m)(#M)a* ]]
+#           zsh    $MATCH unset
+#           zshrs  $MATCH=abc
+#
+#   c:Src/pattern.c:1093-1100 — the glob flags come in ON/OFF pairs and the
+#   LAST one wins:
+#       case 'i': patglobflags = (patglobflags & ~GF_LCMATCHUC) | GF_IGNCASE;
+#       case 'I': patglobflags &= ~(GF_LCMATCHUC|GF_IGNCASE);
+#       case 'm': patglobflags |= GF_MATCHREF;
+#       case 'M': patglobflags &= ~GF_MATCHREF;
+#       case 'b': patglobflags |= GF_BACKREF;
+#       case 'B': patglobflags &= ~GF_BACKREF;
+#
+#   TWO layers were wrong, and each hid the other:
+#     - The MATCHER (pattern.rs, c:2526) gated $MATCH on `prog->globflags`.
+#       C reads the GLOBAL patglobflags there. They are not the same thing:
+#       c:Src/zsh.h:1606 documents the struct field as "globbing flags to set
+#       at START", so it keeps what the pattern opened with — it is 0x1800 for
+#       ALL of `(#m)a*`, `(#m)(#M)a*` and `(#M)(#m)a*`, while the global
+#       correctly ends at 0x800 / 0x0 / 0x800.
+#     - vm_helper's glob_match_static then RE-set $MATCH from
+#       `pattern.contains("(#m)")`, a substring test that can only ever answer
+#       "on" and cannot see which flag came last. It overwrote the matcher's
+#       correct decision. Removed: the matcher is the layer that has the
+#       compiled flags, which is where C decides it.
+#
+#   `(#b)`/`(#B)` behaved correctly throughout because that check reads real
+#   compiled state (`prog.patnpar`, the count of numbered groups) rather than
+#   sniffing text — the same reason `(#m)`/`(#M)` did not.
+#
+#   The vocabulary only generated `b i m`: the ON half of three pairs and none
+#   of `a l I B M s e u U`. An implementation that treats a flag as "present in
+#   the pattern text" passes every ON-only case, which is exactly how this
+#   survived. The generator now emits both halves of each pair and reads $MATCH
+#   back, since whether it was SET is the whole question and the exit status
+#   cannot see it.
+#
+#   2. `(#a<n>)` approximate matching rejected a trailing-input deletion after
+#      a class / `?` / `*`:
+#
+#          [[ abc = (#a2)[^0-9] ]]   zsh Y   was N   (match `a`, delete `bc`)
+#          [[ ab  = (#a1)?      ]]   zsh Y   was N   (`?` = `a`, delete `b`)
+#
+#      c:Src/pattern.c:3451 — at P_END, if the pattern is exhausted but input
+#      remains (anchored), `fail = 1` and the shared approximate block
+#      (c:3463-3475) deletes trailing input one CHARACTER at a time
+#      (`++errsfound; CHARINC; continue`) until the input is gone or the budget
+#      is spent. This ran only for literal (P_EXACTLY) patterns via
+#      approx_match_exactly; a class / `?` / `*`-final pattern reached P_END and
+#      simply failed. The class/`?` arms already delete on a FAILED element
+#      match — this is the same edit at the pattern end.
+#
+# TWO `(#a)` gaps remain (pre-existing, unrelated to the trailing-delete fix —
+# verified divergent at HEAD both before and after it) and are kept OUT of the
+# `(#a)` arm's curated vocabulary:
+#
+#   - many substitutions across a `?`/`*`: `[[ xyz = (#a2)a?c ]]` matches in
+#     zshrs, not zsh — zshrs undercounts the substitution edits around the `?`.
+#   - the ranged closure `(#c<n>,<m>)` under `(#a)`: `[[ abc = (#a1)a(#c1,2)b ]]`
+#     likewise too permissive (plain `(#c2)` agrees).
+#
+#   3. `(#I)` failed to CLEAR a case-fold flag that a preceding `(#l)` / `(#i)`
+#      set:
+#
+#          [[ FOO = (#l)(#I)foo ]]   zsh N (case-sensitive after (#I))   was Y
+#          [[ FOO = (#i)(#I)foo ]]   zsh N                                was Y
+#
+#      The leading-`(#...)` compile hoist (pattern.rs, the `hoisted_globflags`
+#      loop) did `hoisted_globflags |= bits & …`. patgetglobflags's returned
+#      `bits` starts at 0 and only carries flags turned ON, so `(#I)` clearing
+#      LCMATCHUC/IGNCASE came back as 0 and the `|=` left the earlier fold bit
+#      set. The GLOBAL patglobflags, which patgetglobflags updates with sets AND
+#      clears, is authoritative — the fix REPLACES the fold/backref/matchref
+#      bits from it instead of OR-accumulating the lossy return. (GF_MULTIBYTE
+#      is left out of the replace: the hoist force-sets it for this UTF-8 port,
+#      and the original `|=` could not clear it either.)
+#
+#      `(#I)` alone, `(#I)(#l)` (fold last), and single-flag `(#i)Über` matching
+#      `über` were all correct throughout — only set-then-clear was wrong.
+#
+# Any divergence here is a regression.
+

@@ -1,0 +1,24 @@
+[[patch]]
+id = "native-tool-path"
+group = "android"
+file = "android/native-tool-path.patch"
+
+[[patch]]
+id = "libc-bindings"
+group = "android"
+file = "android/libc-bindings.patch"
+
+[[patch]]
+id = "interface-counters"
+group = "android"
+file = "android/interface-counters.patch"
+
+[[patch]]
+id = "random-source"
+group = "android"
+file = "android/random-source.patch"
+
+[[patch]]
+id = "xdg-base-dirs"
+group = "android"
+file = "android/xdg-base-dirs.patch"

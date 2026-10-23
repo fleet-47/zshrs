@@ -1,0 +1,899 @@
+// canonical.rs — rkyv-backed canonical state store.
+//
+// rkyv = source of truth (mmap'd shard); SQLite is a hydrated mirror for
+// inspection only. Per docs/DAEMON.md "Cache layout" + "Daemon = sole writer".
+//
+// Daemon keeps the authoritative copy in memory (RwLock<HashMap<subsystem,
+// HashMap<key, value>>>). Every mutation:
+//
+//   1. Updates the in-memory state atomically.
+//   2. Persists the updated rkyv shard via atomic-rename.
+//   3. Broadcasts `canonical_changed` to subscribed clients.
+//
+// SQLite hydration is a one-shot derived view: `hydrate_sqlite_view`
+// refreshes the `canonical` table to reflect the in-memory state. Triggered
+// by `zcache hydrate-view` (or implicitly on every push if cheap enough).
+//
+// Reads from `op_pull_canonical` / `op_view` / `op_export` go straight
+// against the in-memory map — no SQLite round trip on the hot path.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+
+use super::paths::CachePaths;
+use super::shard::{
+    read_canonical_shard, write_canonical_shard, CanonicalShard, ShardHeader, SHARD_FORMAT_VERSION,
+    SHARD_MAGIC,
+};
+use super::Result;
+
+/// Canonical slug used by the user-overlay promotion shard
+/// (target of `zsync up`). Per docs/DAEMON.md cache layout.
+const PROMOTIONS_SLUG: &str = "promotions";
+const PROMOTIONS_SOURCE_ROOT: &str = "user-overlay";
+
+/// Federation separator embedded in the in-memory storage key when a
+/// row is tagged with a non-default `shell_id`. ASCII Unit Separator
+/// (0x1f) — illegal in any reserved shell_id (see docs/SHELL_IDS.md
+/// identifier rules: lowercase alphanumerics + `-_:`) and in any
+/// realistic recorder key (alias names, function names, env vars).
+/// Storage layout:
+///   shell_id None  / Some("zshrs")  → stored under bare `key`
+///   shell_id Some(other)            → stored under `key\x1fshell_id`
+/// This keeps legacy on-disk shards (which carry no shell_id) and
+/// every existing zshrs row in their original slot, while letting
+/// federated rows from bash/fish/etc. coexist without overwrite.
+const SHELL_ID_SEP: char = '\x1f';
+
+/// Order of two row keys. Positional subsystems (`path`, `fpath`, `source`,
+/// `zstyle`, …) key their rows by index, `0`, `1`, … `10`, and the storage map
+/// sorts those as text, so `10` came before `2` and a listing or an export
+/// replayed `$PATH` out of order. A key that starts with a number sorts by that
+/// number first; every other key keeps plain text order.
+fn key_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let lead = |k: &str| -> Option<u64> {
+        let n = k.bytes().take_while(u8::is_ascii_digit).count();
+        k[..n].parse().ok()
+    };
+    match (lead(a), lead(b)) {
+        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    }
+}
+
+fn composite_storage_key(key: &str, shell_id: Option<&str>) -> String {
+    match shell_id {
+        None | Some("zshrs") => key.to_string(),
+        Some(sid) => format!("{key}{SHELL_ID_SEP}{sid}"),
+    }
+}
+
+/// One row in the canonical table. Stores the JSON-encoded value (so list /
+/// scalar / map values all round-trip cleanly through `unjson` in export.rs).
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct CanonicalRow {
+    /// `key` field.
+    pub key: String,
+    /// `value` field.
+    pub value: String, // already JSON-encoded
+    /// `set_at_ns` field.
+    pub set_at_ns: i64,
+    /// `set_by_shell` field.
+    pub set_by_shell: Option<i64>,
+    /// Federated-catalog recording-shell identity. Filled by the
+    /// recorder ingest path (zshrs_recorder bundle's top-level
+    /// shell_id, or per-record override) and by `definitions_emit`
+    /// from non-zshrs shells. None on legacy / pre-shell_id rows is
+    /// treated as "zshrs" by query callers. See
+    /// docs/SHELL_IDS.md for the reserved-identifier registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_id: Option<String>,
+    /// Source file where this definition was captured by the recorder
+    /// (e.g. `~/.zshrc`, a sourced plugin file). Powers `zwhere`'s
+    /// "where was this defined" answer. None on rows that pre-date
+    /// file/line attribution (older shards) or that come from
+    /// `definitions_emit` callers without `--file` set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Source line for `file`. Same nullable semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Every definition of this key in capture order — JSON value, file,
+    /// line, call chain; the last entry is the one `value`/`file`/`line`
+    /// describe. Empty for rows from a recording that predates the chain.
+    /// Powers `zwhere`'s override chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<super::recorder_shard::Definition>,
+}
+
+/// In-memory canonical state, keyed first by subsystem, then by key. Values
+/// are pre-encoded JSON strings to match the existing wire format (the JSON
+/// quoting is stripped on emit by `unjson` in export.rs).
+#[derive(Default)]
+struct InMemory {
+    /// subsystem → key → row
+    rows: BTreeMap<String, BTreeMap<String, CanonicalRow>>,
+    /// Most-recent rkyv-shard mtime per file (for staleness checks; daemon-
+    /// only — clients never read this).
+    last_persist_at_ns: i64,
+    /// mtime of each `*-recorder.rkyv` as last applied by
+    /// [`CanonicalEngine::sync_recorder_shards`].
+    recorder_shard_mtimes: BTreeMap<PathBuf, std::time::SystemTime>,
+}
+
+/// Canonical-state engine. One instance lives in DaemonState; clients address
+/// it through Arc.
+pub struct CanonicalEngine {
+    /// `inner` field.
+    inner: RwLock<InMemory>,
+    /// `paths` field.
+    paths: CachePaths,
+}
+
+impl CanonicalEngine {
+    /// `new` — see implementation.
+    pub fn new(paths: CachePaths) -> Arc<Self> {
+        Arc::new(Self {
+            inner: RwLock::new(InMemory::default()),
+            paths,
+        })
+    }
+
+    /// Reload the in-memory state from the on-disk rkyv shard if present.
+    /// Idempotent; safe to call at daemon start. Missing shard = empty state
+    /// (cold cache).
+    pub fn load_from_disk(&self) -> Result<()> {
+        let path = self.shard_path();
+        if !path.exists() {
+            self.sync_recorder_shards();
+            return Ok(());
+        }
+        let shard = read_canonical_shard(&path)?;
+        let mut g = self.inner.write();
+        g.rows.clear();
+        Self::ingest_shard_into(&mut g.rows, &shard);
+        g.last_persist_at_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        g.recorder_shard_mtimes.clear();
+        tracing::info!(
+            path = %path.display(),
+            generation = shard.header.generation,
+            entries = subsystem_total(&g.rows),
+            "canonical engine loaded from disk"
+        );
+        drop(g);
+        self.sync_recorder_shards();
+        Ok(())
+    }
+
+    /// Apply every `images/*-recorder.rkyv` written since the last call.
+    ///
+    /// `zshrs-recorder` writes its shard itself, with no daemon in the
+    /// loop (`recorder_shard::write_bundle_shard`), so this is how the
+    /// daemon's catalog learns a recording: at startup, and before every
+    /// `definitions_*` read, a shard whose mtime moved replaces the
+    /// subsystems it carries. A shard with the
+    /// [`super::recorder_shard::CATALOG_EXTRA`] rows brings their file,
+    /// line and shell id; one written before that extra existed brings
+    /// values only. Returns the number of shards applied.
+    pub fn sync_recorder_shards(&self) -> usize {
+        let Ok(dir) = std::fs::read_dir(&self.paths.images) else {
+            return 0;
+        };
+        let mut changed: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        {
+            let g = self.inner.read();
+            for entry in dir.flatten() {
+                let path = entry.path();
+                let is_recorder = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with("-recorder.rkyv"));
+                if !is_recorder {
+                    continue;
+                }
+                let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if g.recorder_shard_mtimes.get(&path) != Some(&mtime) {
+                    changed.push((path, mtime));
+                }
+            }
+        }
+        // Oldest first, so the most recent recording wins a subsystem two
+        // shards both carry.
+        changed.sort_by_key(|(_, mtime)| *mtime);
+        let mut applied = 0;
+        let mut newest_plugins = None;
+        let mut newest_paths = None;
+        for (path, mtime) in changed {
+            let shard = match read_canonical_shard(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), ?e, "recorder shard unreadable; catalog unchanged");
+                    continue;
+                }
+            };
+            let rows = match super::recorder_shard::decode_catalog(&shard.extras) {
+                Some((subs, shell_id)) => {
+                    for (sub, rows) in subs {
+                        self.replace_subsystem_with_attrs(&sub, rows, None, shell_id.clone());
+                    }
+                    for ((sub, name), defs) in super::recorder_shard::decode_catalog_history(&shard.extras) {
+                        self.set_history(&sub, &name, shell_id.as_deref(), defs);
+                    }
+                    "catalog"
+                }
+                None => {
+                    let mut by_sub = BTreeMap::new();
+                    Self::ingest_shard_into(&mut by_sub, &shard);
+                    for (sub, map) in by_sub {
+                        let rows = map.into_values().map(|r| (r.key, r.value, None, None));
+                        self.replace_subsystem_with_attrs(&sub, rows, None, None);
+                    }
+                    "values only"
+                }
+            };
+            newest_plugins = Some(super::recorder_shard::shard_plugins(&shard));
+            newest_paths = Some((shard.sourced_files.clone(), shard.fpath.clone()));
+            self.inner.write().recorder_shard_mtimes.insert(path.clone(), mtime);
+            applied += 1;
+            tracing::info!(path = %path.display(), rows, "recorder shard applied to canonical catalog");
+        }
+        if let Some(plugins) = newest_plugins {
+            // SQLite is the inspection mirror: a failure leaves the rkyv shard authoritative.
+            let mirrored = super::catalog::open(&self.paths)
+                .and_then(|conn| super::catalog::hydrate_plugins(&conn, &plugins));
+            if let Err(e) = mirrored {
+                tracing::warn!(?e, "catalog.db plugins mirror not hydrated (rkyv is authoritative)");
+            }
+        }
+        if let Some((sourced, fpath)) = newest_paths {
+            // plugins.db is what `zshrs --dump-plugins` reads.
+            let db = self.paths.root.join("plugins.db");
+            if let Err(e) = super::plugins_db::record(&db, &sourced, &fpath) {
+                tracing::warn!(?e, "plugins.db not updated from recorder shard");
+            }
+        }
+        applied
+    }
+
+    fn ingest_shard_into(
+        rows: &mut BTreeMap<String, BTreeMap<String, CanonicalRow>>,
+        shard: &CanonicalShard,
+    ) {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let push = |rows: &mut BTreeMap<String, BTreeMap<String, CanonicalRow>>,
+                    sub: &str,
+                    k: &str,
+                    v: String| {
+            rows.entry(sub.to_string()).or_default().insert(
+                k.to_string(),
+                CanonicalRow {
+                    key: k.to_string(),
+                    value: v,
+                    set_at_ns: now,
+                    set_by_shell: None,
+                    history: Vec::new(),
+                    // Reload from disk: shell_id is None — the shard's
+                    // header doesn't carry a per-row shell_id today.
+                    // Future: persist shell_id alongside rkyv shard
+                    // (`extras["row_shell_ids"]` map) so this round-
+                    // trips. v1 keeps None and treats as "zshrs".
+                    shell_id: None,
+                    // Same story for file/line: not in the shard
+                    // format yet. Reload-from-disk loses the
+                    // attribution. New ingests via
+                    // replace_subsystem_with_attrs populate them in
+                    // the in-memory canonical state; survives until
+                    // daemon restart.
+                    file: None,
+                    line: None,
+                },
+            );
+        };
+        for (k, v) in &shard.aliases {
+            push(rows, "alias", k, json_string(v));
+        }
+        for (k, v) in &shard.global_aliases {
+            push(rows, "galias", k, json_string(v));
+        }
+        for (k, v) in &shard.suffix_aliases {
+            push(rows, "salias", k, json_string(v));
+        }
+        for (k, v) in &shard.functions {
+            push(rows, "function", k, json_string(v));
+        }
+        for (k, v) in &shard.autoload_functions {
+            push(rows, "function_autoload", k, json_string(v));
+        }
+        for (k, v) in &shard.bindkeys {
+            push(rows, "bindkey", k, json_string(v));
+        }
+        for (k, v) in &shard.named_dirs {
+            push(rows, "named_dir", k, json_string(v));
+        }
+        for (k, v) in &shard.compdef {
+            push(rows, "compdef", k, json_string(v));
+        }
+        for (k, v) in &shard.env_exports {
+            push(rows, "env", k, json_string(v));
+        }
+        for (k, v) in &shard.params {
+            push(rows, "params", k, json_string(v));
+        }
+        for opt in &shard.setopts {
+            push(rows, "setopt", opt, "\"on\"".to_string());
+        }
+        for opt in &shard.unsetopts {
+            push(rows, "setopt", opt, "\"off\"".to_string());
+        }
+        for module in &shard.zmodload {
+            push(rows, "zmodload", module, "\"loaded\"".to_string());
+        }
+        for (i, dir) in shard.path.iter().enumerate() {
+            push(rows, "path", &i.to_string(), json_string(dir));
+        }
+        for (i, dir) in shard.fpath.iter().enumerate() {
+            push(rows, "fpath", &i.to_string(), json_string(dir));
+        }
+        for (i, dir) in shard.manpath.iter().enumerate() {
+            push(rows, "manpath", &i.to_string(), json_string(dir));
+        }
+        for (pat, rest) in &shard.zstyle {
+            push(rows, "zstyle", pat, json_string(rest));
+        }
+        // Re-ingest catch-all subsystems exactly as stored. Values came in
+        // as JSON-encoded already, so pass through verbatim — `unjson` in
+        // export.rs strips the quoting on emit.
+        for (sub, kv) in &shard.extras {
+            for (k, v) in kv {
+                push(rows, sub, k, v.clone());
+            }
+        }
+    }
+
+    /// Upsert one row. JSON-encode the value before storing if it isn't
+    /// already (callers can pass a pre-encoded JSON value to insert object /
+    /// array shapes directly).
+    pub fn upsert(
+        &self,
+        subsystem: &str,
+        key: &str,
+        json_value: &str,
+        set_by_shell: Option<u64>,
+    ) -> usize {
+        self.upsert_tagged(subsystem, key, json_value, set_by_shell, None)
+    }
+
+    /// `upsert` + structured `shell_id` for federated-catalog rows.
+    /// Used by `definitions_emit` (single-record write from non-zshrs
+    /// shells) and by `recorder_ingest` when the bundle's `shell_id`
+    /// is something other than the implicit "zshrs". Federation key
+    /// is `(subsystem, key, shell_id)` — see `composite_storage_key`
+    /// below — so two shells emitting `alias gst` keep both rows
+    /// distinct in the catalog (the diff op compares them by shell_id).
+    /// Legacy and `"zshrs"` rows share the bare-key slot for
+    /// backward compatibility with pre-federation on-disk shards.
+    pub fn upsert_tagged(
+        &self,
+        subsystem: &str,
+        key: &str,
+        json_value: &str,
+        set_by_shell: Option<u64>,
+        shell_id: Option<String>,
+    ) -> usize {
+        self.upsert_tagged_with_attrs(
+            subsystem,
+            key,
+            json_value,
+            set_by_shell,
+            shell_id,
+            None,
+            None,
+        )
+    }
+
+    /// `upsert_tagged` + per-row file/line attribution. Used by
+    /// `definitions_emit` when the caller passes `--file`/`--line`,
+    /// and by `recorder_ingest` for every event (recorder always
+    /// captures file/line via `RecordCtx`). file/line live in the
+    /// in-memory `CanonicalRow` and survive until daemon restart;
+    /// they are not yet persisted in the rkyv shard format.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_tagged_with_attrs(
+        &self,
+        subsystem: &str,
+        key: &str,
+        json_value: &str,
+        set_by_shell: Option<u64>,
+        shell_id: Option<String>,
+        file: Option<String>,
+        line: Option<u32>,
+    ) -> usize {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ckey = composite_storage_key(key, shell_id.as_deref());
+        let mut g = self.inner.write();
+        g.rows.entry(subsystem.to_string()).or_default().insert(
+            ckey,
+            CanonicalRow {
+                key: key.to_string(),
+                value: json_value.to_string(),
+                set_at_ns: now,
+                set_by_shell: set_by_shell.map(|n| n as i64),
+                shell_id,
+                file,
+                line,
+                history: Vec::new(),
+            },
+        );
+        1
+    }
+
+    /// Bulk-replace one subsystem's rows from a (key, json_value) iterator.
+    /// Returns the number of rows inserted by this call.
+    pub fn replace_subsystem<I: IntoIterator<Item = (String, String)>>(
+        &self,
+        subsystem: &str,
+        rows: I,
+        set_by_shell: Option<u64>,
+    ) -> usize {
+        self.replace_subsystem_tagged(subsystem, rows, set_by_shell, None)
+    }
+
+    /// `replace_subsystem` + structured `shell_id` stamped on every
+    /// row. Used by `recorder_ingest` so all rows from a single
+    /// recorder bundle carry the bundle's federated shell identity.
+    /// Scope-clears: only rows tagged with the same `shell_id` get
+    /// dropped before the re-insert; rows from other shells stay put
+    /// so a bash recorder ingest doesn't wipe out a parallel zshrs
+    /// recorder ingest in the same subsystem. Returns the number of
+    /// rows inserted by this call.
+    pub fn replace_subsystem_tagged<I: IntoIterator<Item = (String, String)>>(
+        &self,
+        subsystem: &str,
+        rows: I,
+        set_by_shell: Option<u64>,
+        shell_id: Option<String>,
+    ) -> usize {
+        // Adapt the (key, value) tuples into (key, value, None, None)
+        // and delegate. Existing callers (snapshot restore, etc.) use
+        // this; recorder_ingest uses the with_attrs variant directly
+        // so file/line propagate.
+        self.replace_subsystem_with_attrs(
+            subsystem,
+            rows.into_iter().map(|(k, v)| (k, v, None, None)),
+            set_by_shell,
+            shell_id,
+        )
+    }
+
+    /// Attach the override chain of one already-ingested key: every
+    /// definition in capture order (see [`CanonicalRow::history`]).
+    pub fn set_history(
+        &self,
+        subsystem: &str,
+        key: &str,
+        shell_id: Option<&str>,
+        history: Vec<super::recorder_shard::Definition>,
+    ) {
+        let ckey = composite_storage_key(key, shell_id);
+        let mut g = self.inner.write();
+        if let Some(row) = g.rows.get_mut(subsystem).and_then(|m| m.get_mut(&ckey)) {
+            row.history = history;
+        }
+    }
+
+    /// `replace_subsystem_tagged` + per-row file/line attribution.
+    /// Iterator yields `(key, value, file, line)` 4-tuples. Used by
+    /// `recorder_ingest` so every captured definition retains its
+    /// `~/.zshrc:42` lineage for `zwhere` queries.
+    pub fn replace_subsystem_with_attrs<I>(
+        &self,
+        subsystem: &str,
+        rows: I,
+        set_by_shell: Option<u64>,
+        shell_id: Option<String>,
+    ) -> usize
+    where
+        I: IntoIterator<Item = (String, String, Option<String>, Option<u32>)>,
+    {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let mut g = self.inner.write();
+        let map = g.rows.entry(subsystem.to_string()).or_default();
+        // Scope-clear: drop only rows for this shell_id slot. Bare
+        // keys belong to the None / "zshrs" scope; suffixed keys
+        // belong to other shells.
+        match shell_id.as_deref() {
+            None | Some("zshrs") => {
+                map.retain(|k, _| k.contains(SHELL_ID_SEP));
+            }
+            Some(sid) => {
+                let suffix = format!("{SHELL_ID_SEP}{sid}");
+                map.retain(|k, _| !k.ends_with(suffix.as_str()));
+            }
+        }
+        let mut inserted = 0;
+        for (k, v, file, line) in rows {
+            let ckey = composite_storage_key(&k, shell_id.as_deref());
+            let r = CanonicalRow {
+                key: k,
+                value: v,
+                set_at_ns: now,
+                set_by_shell: set_by_shell.map(|n| n as i64),
+                shell_id: shell_id.clone(),
+                file,
+                line,
+                history: Vec::new(),
+            };
+            map.insert(ckey, r);
+            inserted += 1;
+        }
+        inserted
+    }
+
+    /// Read zshrs's own rows in a subsystem (`shell_id` None / "zshrs",
+    /// the bare-key slot), ordered by key. Rows other shells federated in
+    /// (`definitions_emit`, `zshrs-recorder --shell-id`) are left out:
+    /// exporting, pulling or completing from them would apply another
+    /// shell's definitions in zshrs. Federation readers use
+    /// [`Self::rows_for_all_shells`].
+    pub fn rows_for(&self, subsystem: &str) -> Vec<CanonicalRow> {
+        let g = self.inner.read();
+        let mut rows: Vec<CanonicalRow> = g
+            .rows
+            .get(subsystem)
+            .map(|m| {
+                m.iter()
+                    .filter(|(k, _)| !k.contains(SHELL_ID_SEP))
+                    .map(|(_, r)| r.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by(|a, b| key_order(&a.key, &b.key));
+        rows
+    }
+
+    /// Read every row in a subsystem across all recording shells, ordered
+    /// by storage key.
+    pub fn rows_for_all_shells(&self, subsystem: &str) -> Vec<CanonicalRow> {
+        let g = self.inner.read();
+        let mut rows: Vec<CanonicalRow> = g
+            .rows
+            .get(subsystem)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        rows.sort_by(|a, b| key_order(&a.key, &b.key));
+        rows
+    }
+
+    /// Read one row by (subsystem, key).
+    pub fn row(&self, subsystem: &str, key: &str) -> Option<CanonicalRow> {
+        let g = self.inner.read();
+        g.rows.get(subsystem).and_then(|m| m.get(key)).cloned()
+    }
+
+    /// Total row count across all subsystems (for `info` / stats).
+    pub fn total_rows(&self) -> usize {
+        let g = self.inner.read();
+        subsystem_total(&g.rows)
+    }
+
+    /// Snapshot the entire in-memory state as a CanonicalShard, ready to
+    /// rkyv-serialize. Generation is set by the caller so the same value can
+    /// flow through the canonical_changed event.
+    pub fn snapshot_shard(&self, generation: u64) -> CanonicalShard {
+        let g = self.inner.read();
+        let mut shard = CanonicalShard {
+            header: ShardHeader {
+                magic: SHARD_MAGIC,
+                format_version: SHARD_FORMAT_VERSION,
+                generation,
+                built_at_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64,
+                slug: PROMOTIONS_SLUG.to_string(),
+                source_root: PROMOTIONS_SOURCE_ROOT.to_string(),
+                entry_count: 0,
+                binary_mtime_secs: super::shard::current_binary_identity().0,
+                binary_mtime_nsecs: super::shard::current_binary_identity().1,
+                binary_len: super::shard::current_binary_identity().2,
+            },
+            ..Default::default()
+        };
+
+        for (sub, map) in g.rows.iter() {
+            for (k, row) in map.iter() {
+                let plain = unjson(&row.value);
+                match sub.as_str() {
+                    "alias" => {
+                        shard.aliases.insert(k.clone(), plain);
+                    }
+                    "galias" => {
+                        shard.global_aliases.insert(k.clone(), plain);
+                    }
+                    "salias" => {
+                        shard.suffix_aliases.insert(k.clone(), plain);
+                    }
+                    // Inline-defined functions go to shard.functions;
+                    // fpath-walk autoload bodies go to shard.autoload_functions.
+                    // The split exists in rkyv too so a round-trip
+                    // (load_from_disk → snapshot_shard) preserves the
+                    // distinction and `replace_subsystem("function", …)`
+                    // can never wipe autoload bodies.
+                    "function" => {
+                        shard.functions.insert(k.clone(), plain);
+                    }
+                    "function_autoload" => {
+                        shard.autoload_functions.insert(k.clone(), plain);
+                    }
+                    "bindkey" => {
+                        shard.bindkeys.insert(k.clone(), plain);
+                    }
+                    "named_dir" => {
+                        shard.named_dirs.insert(k.clone(), plain);
+                    }
+                    "compdef" => {
+                        shard.compdef.insert(k.clone(), plain);
+                    }
+                    "env" => {
+                        shard.env_exports.insert(k.clone(), plain);
+                    }
+                    "params" => {
+                        shard.params.insert(k.clone(), plain);
+                    }
+                    "setopt" => {
+                        if plain == "on" || plain == "true" || plain == "1" {
+                            shard.setopts.push(k.clone());
+                        } else {
+                            shard.unsetopts.push(k.clone());
+                        }
+                    }
+                    "zmodload" => {
+                        shard.zmodload.push(k.clone());
+                    }
+                    "path" => {
+                        push_indexed(&mut shard.path, k, plain);
+                    }
+                    "fpath" => {
+                        push_indexed(&mut shard.fpath, k, plain);
+                    }
+                    "manpath" => {
+                        push_indexed(&mut shard.manpath, k, plain);
+                    }
+                    "zstyle" => {
+                        shard.zstyle.push((k.clone(), plain));
+                    }
+                    other => {
+                        // Catch-all: store under shard.extras so the
+                        // subsystem survives daemon restart even if it
+                        // isn't one of the known top-level fields.
+                        // Preserves zcompdump_raw / service / patcomp /
+                        // postpatcomp / autoload_completion across
+                        // restarts.
+                        shard
+                            .extras
+                            .entry(other.to_string())
+                            .or_default()
+                            .insert(k.clone(), row.value.clone());
+                    }
+                }
+            }
+        }
+        let total = subsystem_total(&g.rows);
+        shard.header.entry_count = total as u32;
+        shard
+    }
+
+    /// Persist the current state to disk (atomic-rename rkyv shard).
+    pub fn persist(&self, generation: u64) -> Result<PathBuf> {
+        let shard = self.snapshot_shard(generation);
+        let path = write_canonical_shard(&self.paths, &shard)?;
+        let mut g = self.inner.write();
+        g.last_persist_at_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        Ok(path)
+    }
+
+    /// Replace SQLite's `canonical` table with the current in-memory state.
+    /// SQLite is the inspection mirror only — never the source of truth.
+    /// Returns the number of rows written.
+    pub fn hydrate_sqlite_view(&self, state: &super::state::DaemonState) -> Result<usize> {
+        super::zsync::ensure_schema(state)?;
+        let g = self.inner.read();
+        let mut count = 0usize;
+        state.with_catalog(|conn| -> std::result::Result<(), super::DaemonError> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM canonical", [])?;
+            for (sub, map) in g.rows.iter() {
+                for (k, row) in map.iter() {
+                    tx.execute(
+                        "INSERT INTO canonical (subsystem, key, value, set_at_ns, set_by_shell) \
+                         VALUES (?, ?, ?, ?, ?)",
+                        rusqlite::params![sub, k, row.value, row.set_at_ns, row.set_by_shell],
+                    )?;
+                    count += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })?;
+        Ok(count)
+    }
+
+    fn shard_path(&self) -> PathBuf {
+        super::shard::shard_path(&self.paths, PROMOTIONS_SOURCE_ROOT, PROMOTIONS_SLUG)
+    }
+    /// `last_persist_at_ns` — see implementation.
+    pub fn last_persist_at_ns(&self) -> i64 {
+        self.inner.read().last_persist_at_ns
+    }
+}
+
+fn subsystem_total(rows: &BTreeMap<String, BTreeMap<String, CanonicalRow>>) -> usize {
+    rows.values().map(|m| m.len()).sum()
+}
+
+fn push_indexed(target: &mut Vec<String>, key: &str, value: String) {
+    if let Ok(idx) = key.parse::<usize>() {
+        while target.len() <= idx {
+            target.push(String::new());
+        }
+        target[idx] = value;
+    } else {
+        target.push(value);
+    }
+}
+
+fn json_string(s: &str) -> String {
+    serde_json::Value::String(s.to_string()).to_string()
+}
+
+fn unjson(s: &str) -> String {
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+            if let Some(s2) = v.as_str() {
+                return s2.to_string();
+            }
+        }
+    }
+    s.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recorder_shard::{write_bundle_shard, Bundle};
+    use serde_json::json;
+
+    fn bundle(finished_at_ns: u64, aliases: &[(&str, &str, u32)]) -> Bundle {
+        let events: Vec<_> = aliases
+            .iter()
+            .enumerate()
+            .map(|(i, (name, value, line))| {
+                json!({
+                    "order_idx": i,
+                    "ts_ns": finished_at_ns,
+                    "kind": "alias",
+                    "name": name,
+                    "value": value,
+                    "file": "/home/u/.zshrc",
+                    "line": line,
+                    "fn_chain": null,
+                })
+            })
+            .collect();
+        serde_json::from_value(json!({
+            "started_at_ns": 1,
+            "finished_at_ns": finished_at_ns,
+            "cmdline": null,
+            "zdotdir": "/home/u",
+            "home": "/home/u",
+            "events": events,
+        }))
+        .unwrap()
+    }
+
+    fn alias_rows(engine: &CanonicalEngine) -> Vec<(String, String, Option<String>, Option<u32>)> {
+        let mut rows: Vec<_> = engine
+            .rows_for("alias")
+            .into_iter()
+            .map(|r| (r.key, unjson(&r.value), r.file, r.line))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// `zshrs-recorder` writes its shard with no daemon running. The
+    /// catalog must pick it up both at startup and, for a recording made
+    /// while the daemon runs, on the next read, with each row's
+    /// definition site, and a re-recording must drop what it no longer
+    /// defines. Before the catalog read the shard, `zwhere alias gst`
+    /// printed nothing after every recording.
+    #[test]
+    fn recorder_shard_reaches_the_catalog_with_its_definition_site() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CachePaths::with_root(tmp.path());
+        paths.ensure_dirs().unwrap();
+
+        let first = write_bundle_shard(&paths, &bundle(10, &[("gst", "git status", 1), ("gco", "git checkout", 2)]))
+            .unwrap();
+        let engine = CanonicalEngine::new(paths.clone());
+        engine.load_from_disk().unwrap();
+        assert_eq!(
+            alias_rows(&engine),
+            vec![
+                ("gco".into(), "git checkout".into(), Some("/home/u/.zshrc".into()), Some(2)),
+                ("gst".into(), "git status".into(), Some("/home/u/.zshrc".into()), Some(1)),
+            ]
+        );
+        assert_eq!(engine.sync_recorder_shards(), 0, "an unchanged shard is not re-applied");
+
+        let second = write_bundle_shard(&paths, &bundle(20, &[("gst", "git status -sb", 1)])).unwrap();
+        assert_eq!(first, second, "one recorder shard per source root");
+        // A rewrite inside the same mtime tick must still count as new.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&second).unwrap().set_modified(later).unwrap();
+        assert_eq!(engine.sync_recorder_shards(), 1);
+        assert_eq!(
+            alias_rows(&engine),
+            vec![("gst".into(), "git status -sb".into(), Some("/home/u/.zshrc".into()), Some(1))]
+        );
+    }
+
+    /// The recording's plugins reach `catalog.db`'s `plugins` mirror when the
+    /// shard is applied. Before, nothing wrote it and the doctor reported 0.
+    #[test]
+    fn recorder_shard_hydrates_the_plugins_mirror() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CachePaths::with_root(tmp.path());
+        paths.ensure_dirs().unwrap();
+        let bundle: Bundle = serde_json::from_value(json!({
+            "started_at_ns": 1,
+            "finished_at_ns": 2,
+            "cmdline": null,
+            "zdotdir": "/home/u",
+            "home": "/home/u",
+            "events": [
+                {"order_idx": 0, "ts_ns": 1, "kind": "source", "name": "/home/u/.zinit/plugins/a---b/b.plugin.zsh", "value": null, "file": null, "line": null, "fn_chain": null},
+                {"order_idx": 1, "ts_ns": 2, "kind": "source", "name": "/home/u/.oh-my-zsh/plugins/git/git.plugin.zsh", "value": null, "file": null, "line": null, "fn_chain": null},
+            ],
+        }))
+        .unwrap();
+        write_bundle_shard(&paths, &bundle).unwrap();
+        CanonicalEngine::new(paths.clone()).load_from_disk().unwrap();
+        assert_eq!(crate::catalog::mirrored_plugin_count(&paths.catalog_db), Some(2));
+    }
+
+    // A bash `ll` federated in through definitions_emit must not shadow
+    // zshrs's own `ll` in anything zshrs exports, pulls or completes from.
+    #[test]
+    fn rows_for_is_the_zshrs_view_of_a_federated_subsystem() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = CanonicalEngine::new(CachePaths::with_root(tmp.path()));
+        engine.upsert_tagged("alias", "ll", &json_string("ls -la"), None, Some("zshrs".into()));
+        engine.upsert_tagged("alias", "ll", &json_string("ls -l"), None, Some("bash".into()));
+        engine.upsert("alias", "gst", &json_string("git status"), None);
+
+        let zshrs: Vec<_> = engine.rows_for("alias").into_iter().map(|r| unjson(&r.value)).collect();
+        assert_eq!(zshrs, ["git status", "ls -la"]);
+        assert_eq!(engine.rows_for_all_shells("alias").len(), 3);
+    }
+
+    // Positional subsystems key rows by index; the map sorts text, so `10`
+    // used to precede `2` and `$PATH` came back out of order.
+    #[test]
+    fn positional_rows_come_back_in_numeric_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = CanonicalEngine::new(CachePaths::with_root(tmp.path()));
+        for i in 0..12 {
+            engine.upsert("path", &i.to_string(), &json_string(&format!("/p{i}")), None);
+        }
+        let want: Vec<String> = (0..12).map(|i| format!("/p{i}")).collect();
+        let got = |rows: Vec<CanonicalRow>| -> Vec<String> {
+            rows.into_iter().map(|r| unjson(&r.value)).collect()
+        };
+        assert_eq!(got(engine.rows_for("path")), want);
+        assert_eq!(got(engine.rows_for_all_shells("path")), want);
+    }
+}

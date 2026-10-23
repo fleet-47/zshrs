@@ -1,0 +1,406 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.11.22)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # zshrs is huge (627k+ LOC, multiple binaries) — give the build room.
+    timeout-minutes: 180
+    # Per-target failures are tolerated on the flaky variants so the
+    # downstream publish + tap job ships from whichever targets did
+    # build. `needs: build` is satisfied either way.
+    continue-on-error: ${{ matrix.allow_failure || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- macOS native ---
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # --- Linux glibc native ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            # Native arm64 runner — switched off cross-rs because its
+            # xenial-era Docker image can't reliably apt-install zshrs's
+            # C lib deps (gdbm/cap/sqlite3). Native runner
+            # has up-to-date apt + matches link-step memory needs.
+            # No allow_failure: this target must succeed so the
+            # Homebrew formula's on_linux/on_arm block emits.
+          # --- Linux musl static (portable across glibc/musl distros) ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            allow_failure: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl') && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # ncurses/tinfo are no longer needed: the terminfo database reader,
+      # capability tables and `tparm` evaluator are pure Rust
+      # (src/extensions/terminfo_db.rs, terminfo_caps.rs, tparm.rs), so the
+      # binary links no terminal library and `libtinfo.so.6` is not an
+      # install dependency on Debian/Ubuntu.
+      - name: Install native deps for aarch64-linux-gnu (gdbm, cap, sqlite3)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && !matrix.use_cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdbm-dev libcap-dev libsqlite3-dev
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: |
+          # Prefer the prebuilt binary release over `cargo install`
+          # to save ~5 min of compile time per cross-build runner.
+          CROSS_VER="v0.2.5"
+          curl -sSLf -o /tmp/cross.tar.gz \
+            "https://github.com/cross-rs/cross/releases/download/${CROSS_VER}/cross-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C /tmp -xzf /tmp/cross.tar.gz
+          sudo install -m 755 /tmp/cross /usr/local/bin/cross
+
+      - uses: Swatinem/rust-cache@v2
+        if: '!matrix.use_cross'
+
+      - name: Build zshrs + zd + recorder (native)
+        if: '!matrix.use_cross'
+        # recorder feature implies daemon (per Cargo.toml). zd has its own
+        # required-features gate. One pass builds all three zshrs-crate bins.
+        run: cargo build --profile dist --locked --features recorder,zd --bin zshrs --bin zshrs-recorder --bin zd --target ${{ matrix.target }}
+
+      - name: Build zshrs + zd + recorder (cross)
+        if: matrix.use_cross
+        run: cross build --profile dist --locked --features recorder,zd --bin zshrs --bin zshrs-recorder --bin zd --target ${{ matrix.target }}
+
+      - name: Build zshrs-daemon binary (native)
+        if: '!matrix.use_cross'
+        # zshrs-daemon lives in a separate workspace crate; needs its own -p.
+        run: cargo build --profile dist --locked -p zshrs-daemon --bin zshrs-daemon --target ${{ matrix.target }}
+
+      - name: Build zshrs-daemon binary (cross)
+        if: matrix.use_cross
+        run: cross build --profile dist --locked -p zshrs-daemon --bin zshrs-daemon --target ${{ matrix.target }}
+
+      - name: Package zshrs (basic)
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/dist
+          for b in zshrs zd; do
+            strip "$b" 2>/dev/null || true
+          done
+          tar czf ../../../zshrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz zshrs zd
+          cd ../../..
+
+      - name: Package zshrs-all (basic + recorder + daemon)
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/dist
+          for b in zshrs zd zshrs-recorder zshrs-daemon; do
+            strip "$b" 2>/dev/null || true
+          done
+          tar czf ../../../zshrs-all-${{ github.ref_name }}-${{ matrix.target }}.tar.gz zshrs zd zshrs-recorder zshrs-daemon
+          cd ../../..
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zshrs-${{ matrix.target }}
+          path: zshrs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zshrs-all-${{ matrix.target }}
+          path: zshrs-all-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  plugin:
+    name: Build IntelliJ plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: editors/intellij
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '17'
+
+      - name: Cache Gradle + IntelliJ Platform SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            editors/intellij/.intellijPlatform
+          key: ${{ runner.os }}-gradle-${{ hashFiles('editors/intellij/build.gradle.kts', 'editors/intellij/gradle.properties', 'editors/intellij/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build plugin zip
+        # -x test skips the test task (CI has its own IntelliJ plugin
+        # tests job). -x buildSearchableOptions skips heavy IDE indexing.
+        run: ./gradlew buildPlugin --no-daemon -x test -x buildSearchableOptions
+
+      - name: Locate plugin zip
+        id: plugin_zip
+        run: |
+          zip_path=$(ls build/distributions/*.zip | head -1)
+          echo "path=$zip_path" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename $zip_path)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zshrs-intellij-plugin
+          path: editors/intellij/${{ steps.plugin_zip.outputs.path }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build, plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Attach BOTH the Rust binary tarballs (per-target) and the
+          # IntelliJ plugin zip (single file from the `plugin` job).
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/*.zip
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256 sums
+        id: sha
+        shell: bash
+        run: |
+          for f in artifacts/*.tar.gz; do
+            base=$(basename "$f")
+            sum=$(sha256sum "$f" | awk '{print $1}')
+            # zshrs-all-vX.Y.Z-target.tar.gz → all_<target>
+            # zshrs-vX.Y.Z-target.tar.gz     → <target>
+            if [[ "$base" == zshrs-all-* ]]; then
+              key="all_$(echo "$base" | sed 's/zshrs-all-v[^-]*-//; s/\.tar\.gz//; s/-/_/g')"
+            else
+              key=$(echo "$base" | sed 's/zshrs-v[^-]*-//; s/\.tar\.gz//; s/-/_/g')
+            fi
+            echo "${key}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/checkout@v6
+        with:
+          repository: MenkeTechnologies/homebrew-menketech
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update zshrs formula
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin }}
+          SHA_X86_MACOS: ${{ steps.sha.outputs.x86_64_apple_darwin }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
+          SHA_ARM_LINUX: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
+          SHA_X86_LINUX_MUSL: ${{ steps.sha.outputs.x86_64_unknown_linux_musl }}
+          SHA_ARM_LINUX_MUSL: ${{ steps.sha.outputs.aarch64_unknown_linux_musl }}
+        run: |
+          set -eu
+          V="${VERSION#v}"
+          BASE="https://github.com/MenkeTechnologies/zshrs/releases/download/v${V}"
+          # Helper: emit an on_arm / on_intel block when its SHA is non-empty.
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/zshrs-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          # Build per-OS blocks first; skip the whole on_macos/on_linux
+          # block if zero arches succeeded for that OS.
+          mac_blocks=$( { emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS"; emit on_intel x86_64-apple-darwin "$SHA_X86_MACOS"; } )
+          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          {
+            printf 'class Zshrs < Formula\n'
+            printf '  desc "First compiled Unix shell — drop-in zsh with bytecode JIT, AOP, worker pool"\n'
+            printf '  homepage "https://github.com/MenkeTechnologies/zshrs"\n'
+            printf '  license "MIT"\n'
+            printf '  version "%s"\n\n' "$V"
+            if [ -n "$mac_blocks" ]; then
+              printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
+            fi
+            if [ -n "$linux_blocks" ]; then
+              printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            fi
+            printf '  def install\n'
+            printf '    bin.install "zshrs"\n'
+            printf '    bin.install "zd"\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            printf '    assert_match "hi", shell_output("#{bin}/zshrs -c '"'"'echo hi'"'"'")\n'
+            printf '  end\n'
+            # musl tarballs as trailing comment — Homebrew has no
+            # on_libc gate, so static binaries are referenced by URL
+            # for users targeting Alpine / scratch / distroless.
+            if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
+              printf '\n  # Static musl tarballs also published at this release:\n'
+              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   zshrs-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
+              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   zshrs-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
+            fi
+            printf 'end\n'
+          } > tap/Formula/zshrs.rb
+
+      - name: Update zshrs-all formula
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.all_aarch64_apple_darwin }}
+          SHA_X86_MACOS: ${{ steps.sha.outputs.all_x86_64_apple_darwin }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.all_x86_64_unknown_linux_gnu }}
+          SHA_ARM_LINUX: ${{ steps.sha.outputs.all_aarch64_unknown_linux_gnu }}
+          SHA_X86_LINUX_MUSL: ${{ steps.sha.outputs.all_x86_64_unknown_linux_musl }}
+          SHA_ARM_LINUX_MUSL: ${{ steps.sha.outputs.all_aarch64_unknown_linux_musl }}
+        run: |
+          set -eu
+          V="${VERSION#v}"
+          BASE="https://github.com/MenkeTechnologies/zshrs/releases/download/v${V}"
+          # Helper: emit an on_arm / on_intel block when its SHA is non-empty.
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/zshrs-all-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          mac_blocks=$( { emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS"; emit on_intel x86_64-apple-darwin "$SHA_X86_MACOS"; } )
+          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          {
+            printf 'class ZshrsAll < Formula\n'
+            printf '  desc "Full zshrs install — shell + zd client + recorder + daemon"\n'
+            printf '  homepage "https://github.com/MenkeTechnologies/zshrs"\n'
+            printf '  license "MIT"\n'
+            printf '  conflicts_with "zshrs", because: "both install zshrs and zd"\n'
+            printf '  version "%s"\n\n' "$V"
+            if [ -n "$mac_blocks" ]; then
+              printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
+            fi
+            if [ -n "$linux_blocks" ]; then
+              printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            fi
+            printf '  def install\n'
+            printf '    bin.install "zshrs"\n'
+            printf '    bin.install "zd"\n'
+            printf '    bin.install "zshrs-recorder"\n'
+            printf '    bin.install "zshrs-daemon"\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            printf '    assert_match "hi", shell_output("#{bin}/zshrs -c '"'"'echo hi'"'"'")\n'
+            printf '    assert_predicate bin/"zshrs-recorder", :exist?\n'
+            printf '    assert_predicate bin/"zshrs-daemon", :exist?\n'
+            printf '  end\n'
+            if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
+              printf '\n  # Static musl tarballs also published at this release:\n'
+              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   zshrs-all-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
+              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   zshrs-all-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
+            fi
+            printf 'end\n'
+          } > tap/Formula/zshrs-all.rb
+
+      - name: Update zshrs-daemon formula
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.all_aarch64_apple_darwin }}
+          SHA_X86_MACOS: ${{ steps.sha.outputs.all_x86_64_apple_darwin }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.all_x86_64_unknown_linux_gnu }}
+          SHA_ARM_LINUX: ${{ steps.sha.outputs.all_aarch64_unknown_linux_gnu }}
+        run: |
+          set -eu
+          V="${VERSION#v}"
+          BASE="https://github.com/MenkeTechnologies/zshrs/releases/download/v${V}"
+          # daemon-only formula reuses the zshrs-all tarball (which already
+          # bundles zshrs-daemon + zd) and installs just those two — no
+          # dedicated tarball needed. Same all_ SHA keys as zshrs-all.
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/zshrs-all-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          mac_blocks=$( { emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS"; emit on_intel x86_64-apple-darwin "$SHA_X86_MACOS"; } )
+          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          {
+            printf 'class ZshrsDaemon < Formula\n'
+            printf '  desc "Daemon and zd client from zshrs — for users of other shells (bash/fish/zsh)"\n'
+            printf '  homepage "https://github.com/MenkeTechnologies/zshrs"\n'
+            printf '  license "MIT"\n'
+            printf '  conflicts_with "zshrs-all", because: "both install zd and zshrs-daemon"\n'
+            printf '  conflicts_with "zshrs", because: "both install zd"\n'
+            printf '  version "%s"\n\n' "$V"
+            if [ -n "$mac_blocks" ]; then
+              printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
+            fi
+            if [ -n "$linux_blocks" ]; then
+              printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            fi
+            printf '  def install\n'
+            printf '    bin.install "zshrs-daemon"\n'
+            printf '    bin.install "zd"\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            printf '    assert_match "zshrs-daemon #{version}", shell_output("#{bin}/zshrs-daemon --version")\n'
+            printf '    assert_match "zd #{version}", shell_output("#{bin}/zd --version")\n'
+            printf '  end\n'
+            printf 'end\n'
+          } > tap/Formula/zshrs-daemon.rb
+
+      - name: Push formula update
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/zshrs.rb Formula/zshrs-all.rb Formula/zshrs-daemon.rb
+          if git diff --cached --quiet; then
+            echo "no changes — formulas already up to date"
+            exit 0
+          fi
+          git commit -m "zshrs: bump zshrs + zshrs-all + zshrs-daemon to ${{ github.ref_name }}"
+          # The tap is shared by ~30 repos. When several releases land together
+          # a bare push loses a non-fast-forward race, so rebase and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push; then exit 0; fi
+            echo "tap push rejected (concurrent update) — rebasing, attempt $attempt/5"
+            git pull --rebase --autostash origin main || exit 1
+            sleep $(( (RANDOM % 5) + 2 ))
+          done
+          echo "tap push failed after 5 attempts" >&2
+          exit 1

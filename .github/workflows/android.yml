@@ -1,0 +1,96 @@
+name: android
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'zshrs/**'
+      - 'zshrs-android/**'
+      - 'mise.toml'
+      - '.github/cargo-config.sh'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      # termux-docker needs seccomp relaxed; its entrypoint drops root to the uid 1000 `system` user.
+      - name: Start Termux
+        run: |
+          mkdir -p .build
+          chmod -R a+rwX "$GITHUB_WORKSPACE"
+          docker run -d --name termux --privileged -v "$GITHUB_WORKSPACE:/work" \
+            termux/termux-docker:aarch64 tail -f /dev/null
+          echo 'termux() { docker exec -e GH_TOKEN -e ZSHRS_BUILD=/work/.build/zshrs -e MISE_TRUSTED_CONFIG_PATHS=/work termux /entrypoint.sh bash -euo pipefail -c "umask 022; cd /work; $1"; }' > "$RUNNER_TEMP/termux.sh"
+          . "$RUNNER_TEMP/termux.sh"
+          termux 'apt-get update -q && apt-get install -yq mise gh jq patch'
+
+      # The latest toolchain release of fleet-47/termux-bionicc-aarch64, as on the device.
+      - name: Toolchain
+        run: |
+          . "$RUNNER_TEMP/termux.sh"
+          termux 'mise run toolchain:ensure && cp "$HOME/.local/state/zshrs-android/toolchain.env" .build/ && rustc -vV && clang --version'
+
+      - name: Apply Android patches
+        run: |
+          . "$RUNNER_TEMP/termux.sh"
+          termux 'mise run zshrs:prepare'
+
+      # Debug build: cargo defaults and upstream profiles, no CPU flags (the runner is not a Cortex-X3).
+      - name: Test (debug)
+        run: |
+          . "$RUNNER_TEMP/termux.sh"
+          termux 'cd .build/zshrs && cargo test --features zd && cargo test -p zshrs-daemon'
+
+      # The CPU-flag config goes in .build/, a parent of the build copy, so cargo merges it with zshrs's own.
+      # --target keeps the CPU flags off build scripts and proc-macros, which run on the runner.
+      - name: Build (release, Cortex-X3)
+        run: |
+          (cd .build && ../.github/cargo-config.sh)
+          . "$RUNNER_TEMP/termux.sh"
+          termux 'cd .build/zshrs &&
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$PREFIX/bin/clang" &&
+            cargo build --release --target aarch64-linux-android --features zd --bin zshrs --bin zd &&
+            cargo build --release --target aarch64-linux-android -p zshrs-daemon --bin zshrs-daemon &&
+            cargo metadata --format-version 1 --no-deps | jq -r ".packages[] | select(.name == \"zshrs\") | .version" > ../VERSION'
+
+      - name: Package
+        run: |
+          VERSION="v$(cat .build/VERSION)"
+          BIN_DIR=.build/zshrs/target/aarch64-linux-android/release
+          TARBALL="zshrs-${VERSION#v}-aarch64-linux-android.tar.gz"
+          mkdir dist
+          cp "$BIN_DIR/zshrs" "$BIN_DIR/zd" "$BIN_DIR/zshrs-daemon" dist/
+          tar -czf "dist/$TARBALL" -C "$BIN_DIR" zshrs zd zshrs-daemon
+          (cd dist && sha256sum zshrs zd zshrs-daemon "$TARBALL" > SHA256SUMS-zshrs.txt)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          grep '^TOOLCHAIN_TAG=' .build/toolchain.env >> "$GITHUB_ENV"
+
+      - name: Publish zshrs-${{ env.VERSION }} and zshrs-latest
+        run: |
+          for RELEASE in "zshrs-$VERSION" zshrs-latest; do
+            if gh release view "$RELEASE" >/dev/null 2>&1; then
+              gh release view "$RELEASE" --json assets --jq '.assets[].name' | while read -r name; do
+                [ -e "dist/$name" ] || gh release delete-asset "$RELEASE" "$name" --yes
+              done
+              gh release upload "$RELEASE" dist/* --clobber
+            else
+              gh release create "$RELEASE" dist/* --title "zshrs $VERSION (aarch64-linux-android, Cortex-X3)" \
+                --notes "Commit $GITHUB_SHA. Toolchain: fleet-47/termux-bionicc-aarch64 $TOOLCHAIN_TAG."
+            fi
+          done

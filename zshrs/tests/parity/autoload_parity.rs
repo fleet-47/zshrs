@@ -1,0 +1,922 @@
+//! Parity tests for the `WC_AUTOFN` dispatch path (`execautofn` →
+//! `loadautofn` → `execautofn_basic`) and ksh-style funcdef stripping
+//! (`stripkshdef`).
+//!
+//! These pin behaviour observable from an autoload file: when the file
+//! is a plain body, calling the function should run the body; when the
+//! file wraps the body in `function NAME { … }` syntax, zsh's default
+//! `autoload -U` mode strips the wrapper so the body runs on first
+//! call (this is what `stripkshdef` does at the wordcode level).
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+struct R {
+    stdout: String,
+    /// `untagged_fpath_file_is_not_a_command` pins a DIAGNOSTIC
+    /// (c:Src/exec.c:903 `zerr("command not found: %s", arg0)`), which
+    /// never reaches stdout.
+    stderr: String,
+    exit: i32,
+}
+
+fn run_zsh_in(d: &Path, s: &str) -> R {
+    run_reference_in(zsh_path(), d, s)
+}
+
+/// The release zsh zshrs reports as its own version (`oracle::release_zsh_path`).
+/// A `.zwc` carries the writing shell's version, so the dump tests move files
+/// between zshrs and THIS shell; the development-tree reference refuses them.
+fn release_zsh_available() -> bool {
+    crate::oracle::release_zsh_path().is_some()
+}
+
+fn run_release_zsh_in(d: &Path, s: &str) -> R {
+    run_reference_in(
+        crate::oracle::release_zsh_path().expect("release zsh, checked by release_zsh_available"),
+        d,
+        s,
+    )
+}
+
+fn run_reference_in(zsh: &str, d: &Path, s: &str) -> R {
+    let o = Command::new(zsh)
+        .args(["-fc", s])
+        .current_dir(d)
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+
+fn run_zshrs_in(d: &Path, s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .current_dir(d)
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+
+/// Plain-body autoload file: `autoload -U FN; FN` should print the
+/// file's contents (first call faults the body in via `loadautofn`,
+/// then `execautofn_basic` runs it). Pins the `execautofn`→
+/// `execautofn_basic` dispatch wired by `dispatch_execfuncs`.
+#[test]
+fn autoload_plain_body_runs_on_first_call() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("af_plain"), "echo plain_body_ran\n").unwrap();
+    let script = format!(
+        r#"fpath=({} $fpath); autoload -U af_plain; af_plain"#,
+        d.path().display()
+    );
+    let z = run_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(
+        z.stdout.trim(),
+        "plain_body_ran",
+        "zsh sanity: {:?}",
+        z.stdout
+    );
+    assert_eq!(
+        r.stdout.trim(),
+        "plain_body_ran",
+        "zshrs autoload-of-plain-body — execautofn dispatch broken?\nzshrs: {:?}",
+        r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+/// Autoload file that uses an explicit option in the body — verifies
+/// the loaded body executes in the function's scope, not at parse
+/// time. Pins `execautofn_basic` writes through to the caller's
+/// `LASTVAL`.
+#[test]
+fn autoload_body_propagates_exit_status() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("af_exit"), "return 7\n").unwrap();
+    let script = format!(
+        r#"fpath=({} $fpath); autoload -U af_exit; af_exit; print $?"#,
+        d.path().display()
+    );
+    let z = run_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout.trim(), "7", "zsh sanity");
+    assert_eq!(r.stdout.trim(), "7", "zshrs lost exit status");
+    assert_eq!(z.exit, r.exit);
+}
+
+/// Calling an autoloaded fn twice — the second call must NOT re-run
+/// `loadautofn` (already loaded). Verifies state.prog.shf carries
+/// the loaded funcdef across calls.
+#[test]
+fn autoload_second_call_uses_cached_body() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("af_twice"), "echo twice_$1\n").unwrap();
+    let script = format!(
+        r#"fpath=({} $fpath); autoload -U af_twice; af_twice one; af_twice two"#,
+        d.path().display()
+    );
+    let z = run_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout, "twice_one\ntwice_two\n", "zsh sanity");
+    assert_eq!(
+        r.stdout, "twice_one\ntwice_two\n",
+        "zshrs autoload re-load divergence"
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+/// `autoload -U` of a nonexistent function: the call must report
+/// non-zero `$?`. zsh and zshrs use different specific exit codes
+/// (zsh: 1, zshrs: 127) — pre-existing divergence, not pinned here.
+/// What matters for the `execautofn` dispatch is that the failure
+/// path doesn't crash and surfaces non-zero status.
+#[test]
+fn autoload_missing_function_reports_failure() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let script = format!(
+        r#"fpath=({} $fpath); autoload -U af_nope; af_nope 2>/dev/null; echo done=$?"#,
+        d.path().display()
+    );
+    let z = run_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert!(
+        z.stdout.trim().starts_with("done="),
+        "zsh sanity: {:?}",
+        z.stdout
+    );
+    assert!(
+        r.stdout.trim().starts_with("done="),
+        "zshrs missing-fn path crashed: {:?}",
+        r.stdout
+    );
+    let z_code = z.stdout.trim().trim_start_matches("done=");
+    let r_code = r.stdout.trim().trim_start_matches("done=");
+    assert_ne!(z_code, "0", "zsh expected non-zero");
+    assert_ne!(r_code, "0", "zshrs expected non-zero");
+}
+
+// =====================================================================
+// `.zwc` autoload — getfpfunc tries try_dump_file per fpath dir BEFORE
+// the plain file (Src/exec.c:6238), header/version/mtime checks in
+// try_dump_file / check_dump_file (Src/parse.c:3746/3833).
+// =====================================================================
+
+/// fpath dir containing ONLY `fn.zwc` (source deleted), compiled by
+/// REAL zsh — zshrs must locate the function in the dump and run it.
+/// Pins the c:exec.c:6238 try_dump_file arm of getfpfunc and the
+/// check_dump_file body load (c:parse.c:3919-3958).
+#[test]
+fn autoload_zwc_only_dir_real_zsh_compiled() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("zwfn"), "echo zw_body $1\n").unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile zwfn");
+    assert_eq!(z.exit, 0, "zsh zcompile sanity");
+    std::fs::remove_file(d.path().join("zwfn")).unwrap();
+    let script = format!(
+        r#"fpath=({}); autoload -Uz zwfn; zwfn arg1"#,
+        d.path().display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(
+        z.stdout.trim(),
+        "zw_body arg1",
+        "zsh sanity: {:?}",
+        z.stdout
+    );
+    assert_eq!(
+        r.stdout, z.stdout,
+        "zshrs failed to autoload from .zwc-only fpath dir"
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+/// Cross direction: ZSHRS zcompiles the function file; both shells
+/// must then load the dump (pins write_dump emission + the loader
+/// round-trip, and that real zsh accepts zshrs-written dumps).
+#[test]
+fn autoload_zwc_only_dir_zshrs_compiled() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("rwfn"), "echo rw_body $1\n").unwrap();
+    let r = run_zshrs_in(d.path(), "zcompile rwfn");
+    assert_eq!(r.exit, 0, "zshrs zcompile failed");
+    std::fs::remove_file(d.path().join("rwfn")).unwrap();
+    let script = format!(
+        r#"fpath=({}); autoload -Uz rwfn; rwfn arg1"#,
+        d.path().display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(
+        z.stdout.trim(),
+        "rw_body arg1",
+        "real zsh rejected zshrs-written dump: {:?}",
+        z.stdout
+    );
+    assert_eq!(r.stdout, z.stdout, "zshrs cannot load its own dump");
+    assert_eq!(z.exit, r.exit);
+}
+
+/// Both compiled + plain present: the dump wins only when its mtime
+/// is >= the source's (c:parse.c:3779 `stc.st_mtime >= stn.st_mtime`).
+/// Distinct bodies make the winner observable.
+#[test]
+fn autoload_zwc_mtime_preference() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("mtfn"), "echo compiled_body\n").unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile mtfn");
+    assert_eq!(z.exit, 0, "zsh zcompile sanity");
+    // Rewrite the source with different output, then backdate it so
+    // the dump is newer.
+    std::fs::write(d.path().join("mtfn"), "echo source_body\n").unwrap();
+    let old = filetime::FileTime::from_unix_time(1577836800, 0); // 2020-01-01
+    filetime::set_file_mtime(d.path().join("mtfn"), old).unwrap();
+    let script = format!(r#"fpath=({}); autoload -Uz mtfn; mtfn"#, d.path().display());
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout.trim(), "compiled_body", "zsh sanity (dump newer)");
+    assert_eq!(r.stdout, z.stdout, "zshrs ignored newer dump");
+    // Now make the source newer than the dump — the plain file wins. Use a
+    // fixed far-future mtime rather than `now()`: the .zwc was created moments
+    // earlier, so at second granularity (which both shells compare on) `now()`
+    // can TIE the dump's second under fast/contended execution, flipping
+    // zwc>=source and breaking the test's own premise. 2030 is unambiguously
+    // newer than the just-built dump.
+    let new = filetime::FileTime::from_unix_time(1893456000, 0); // 2030-01-01
+    filetime::set_file_mtime(d.path().join("mtfn"), new).unwrap();
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout.trim(), "source_body", "zsh sanity (source newer)");
+    assert_eq!(
+        r.stdout, z.stdout,
+        "zshrs preferred stale dump over newer source"
+    );
+}
+
+/// `zcompile -k` marks the dump FDHF_KSHLOAD (c:parse.c:3149); the
+/// loader must then execute the file contents and call the defined
+/// function (c:exec.c:5725-5746) — observable as BOTH the trailing
+/// self-call output and the real-call output, in order.
+#[test]
+fn autoload_zwc_kshload_flag() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("kfn"), "kfn() { echo kbody $1; }\nkfn boot\n").unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile -k kfn");
+    assert_eq!(z.exit, 0, "zsh zcompile -k sanity");
+    std::fs::remove_file(d.path().join("kfn")).unwrap();
+    let script = format!(
+        r#"fpath=({}); autoload -Uz kfn; kfn arg1"#,
+        d.path().display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(
+        z.stdout, "kbody boot\nkbody arg1\n",
+        "zsh sanity: {:?}",
+        z.stdout
+    );
+    assert_eq!(
+        r.stdout, z.stdout,
+        "zshrs FDHF_KSHLOAD handling diverges (file-run + re-call)"
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+/// Directory digest: `<dir>.zwc` beside the fpath dir holds multiple
+/// functions (c:parse.c:3766 `dig = dyncat(path, FD_EXT)`); and an
+/// fpath element that IS a `.zwc` file (c:parse.c:3753 strsfx arm).
+#[test]
+fn autoload_zwc_digest_and_zwc_fpath_entry() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let fns = d.path().join("fns");
+    std::fs::create_dir(&fns).unwrap();
+    std::fs::write(fns.join("dg1"), "echo dg_one $1\n").unwrap();
+    std::fs::write(fns.join("dg2"), "echo dg_two $1\n").unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile fns.zwc fns/dg1 fns/dg2");
+    assert_eq!(z.exit, 0, "zsh digest zcompile sanity");
+    std::fs::remove_file(fns.join("dg1")).unwrap();
+    std::fs::remove_file(fns.join("dg2")).unwrap();
+    // Digest beside the dir.
+    let script = format!(
+        r#"fpath=({}); autoload -Uz dg1 dg2; dg1 a; dg2 b"#,
+        fns.display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout, "dg_one a\ndg_two b\n", "zsh digest sanity");
+    assert_eq!(r.stdout, z.stdout, "zshrs digest <dir>.zwc lookup broken");
+    // fpath entry pointing AT the .zwc file itself.
+    let script = format!(
+        r#"fpath=({}/fns.zwc); autoload -Uz dg1; dg1 c"#,
+        d.path().display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout, "dg_one c\n", "zsh zwc-as-fpath sanity");
+    assert_eq!(r.stdout, z.stdout, "zshrs zwc-as-fpath-entry lookup broken");
+}
+
+/// A truncated `<dir>.zwc` digest is reported by `load_dump_header`
+/// (c:Src/parse.c:3286-3288 `zwarnnam(nam, "invalid zwc file: %s")`) on
+/// every lookup that reaches it, and the PREFIX of that warning says who was
+/// running: an autoload reached as a quoted command word (`"$tmp"` — how
+/// `_main_complete:218` calls each completer) goes through `doshfunc` with a
+/// PM_UNDEFINED node, so the lookup happens before `scriptname` changes and at
+/// the caller's `lineno` (`f:2:`), and the loaded body then runs under its own
+/// name (`execautofn_basic`, c:Src/exec.c:5553, so `outer:2:`). zshrs zeroed
+/// `lineno` before the load (`f:`) and kept the caller's name for the body
+/// (`f:2:`).
+#[test]
+fn corrupt_digest_warning_names_the_caller_then_the_autoloaded_body() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let fns = d.path().join("fns");
+    std::fs::create_dir(&fns).unwrap();
+    std::fs::write(fns.join("outer"), "print in-outer\ninner\n").unwrap();
+    std::fs::write(fns.join("inner"), "print in-inner\n").unwrap();
+    // Enough entries that the digest header is longer than the 60 bytes kept.
+    for i in 0..6 {
+        std::fs::write(fns.join(format!("pad{i}")), ":\n").unwrap();
+    }
+    let z = run_release_zsh_in(d.path(), "zcompile fns.zwc fns/*");
+    assert_eq!(z.exit, 0, "zsh digest zcompile sanity");
+    let zwc = d.path().join("fns.zwc");
+    let mut perm = std::fs::metadata(&zwc).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perm.set_readonly(false);
+    std::fs::set_permissions(&zwc, perm).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&zwc)
+        .unwrap()
+        .set_len(60)
+        .unwrap();
+    // Newer than the directory, so the digest is the one consulted.
+    let future = filetime::FileTime::from_unix_time(1893456000, 0);
+    filetime::set_file_mtime(&zwc, future).unwrap();
+    let script = format!(
+        "fpath=({}); autoload -Uz outer inner\nf() {{\n  local tmp=outer\n  \"$tmp\"\n}}\nf",
+        fns.display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    let zwc_s = zwc.display().to_string();
+    let want = format!(
+        "f:2: invalid zwc file: {zwc_s}\nouter:2: invalid zwc file: {zwc_s}\n"
+    );
+    assert_eq!(z.stderr, want, "zsh sanity");
+    assert_eq!(r.stderr, z.stderr, "corrupt-digest warning prefix diverges");
+    assert_eq!(r.stdout, z.stdout);
+}
+
+/// `source file` with a newer sibling `file.zwc` loads the compiled
+/// body (c:init.c:1566 try_source_file), including when the plain
+/// file is deleted entirely (slash-path arm, c:builtin.c:6092-6100).
+#[test]
+fn source_zwc_sibling_and_zwc_only() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("s.zsh"), "echo compiled_src\n").unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile s.zsh");
+    assert_eq!(z.exit, 0, "zsh zcompile sanity");
+    std::fs::write(d.path().join("s.zsh"), "echo plain_src\n").unwrap();
+    let old = filetime::FileTime::from_unix_time(1577836800, 0);
+    filetime::set_file_mtime(d.path().join("s.zsh"), old).unwrap();
+    let script = format!("source {}/s.zsh", d.path().display());
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout.trim(), "compiled_src", "zsh sanity (zwc newer)");
+    assert_eq!(r.stdout, z.stdout, "zshrs source ignored newer .zwc");
+    // zwc-only: plain file removed, slash path still sources the dump.
+    std::fs::remove_file(d.path().join("s.zsh")).unwrap();
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout.trim(), "compiled_src", "zsh sanity (zwc only)");
+    assert_eq!(r.stdout, z.stdout, "zshrs source of zwc-only path broken");
+    assert_eq!(z.exit, r.exit);
+}
+
+/// zshrs zcompile of a function file whose case arms use the
+/// open-paren `(pat)` form (c:Src/parse.c:1321-1357 whole-pattern
+/// hack in par_case). The wordcode parser previously errored
+/// "par_case: expected `)` or `|`" on every such file. Both shells
+/// must load + run the zshrs-written dump.
+#[test]
+fn autoload_zwc_open_paren_case_arms() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("opfn"),
+        "case $1 in\n  (a) print A;;\n  (b|c) print BC;;\n  ( d | e ) print DE;;\n  (*) print other;;\nesac\n",
+    )
+    .unwrap();
+    let r = run_zshrs_in(d.path(), "zcompile opfn");
+    assert_eq!(
+        r.exit, 0,
+        "zshrs zcompile of (pat) case arms failed: {}",
+        r.stdout
+    );
+    std::fs::remove_file(d.path().join("opfn")).unwrap();
+    for (arg, want) in [("a", "A"), ("c", "BC"), ("e", "DE"), ("zz", "other")] {
+        let script = format!(
+            r#"fpath=({}); autoload -Uz opfn; opfn {}"#,
+            d.path().display(),
+            arg
+        );
+        let z = run_release_zsh_in(d.path(), &script);
+        let r = run_zshrs_in(d.path(), &script);
+        assert_eq!(
+            z.stdout.trim(),
+            want,
+            "real zsh rejected zshrs dump: {}",
+            z.stdout
+        );
+        assert_eq!(r.stdout, z.stdout, "zshrs cannot run its own (pat) dump");
+        assert_eq!(z.exit, r.exit);
+    }
+}
+
+/// A `.zwc`-loaded function body must NOT be re-resolved against the
+/// lexer state that happens to be live when the function is loaded.
+///
+/// C never re-lexes it: `loadautofn` installs the dump's own wordcode
+/// (`shf->funcdef = stripkshdef(prog, …)`, c:Src/exec.c:5753-5755) and the
+/// ksh-style arm runs it with `execode(prog, 1, 0, "evalautofunc")`
+/// (c:5795). A `.zwc` is quote- and alias-resolved exactly once, at
+/// `zcompile` time.
+///
+/// zshrs has no execute-the-wordcode path — it deparses with `getpermtext`
+/// and lexes the text again — so both pieces of lexer-time state C bypassed
+/// leaked into the body:
+///
+///   * RCQUOTES. `untokenize` renders every quote null through
+///     `ztokens[Snull - Pound]`, a bare `'` (c:Src/lex.c:38), so a
+///     close-then-open null pair deparses to `''`; under RCQUOTES the lexer
+///     reads that as one LITERAL quote (c:Src/lex.c:1328). `local
+///     v='a=''{b}'''` compiled to the value `a={b}` came back as `a='{b}'`.
+///   * Aliases. `checkalias` fires from the lexer (c:Src/lex.c:1909), so an
+///     alias live at CALL time rewrote words inside the compiled program —
+///     including global aliases, which rewrite any word.
+///
+/// The controls in the second half are the point: a body read from a PLAIN
+/// file is lexed for real in both shells, so it must stay fully sensitive to
+/// both.
+#[test]
+fn autoload_zwc_body_ignores_rcquotes_and_aliases() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let fns = d.path().join("fns");
+    std::fs::create_dir(&fns).unwrap();
+    // Compiled with RCQUOTES unset, so `''` is a quote-null pair and the
+    // value is `a={b}` with no literal quotes in it at all.
+    std::fs::write(
+        fns.join("qfn"),
+        "local v='a=''{b}'''\nprint -r -- \"Q:[$v]\"\nprint -r -- GA: ga\n",
+    )
+    .unwrap();
+    let z = run_release_zsh_in(&fns, "zcompile qfn");
+    assert_eq!(z.exit, 0, "zsh zcompile sanity: {}", z.stdout);
+
+    // `-Uz` (aliases already suppressed by PM_UNALIASED) and `-z` (they are
+    // not) must both come out of the dump unmodified.
+    for flags in ["-Uz", "-z"] {
+        let script = format!(
+            "fpath=({}); setopt rcquotes; alias -g ga=LEAKED; \
+             alias print='print -r -- REALIAS'; autoload {} qfn; qfn",
+            fns.display(),
+            flags
+        );
+        let z = run_release_zsh_in(d.path(), &script);
+        let r = run_zshrs_in(d.path(), &script);
+        assert_eq!(
+            z.stdout, "Q:[a={b}]\nGA: ga\n",
+            "zsh sanity (autoload {flags} from .zwc): {:?}",
+            z.stdout
+        );
+        assert_eq!(
+            r.stdout, z.stdout,
+            "zshrs re-lexed the .zwc deparse (autoload {flags})"
+        );
+        assert_eq!(z.exit, r.exit);
+    }
+
+    // Same function, same bytes, no dump: now the lexer really does run over
+    // the file, so RCQUOTES collapses the quote pairs and a non-`-U` autoload
+    // expands the aliases. Both shells must show it.
+    let plain = d.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::copy(fns.join("qfn"), plain.join("qfn")).unwrap();
+    let script = format!(
+        "fpath=({}); setopt rcquotes; alias -g ga=LEAKED; \
+         alias print='print -r -- REALIAS'; autoload -z qfn; qfn",
+        plain.display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(
+        z.stdout, "REALIAS -r -- Q:[a='{b}']\nREALIAS -r -- GA: LEAKED\n",
+        "zsh sanity (plain file, no dump): {:?}",
+        z.stdout
+    );
+    assert_eq!(
+        r.stdout, z.stdout,
+        "zshrs stopped lexing a PLAIN autoload body against the live state"
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+/// The same pin for the two remaining ways a dump reaches an autoload: a
+/// directory digest `<dir>.zwc` (c:Src/parse.c:3766 `dig = dyncat(path,
+/// FD_EXT)`) and a ksh-style load, whose body runs at top level via
+/// `execode(prog, 1, 0, "evalautofunc")` (c:Src/exec.c:5795) instead of
+/// being wrapped.
+#[test]
+fn autoload_zwc_digest_and_ksh_body_ignore_rcquotes() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let fns = d.path().join("fns");
+    std::fs::create_dir(&fns).unwrap();
+    std::fs::write(
+        fns.join("dfn"),
+        "local v='a=''{b}'''\nprint -r -- \"D:[$v]\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fns.join("kfn"),
+        "kfn() { local v='a=''{b}'''; print -r -- \"K:[$v]\"; }\n",
+    )
+    .unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile fns.zwc fns/dfn fns/kfn");
+    assert_eq!(z.exit, 0, "zsh digest zcompile sanity: {}", z.stdout);
+    std::fs::remove_file(fns.join("dfn")).unwrap();
+    std::fs::remove_file(fns.join("kfn")).unwrap();
+
+    let script = format!(
+        "fpath=({}); setopt rcquotes; autoload -Uz dfn; dfn",
+        fns.display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(z.stdout, "D:[a={b}]\n", "zsh digest sanity: {:?}", z.stdout);
+    assert_eq!(r.stdout, z.stdout, "zshrs re-lexed a digest-loaded body");
+    assert_eq!(z.exit, r.exit);
+
+    let script = format!(
+        "fpath=({}); setopt rcquotes ksh_autoload; autoload -U kfn; kfn",
+        fns.display()
+    );
+    let z = run_release_zsh_in(d.path(), &script);
+    let r = run_zshrs_in(d.path(), &script);
+    assert_eq!(
+        z.stdout, "K:[a={b}]\n",
+        "zsh ksh_autoload sanity: {:?}",
+        z.stdout
+    );
+    assert_eq!(
+        r.stdout, z.stdout,
+        "zshrs re-lexed a ksh-style .zwc body (c:5795 execode evalautofunc)"
+    );
+    assert_eq!(z.exit, r.exit);
+}
+
+/// c:Src/exec.c:6383-6388 — stripkshdef matches the file's single funcdef
+/// against the function name while tolerating a Dash token on either side.
+/// C walks bytes and Dash is one byte there; the port walked the UTF-8 bytes
+/// of a String holding Dash as a two-byte char, so any hyphenated name failed
+/// the match, the wrapper was not stripped, and the FIRST call of a
+/// `foo-bar() { … }` autoload file only defined the function.
+#[test]
+fn hyphenated_ksh_style_autoload_runs_on_first_call() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("foo-bar"), "foo-bar() { print dash-body; }\n").unwrap();
+    std::fs::write(d.path().join("fun-kw"), "function fun-kw { print kw-body; }\n").unwrap();
+    for script in [
+        "fpath=(.); autoload -Uz foo-bar; foo-bar; foo-bar; functions foo-bar",
+        "fpath=(.); autoload -Uz fun-kw; fun-kw",
+    ] {
+        let z = run_zsh_in(d.path(), script);
+        let r = run_zshrs_in(d.path(), script);
+        assert_eq!(r.stdout, z.stdout, "divergence on: {script}");
+        assert_eq!(r.exit, z.exit, "exit divergence on: {script}");
+    }
+}
+
+/// c:Src/exec.c:3105-3109 — `execcmd` resolves a command word as
+///     if (!(cflags & (BINF_BUILTIN | BINF_COMMAND)) &&
+///         (hn = shfunctab->getnode(shfunctab, cmdarg))) { is_shfunc = 1; break; }
+/// with the identical gate at c:3484-3488, then `builtintab`, then `$PATH`;
+/// a name that resolves nowhere ends at c:903 `zerr("command not found: %s",
+/// arg0)` and c:908 `_exit(… 127)`. `getnode` only ever finds a node ALREADY
+/// in `shfunctab` — a real definition, or the autoload STUB that `autoload`
+/// or `compinit` installed. A file merely PRESENT in `$fpath` is therefore
+/// NOT a command, whatever it is named: `compinit` registers one only by its
+/// TAG LINE (sh:511-525 — `IFS=$' \t' read -rA _i_line < $_i_file`, then
+/// `case $_i_tag in (\#compdef) compdef -na … ;; (\#autoload) autoload -rUz
+/// "$_i_line[@]" ${_i_name} ;; esac`).
+///
+/// `dispatch_function_call` used to probe `$fpath` by FILENAME for any
+/// `_`-prefixed command word (`getfpfunc`, c:Src/exec.c:6279) and, on a hit,
+/// run `autoload -rUz -- NAME` and EXECUTE the file — so zshrs ran files zsh
+/// reports as not found. The cost was a swallowed diagnostic: with the
+/// untagged `__fasd_files_comp` in the user's `$fpath`, a `_files` override
+/// offering it as an `_alternative` action makes zsh print
+/// `_alternative:71: command not found: __fasd_files_comp` where zshrs
+/// printed nothing at all.
+#[test]
+fn untagged_fpath_file_is_not_a_command() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let fns = d.path().join("fns");
+    std::fs::create_dir(&fns).unwrap();
+    // Untagged: registered by neither `compdef -na` nor `autoload -rUz`.
+    std::fs::write(fns.join("__zzz_probe"), "print RAN\n").unwrap();
+    // Tagged, but nothing has SCANNED the directory — `compinit` never ran,
+    // so these have no `shfunctab` node either and resolve exactly as the
+    // untagged one does.
+    std::fs::write(fns.join("_zzz_compdef"), "#compdef zzzcmd\nprint RAN\n").unwrap();
+    std::fs::write(fns.join("_zzz_autoload"), "#autoload\nprint RAN\n").unwrap();
+
+    for name in ["__zzz_probe", "_zzz_compdef", "_zzz_autoload"] {
+        let script = format!("fpath=({}); {name}", fns.display());
+        let z = run_zsh_in(d.path(), &script);
+        let r = run_zshrs_in(d.path(), &script);
+        assert_eq!(
+            (z.stdout.as_str(), z.exit),
+            ("", 127),
+            "zsh sanity — a bare `$fpath` file is not a command ({name}): {:?}",
+            z.stdout
+        );
+        assert_eq!(
+            r.stdout, z.stdout,
+            "zshrs EXECUTED `{name}` straight out of `$fpath`; zsh resolves it \
+             nowhere (c:Src/exec.c:3105-3109)"
+        );
+        assert_eq!(
+            r.stderr, z.stderr,
+            "`{name}` diagnostic divergence (c:Src/exec.c:903)"
+        );
+        assert_eq!(r.exit, z.exit, "`{name}` exit divergence (c:Src/exec.c:908)");
+    }
+
+    // The legitimate route must keep working: an EXPLICIT `autoload` is one of
+    // the two things that puts a stub in `shfunctab`, and the very same files
+    // then run in both shells. This is what stops the fix above from being a
+    // blanket "never load from `$fpath`".
+    for name in ["__zzz_probe", "_zzz_compdef", "_zzz_autoload"] {
+        let script = format!("fpath=({}); autoload -Uz {name}; {name}", fns.display());
+        let z = run_zsh_in(d.path(), &script);
+        let r = run_zshrs_in(d.path(), &script);
+        assert_eq!(
+            z.stdout, "RAN\n",
+            "zsh sanity (explicit autoload of {name}): {:?}",
+            z.stdout
+        );
+        assert_eq!(
+            r.stdout, z.stdout,
+            "zshrs stopped honouring an explicit `autoload -Uz {name}`"
+        );
+        assert_eq!(r.exit, z.exit, "`{name}` exit divergence after autoload");
+    }
+}
+
+/// c:Src/builtin.c:3424-3428 — `functions -c OLD NEW` copies an autoloaded
+/// function. A PM_LOADDIR filename is only the directory, and the file is
+/// found by appending the function's name, so C clears PM_LOADDIR and stores
+/// `DIR/OLD` in the copy. The port kept PM_LOADDIR, so the copy reported
+/// `DIR/NEW` as its file (`%x`, `$functions_source`).
+#[test]
+fn copied_autoload_function_keeps_the_original_file() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("line_info"),
+        "\nprint -P \"%1x:%I is where we are.\"\n",
+    )
+    .unwrap();
+    let script = "fpath=(.); autoload -Uz line_info; functions -c line_info preserve_file; preserve_file; line_info";
+    let z = run_zsh_in(d.path(), script);
+    let r = run_zshrs_in(d.path(), script);
+    assert_eq!(z.stdout, "line_info:2 is where we are.\nline_info:2 is where we are.\n", "zsh sanity");
+    assert_eq!(r.stdout, z.stdout);
+    assert_eq!(r.exit, z.exit);
+}
+
+/// c:Src/builtin.c:3450 — `functions -c OLD NEW` over an EXISTING NEW replaces
+/// it, and the next call runs the copied body. zshrs runs a function from a
+/// compiled chunk held apart from the function table, which the copy did not
+/// update: `_shadow`/`_unshadow` (used by `_approximate` around `compadd`)
+/// restore the shadowed function this way, and the shadow kept running.
+#[test]
+fn functions_copy_over_an_existing_function_runs_the_copied_body() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let script = "orig() { print -r -- orig }; saved() { print -r -- saved }; \
+                  call() { orig }; call; \
+                  functions -c orig kept; orig() { print -r -- shadow }; call; \
+                  unfunction orig; functions -c kept orig; call; orig; \
+                  functions -c saved orig; call";
+    let z = run_zsh_in(d.path(), script);
+    let r = run_zshrs_in(d.path(), script);
+    assert_eq!(z.stdout, "orig\nshadow\norig\norig\nsaved\n", "zsh sanity");
+    assert_eq!(r.stdout, z.stdout);
+    assert_eq!(r.exit, z.exit);
+}
+
+/// `promptinit` and `prompt` are shell functions (Functions/Prompts/
+/// promptinit), not builtins. promptinit scans `$^fpath/prompt_*_setup(N)`,
+/// so a theme the user ships in their own fpath directory is listed and
+/// runnable, and `prompt -h THEME` reaches that theme's `_help` function.
+/// A native stand-in answered both names from a fixed theme table and
+/// assigned a canned PS1 instead.
+#[test]
+fn promptinit_scans_fpath_for_user_themes() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("prompt_zzmine_setup"),
+        "prompt_zzmine_help () { print 'zzmine help' }\nprompt_zzmine_setup () { PS1='zz%# '; prompt_opts=(percent) }\nprompt_zzmine_setup \"$@\"\n",
+    )
+    .unwrap();
+    let script = "fpath=(. $fpath); autoload -Uz promptinit; promptinit; \
+                  print -r -- ${(M)prompt_themes:#zzmine}; prompt zzmine; \
+                  print -r -- \"$PS1\"; prompt -h zzmine";
+    let z = run_zsh_in(d.path(), script);
+    let r = run_zshrs_in(d.path(), script);
+    assert!(
+        z.stdout.starts_with("zzmine\nzz%# \nHelp for zzmine theme:") && z.stdout.contains("\nzzmine help\n"),
+        "zsh sanity: {:?}",
+        z.stdout
+    );
+    assert_eq!(r.stdout, z.stdout);
+    assert_eq!(r.exit, z.exit);
+}
+
+/// Without promptinit there is no `prompt` command at all, and a `prompt`
+/// function defined at run time is what `prompt` runs.
+#[test]
+fn prompt_is_not_a_builtin() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let script = "prompt -l; print rc=$?; eval 'prompt() { print mine $@ }'; prompt -l";
+    let z = run_zsh_in(d.path(), script);
+    let r = run_zshrs_in(d.path(), script);
+    assert_eq!(z.stdout, "rc=127\nmine -l\n", "zsh sanity");
+    assert_eq!(r.stdout, z.stdout);
+    assert_eq!(r.exit, z.exit);
+}
+
+/// `emulate zsh -c 'autoload -Uz NAME'` stamps the pending sticky emulation
+/// on the stub (c:Src/builtin.c:3766 `shfunc_set_sticky(shf)`), and the body
+/// is parsed and run under it because C loads it from inside doshfunc
+/// (c:Src/exec.c:5978-6010). The caller's `ignorebraces` must neither break
+/// the parse of `{ echo OK }` nor be visible to the body; the same holds for
+/// `autoload +X`, whose eager load keeps the stub's `sticky`.
+#[test]
+fn autoload_under_emulate_c_keeps_sticky_emulation() {
+    if !zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(
+        d.path().join("emufunctest"),
+        "{ echo OK }\n[[ -o ignorebraces ]] || print 'ignorebraces is off'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("kf"),
+        "[[ -o ksharrays ]] && echo on || echo off\n",
+    )
+    .unwrap();
+    let script = r#"fpath=(.)
+setopt ignorebraces ksharrays
+emulate zsh -c 'autoload -Uz emufunctest'
+emufunctest
+emulate zsh -c 'autoload -Uz +X kf'
+kf
+[[ -o ignorebraces && -o ksharrays ]] && echo caller-kept"#;
+    let z = run_zsh_in(d.path(), script);
+    let r = run_zshrs_in(d.path(), script);
+    assert_eq!(
+        z.stdout, "OK\nignorebraces is off\noff\ncaller-kept\n",
+        "zsh sanity: {:?}",
+        z.stderr
+    );
+    assert_eq!(r.stdout, z.stdout, "zshrs stderr: {:?}", r.stderr);
+    assert_eq!(r.stderr, z.stderr);
+    assert_eq!(r.exit, z.exit);
+}
+
+/// c:Src/init.c:1566 — `source()` calls `try_source_file()` BEFORE it sets
+/// `scriptname = s` (c:1591), so a `.zwc` load diagnostic such as
+/// check_dump_file's "invalid description" (c:Src/parse.c:3746) carries the
+/// CALLER's name (`zsh:1:`), not the sourced file's. A04/A09zwc.ztst
+/// workers/54571: a dump whose npats is implausible must not crash, and the
+/// plain file then runs.
+#[test]
+fn source_corrupt_zwc_diagnostic_names_the_caller() {
+    if !release_zsh_available() {
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("victim"), "print victim ran\n").unwrap();
+    let z = run_release_zsh_in(d.path(), "zcompile victim");
+    assert_eq!(z.exit, 0, "zsh zcompile sanity");
+    let zwc = d.path().join("victim.zwc");
+    // zcompile writes the dump read-only (A09zwc.ztst `chmod u+w`).
+    let mut perm = std::fs::metadata(&zwc).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o644);
+    std::fs::set_permissions(&zwc, perm).unwrap();
+    let mut bytes = std::fs::read(&zwc).unwrap();
+    // FD_MAGIC's first byte is 0x07 on a little-endian dump (A09zwc.ztst).
+    let npats: [u8; 4] = if bytes[0] == 0x07 { [0, 0, 0, 0x40] } else { [0x40, 0, 0, 0] };
+    bytes[56..60].copy_from_slice(&npats);
+    std::fs::write(&zwc, &bytes).unwrap();
+    let z = run_release_zsh_in(d.path(), "source ./victim");
+    let r = run_zshrs_in(d.path(), "source ./victim");
+    assert_eq!(z.stdout, "victim ran\n", "zsh sanity");
+    assert_eq!(r.stdout, z.stdout);
+    assert_eq!(r.stderr.replacen("zshrs:", "zsh:", 1), z.stderr);
+    assert_eq!(r.exit, z.exit);
+}

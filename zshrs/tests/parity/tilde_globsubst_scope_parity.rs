@@ -1,0 +1,443 @@
+//! `${~spec}` inside a PATTERN operand must not glob the ENCLOSING expansion.
+//!
+//! C declares the GLOB_SUBST switch as a paramsubst LOCAL:
+//!
+//! ```c
+//! /* Src/subst.c:1671 */
+//! int globsubst = isset(GLOBSUBST);
+//! ...
+//! /* Src/subst.c:2596-2602 */
+//! } else if (c == '~' || c == Tilde) {
+//!     /* GLOB_SUBST (forced) on or off (doubled) */
+//!     if ((c = *++s) == '~' || c == Tilde) {
+//!         globsubst = 0;
+//!         s++;
+//!     } else
+//!         globsubst = 2;
+//! }
+//! ```
+//!
+//! The pattern operand of `#`/`##`/`%`/`%%`/`/`/`//`/`:/`/`:#` is expanded by
+//! `singsub(&s)` (c:Src/subst.c:3412), which re-enters `paramsubst`. Because
+//! `globsubst` is that call's own local, a `~` in the pattern tokenizes only the
+//! value the NESTED call splices into the pattern; the enclosing call's
+//! `globsubst` — the one `strcatsub(…, globsubst, …)` (c:4352/4397/4436/4475)
+//! consults to decide whether its RESULT is offered to filename generation — is
+//! untouched.
+//!
+//! zshrs carries the switch through the GLOBAL option table (a documented
+//! deviation, so the compile-emitted glob ops later in the same word pipeline can
+//! see it) and unwound it only at the command-dispatch boundary. A nested
+//! `${~…}` therefore left GLOB_SUBST on for the rest of the word and the OUTER
+//! expansion's own value was tokenized and filename-globbed:
+//!
+//! ```text
+//! cm=X; v='a|b'; print -r -- ${v%%${~cm}*}
+//!   zsh   -> a|b
+//!   zshrs -> zsh:1: no matches found: a|b
+//! ```
+//!
+//! Named victim: zsh's own `Test/X04zlehighlight.ztst`. Its `zpty_line` helper
+//! ends every captured line with
+//!
+//! ```text
+//! print -r -- ${${REPLY%%${~cm}*}##[[:space:]]##}
+//! ```
+//!
+//! and the file's `zle_highlight=( fg_start_code:"CDE|3" … )` puts a `|` in every
+//! captured line, so all 20 assertions aborted inside the helper.
+//!
+//! The rows below come in pairs on purpose:
+//!   * "leak" rows pin that the outer value is NOT globbed,
+//!   * "still active" rows pin that the nested `~` STILL makes its own spliced
+//!     value a live pattern (a fix that merely turns GLOB_SUBST off around the
+//!     whole operand passes the first set and breaks the second),
+//!   * "genuinely on" rows pin that a real `setopt globsubst` / an OUTER `${~v}`
+//!     still globs the result.
+//!
+//! Skip pattern: tests no-op silently when `zsh` isn't on PATH.
+
+#![allow(non_snake_case)]
+
+use std::path::PathBuf;
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// stdout + stderr + exit-status parity against the reference `zsh`.
+///
+/// stderr is compared too: the whole bug surfaced as a `no matches found:` /
+/// `bad pattern:` diagnostic on stderr with an EMPTY stdout, so a stdout-only
+/// assertion would have gone green the moment the message changed wording.
+fn assert_parity(script: &str) {
+    if !zsh_available() {
+        eprintln!("skip: zsh not found");
+        return;
+    }
+    let z = Command::new(zsh_path())
+        .args(["-fc", script])
+        .output()
+        .expect("invoke zsh");
+    let r = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", script])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("invoke zshrs");
+
+    let z_out = String::from_utf8_lossy(&z.stdout).into_owned();
+    let r_out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert_eq!(
+        z_out, r_out,
+        "stdout divergence on script:\n{script}\n--- zsh ---\n{z_out:?}\n--- zshrs ---\n{r_out:?}"
+    );
+    // Both shells prefix diagnostics with their own argv[0]-derived name and a
+    // line number; compare only whether EITHER produced a diagnostic at all.
+    let z_err = !z.stderr.is_empty();
+    let r_err = !r.stderr.is_empty();
+    assert_eq!(
+        z_err,
+        r_err,
+        "stderr divergence on script:\n{script}\n--- zsh ---\n{}\n--- zshrs ---\n{}",
+        String::from_utf8_lossy(&z.stderr),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert_eq!(
+        z.status.code().unwrap_or(-1),
+        r.status.code().unwrap_or(-1),
+        "exit divergence on script:\n{script}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1. The leak: a nested `${~…}` must not glob the enclosing result.
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod nested_tilde_does_not_glob_the_outer_value {
+    use super::assert_parity;
+
+    /// The exact minimisation of X04zlehighlight's `zpty_line`.
+    #[test]
+    fn longest_suffix_strip() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v%%${~cm}*}"#);
+    }
+
+    #[test]
+    fn shortest_suffix_strip() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v%${~cm}*}"#);
+    }
+
+    #[test]
+    fn shortest_prefix_strip() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v#${~cm}}"#);
+    }
+
+    #[test]
+    fn longest_prefix_strip() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v##${~cm}*}"#);
+    }
+
+    #[test]
+    fn single_replace() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v/${~cm}/z}"#);
+    }
+
+    #[test]
+    fn global_replace() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v//${~cm}/z}"#);
+    }
+
+    #[test]
+    fn whole_element_replace() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v:/${~cm}/z}"#);
+    }
+
+    #[test]
+    fn element_filter() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v:#${~cm}}"#);
+    }
+
+    /// `*` rather than `|`: the leak globbed on any metacharacter the value
+    /// happened to carry, not just alternation.
+    #[test]
+    fn star_in_the_outer_value() {
+        assert_parity(r#"cm=X; v='a*b'; print -r -- ${v%%${~cm}*}"#);
+    }
+
+    /// X04's real shape — the stripped value feeds a SECOND expansion.
+    #[test]
+    fn nested_outer_expansion_as_in_X04() {
+        assert_parity(
+            r#"setopt extendedglob; cm=X; v='a|b'; print -r -- ${${v%%${~cm}*}##[[:space:]]##}"#,
+        );
+    }
+
+    /// The leak also reached text CONCATENATED after the expansion, because the
+    /// option stayed on for the rest of the word.
+    #[test]
+    fn leak_reached_the_rest_of_the_word() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${v%%${~cm}*}${v}"#);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2. The nested `~` must still do its job inside the pattern.
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod nested_tilde_still_activates_its_own_splice {
+    use super::assert_parity;
+
+    /// c:Src/subst.c:1669 — GLOB_SUBST shtokenizes the spliced value, so the
+    /// class matches a digit and the strip runs.
+    #[test]
+    fn character_class_from_the_splice_matches() {
+        assert_parity(r#"cm='[0-9]'; v=a1b; print -r -- ${v#*${~cm}}"#);
+    }
+
+    /// Same splice WITHOUT the `~`: literal `[0-9]`, no strip. Pins that the
+    /// scope restore did not simply turn the feature off.
+    #[test]
+    fn without_tilde_the_splice_stays_literal() {
+        assert_parity(r#"cm='[0-9]'; v=a1b; print -r -- ${v#*$cm}"#);
+    }
+
+    #[test]
+    fn alternation_from_the_splice_matches() {
+        assert_parity(r#"cm='a|b'; v=bcd; print -r -- ${v#(${~cm})}"#);
+    }
+
+    #[test]
+    fn replace_pattern_from_the_splice_matches() {
+        assert_parity(r#"cm='[0-9]'; v=a1b; print -r -- ${v/${~cm}/Z}"#);
+    }
+
+    #[test]
+    fn without_tilde_the_replace_pattern_stays_literal() {
+        assert_parity(r#"cm='[0-9]'; v=a1b; print -r -- ${v/$cm/Z}"#);
+    }
+
+    /// `${~~…}` — the doubled form forces GLOB_SUBST OFF for the nested value
+    /// (c:2598 `globsubst = 0`), and that must not leak either.
+    #[test]
+    fn doubled_tilde_forces_it_off_without_leaking() {
+        assert_parity(r#"setopt globsubst; cm='[0-9]'; v=a1b; print -r -- ${v#*${~~cm}}"#);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. A genuinely-on GLOB_SUBST must still glob the enclosing result.
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod globsubst_that_is_really_on_still_globs {
+    use super::assert_parity;
+
+    /// `setopt globsubst` is the user's own option, not a carrier flip — the
+    /// result IS a pattern and filename generation fails on it.
+    #[test]
+    fn option_set_by_the_user() {
+        assert_parity(r#"setopt globsubst; v='a|b'; print -r -- ${v%%X*}"#);
+    }
+
+    /// The OUTER expansion's own `~` still marks the outer result.
+    #[test]
+    fn outer_tilde_marks_the_outer_result() {
+        assert_parity(r#"cm=X; v='a|b'; print -r -- ${~v%%${~cm}*}"#);
+    }
+
+    /// Outer `~` and inner `~` together: the restore must put back the OUTER's
+    /// value, not the user's option.
+    #[test]
+    fn outer_and_inner_tilde_together_with_a_matching_pattern() {
+        assert_parity(r#"cm='[0-9]'; v='a1|b'; print -r -- ${~v#*${~cm}}"#);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4. A `${~…}` / default-word result inside a larger word globs with the WORD.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// c:Src/subst.c:165-191 then c:Src/exec.c:3755-3757 — `prefork` finishes the
+/// whole word before `globlist` runs, so the glob tokens a `${~…}` or a default
+/// word leaves in its value are matched against the ASSEMBLED word. zshrs globbed
+/// the substitution by itself and then attached the literal text:
+/// `print ${~:-bor*}x` printed `boringfilex` where zsh reports no match.
+mod substitution_segment_globs_with_the_assembled_word {
+    use super::assert_parity;
+
+    const DIR: &str = "cd \"$(mktemp -d)\" && touch boringfile && ";
+
+    #[test]
+    fn suffix_joins_the_pattern() {
+        assert_parity(&format!("{DIR}print ${{~:-bor*}}x"));
+        assert_parity(&format!("{DIR}print ${{~x:-bor*}}x"));
+        assert_parity(&format!("{DIR}print ${{${{~:-bor*}}}}x"));
+        assert_parity(&format!("{DIR}print ${{${{:-bor*}}}}x"));
+    }
+
+    #[test]
+    fn prefix_joins_the_pattern() {
+        assert_parity(&format!("{DIR}print x${{~:-bor*}}"));
+        assert_parity(&format!("{DIR}print ${{~:-bor*}}\"x\""));
+    }
+
+    #[test]
+    fn assembled_word_that_matches_still_globs() {
+        assert_parity(&format!("{DIR}print ${{~x:-b*}}ingfile ${{~:-bor*}}"));
+        assert_parity(&format!("{DIR}a=( ${{~x:-bor}}ing* ); print $#a $a"));
+        assert_parity(&format!("{DIR}setopt nonomatch; print ${{~:-bor*}}x"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. GLOB_SUBST after a default / alternate word (c:Src/subst.c:3231-3233).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `if (globsubst != 2) globsubst = 0;` after the word's multsub: the finished
+/// expansion is not shtokenized, so only glob tokens an UNQUOTED inner
+/// substitution produced survive.
+mod globsubst_off_after_a_default_word {
+    use super::assert_parity;
+
+    const DIR: &str = "cd \"$(mktemp -d)\" && touch boringfile && setopt globsubst && foo='boring*' && ";
+
+    #[test]
+    fn quoted_value_in_the_word_stays_literal() {
+        assert_parity(&format!("{DIR}print -r -- ${{foo+\"$foo\"}} ${{foo+\"x$foo\"}}"));
+        assert_parity(&format!("{DIR}print -r -- ${{unset-\"$foo\"}} ${{unset:-\"$foo\"}} ${{foo:+\"$foo\"}}"));
+        assert_parity(&format!("{DIR}print -r -- x${{foo+\"$foo\"}} ${{foo+\"$foo\"}}x"));
+    }
+
+    #[test]
+    fn globbing_that_zsh_keeps() {
+        assert_parity(&format!("{DIR}print -r -- ${{foo+$foo}} ${{foo:-\"$foo\"}} ${{~foo+\"$foo\"}} $foo"));
+        assert_parity(&format!("{DIR}print -r -- ${{foo+\"$foo\"}}; print -r -- $foo"));
+    }
+}
+
+/// c:Src/subst.c:1671 — the default word of an INNER spec (`${${:-*}…}`) is a
+/// glob request for the inner result only; an outer pattern operator rebuilds
+/// the value through getmatch, so the enclosing word does not glob it.
+mod inner_default_word_glob_stays_inside_an_outer_pattern_op {
+    use super::assert_parity;
+
+    const DIR: &str = "cd \"$(mktemp -d)\" && touch boringfile && ";
+
+    #[test]
+    fn outer_replace_and_strip_results_stay_literal() {
+        assert_parity(&format!("{DIR}print -r -- x${{${{:-*}}//x/y}} x${{${{:-bor*}}#y}} ${{${{:-bor*}}//x/y}}x"));
+        assert_parity(&format!("{DIR}print -r -- x${{${{~:-*}}//x/y}} ${{${{~:-*}}//x/y}}x \"x${{${{~:-*}}//x/y}}\""));
+    }
+
+    #[test]
+    fn pass_through_and_case_modifier_still_glob() {
+        assert_parity(&format!("{DIR}print -r -- ${{${{:-bor*}}}}x"));
+        assert_parity(&format!("{DIR}print -r -- ${{${{~:-bor*}}:u}} ${{${{~:-*}}}}"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A `${~…}` whose value went through a modifier reaches filename generation
+// through the same c:Src/glob.c:1872-1886 no-match dispatch as a bare `${~v}`:
+// NULL_GLOB drops the word, NOMATCH errors, and only with both off does the
+// literal survive. The modifier path used to push the literal back on every
+// empty result, so under NULL_GLOB `${~w//x/y}` kept a word `${~w}` dropped —
+// which is what made compsys `_expand` offer `~[]` as its own expansion
+// (Y01completion #10).
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod no_match_dispatch_after_a_modifier {
+    use super::assert_parity;
+
+    #[test]
+    fn null_glob_drops_the_substituted_word() {
+        for form in [r"${~w}", r"${~w//x/y}", r"${~w/x/y}", r"${~w#q}", r"${~w:-z}", r"${~${w}}"] {
+            assert_parity(&format!(
+                "setopt nullglob; w='/nonexistent_zz_dir/*'; a=( {form} ); print -r -- \"n=$#a [$a]\""
+            ));
+        }
+    }
+
+    #[test]
+    fn nomatch_off_keeps_the_literal_and_nomatch_on_errors() {
+        for opts in ["setopt nonomatch", ""] {
+            assert_parity(&format!(
+                "{opts}; w='/nonexistent_zz_dir/*'; a=( ${{~w//x/y}} ); print -r -- \"n=$#a [$a]\""
+            ));
+        }
+    }
+
+    #[test]
+    fn a_failed_dynamic_directory_name_is_dropped_under_null_glob() {
+        assert_parity(
+            "setopt nullglob nonomatch; w='~[]'; a=( ${~w//x/y} ); print -r -- \"n=$#a [$a]\"",
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A function run from INSIDE a `${~…}` expansion — the `zsh_directory_name`
+// hook behind `~[name]` (c:Src/subst.c:762, c:Src/utils.c:4017) — must neither
+// see the forced GLOB_SUBST nor leave it behind. C keeps the switch in a
+// paramsubst local; zshrs's carrier was consumed by the hook's own command
+// boundary and a LOCAL_OPTIONS restore at its return re-applied ON, so every
+// later statement of the caller ran with GLOB_SUBST set. Stock `_expand`
+// (Completion/Base/Completer/_expand:110-117) is exactly that caller: its
+// quoting fallback then globbed `~[]` away (Y01completion #10).
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod hook_inside_tilde_expansion_does_not_leak_globsubst {
+    use super::assert_parity;
+
+    #[test]
+    fn localoptions_caller_keeps_its_own_globsubst() {
+        for hook in ["zsh_directory_name() { return 1 }", "zsh_directory_name() { reply=(/tmp); return 0 }"] {
+            assert_parity(&format!(
+                "{hook}; f() {{ setopt localoptions nullglob nonomatch; local -a exp; \
+                 exp=('~[x]'); exp=( ${{~exp//q/r}} ); print -r -- \"n=$#exp [$exp] $options[globsubst]\"; \
+                 exp=( ${{w:-'~[x]'}} ); print -r -- \"later n=$#exp [$exp] $options[globsubst]\" }}; \
+                 zmodload zsh/parameter; f 2>/dev/null; print -r -- \"after $options[globsubst]\""
+            ));
+        }
+    }
+}
+
+/// Prefork's end-of-word `filesub` is gated on `unset(SHFILEEXPANSION)`
+/// (c:Src/subst.c:178): under SH_FILE_EXPANSION the file expansion runs
+/// FIRST (c:122-138), so a `~`/`=` that only appears after substitution —
+/// a GLOB_SUBST value, `${~v}` — stays literal. zshrs's GLOB_SUBST glob arms
+/// ran filesub unconditionally (E01options "SH_FILE_EXPANSION option with
+/// GLOB_SUBST et al.").
+mod sh_file_expansion_leaves_substituted_tilde_literal {
+    use super::assert_parity;
+
+    #[test]
+    fn globsubst_values() {
+        assert_parity(r#"setopt globsubst shfileexpansion; v='~/one'; x='=ls'; print -l -- $v ${~v} $x"#);
+        assert_parity(r#"() { emulate -L sh; v='~/one ~/two'; print -l -- $v $v; }"#);
+    }
+
+    #[test]
+    fn literal_words_still_expand_first() {
+        assert_parity(r#"setopt shfileexpansion; x=a; print ~/$x =ls "~/q" a=~/b; print -l ~/{a,b}$x"#);
+        assert_parity(r#"v='~/one'; print ${~v}; setopt globsubst; print $v"#);
+    }
+}

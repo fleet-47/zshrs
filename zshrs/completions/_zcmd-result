@@ -1,0 +1,18 @@
+#compdef zcmd-result
+
+# Responder side of `zsend --wait`: report the stdout, stderr and exit
+# status of a command a `cmd:execute` event delivered, so the daemon can
+# resolve the sender that is blocked on that delivery id.
+#
+# zshrs builtin. Registered in ZSHRS_BUILTIN_NAMES
+# (daemon/builtins.rs); flags mirror zcmd_result in daemon/builtins.rs.
+# Bundled into ~/.zshrs/functions by build.rs.
+
+# Delivery ids arrive in the cmd:execute event payload; the daemon has no
+# op that lists pending ones, so the id is not completed.
+_arguments \
+    '(--id --delivery-id)'{--id,--delivery-id}'[delivery id from the cmd:execute event (required)]:delivery id:' \
+    '--exit-code[exit status of the executed command]:exit code:' \
+    '--stdout[captured stdout]:stdout text:' \
+    '--stderr[captured stderr]:stderr text:' \
+    '(- *)'{-h,--help}'[print usage]'

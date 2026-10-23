@@ -1,0 +1,984 @@
+//! I/O redirection parity tests — >, >>, <, 2>, &>, 2>&1, etc.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+struct R {
+    stdout: String,
+    exit: i32,
+}
+fn run_zsh_in(dir: &Path, s: &str) -> R {
+    let o = Command::new(zsh_path())
+        .args(["-fc", s])
+        .current_dir(dir)
+        .output()
+        .expect("zsh");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn run_zshrs_in(dir: &Path, s: &str) -> R {
+    let o = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", s])
+        .current_dir(dir)
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("zshrs");
+    R {
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        exit: o.status.code().unwrap_or(-1),
+    }
+}
+fn assert_parity_in(dir: &Path, s: &str) {
+    if !zsh_available() {
+        return;
+    }
+    // Snapshot every file in `dir` BEFORE the first shell runs so the
+    // second shell sees the same starting state. Without this, redirect
+    // tests that pre-create files (`echo line1 > out.txt` then
+    // `assert_parity_in`) see zsh mutate the file first, then zshrs run
+    // against zsh's already-modified state. Cumulative-append redirects
+    // (`>>`, `&>>`, `2>>`) then look broken even when both shells
+    // perform identical operations.
+    let snapshot: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter_map(|e| {
+                    let p = e.path();
+                    std::fs::read(&p).ok().map(|b| (p, b))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let z = run_zsh_in(dir, s);
+    // Restore the snapshot so zshrs starts from the same state.
+    for (p, b) in &snapshot {
+        let _ = std::fs::write(p, b);
+    }
+    let r = run_zshrs_in(dir, s);
+    assert_eq!(
+        z.stdout, r.stdout,
+        "stdout divergence on:\n{s}\n--- zsh ---\n{:?}\n--- zshrs ---\n{:?}",
+        z.stdout, r.stdout
+    );
+    assert_eq!(z.exit, r.exit);
+}
+fn tdir() -> tempfile::TempDir {
+    tempfile::tempdir().expect("tempdir")
+}
+
+mod stdout_redirect {
+    use super::*;
+
+    #[test]
+    fn gt_writes_to_file() {
+        let d = tdir();
+        assert_parity_in(d.path(), "echo hello > out.txt; cat out.txt");
+    }
+
+    #[test]
+    fn gt_truncates_existing() {
+        let d = tdir();
+        std::fs::write(d.path().join("out.txt"), "old content").unwrap();
+        assert_parity_in(d.path(), "echo new > out.txt; cat out.txt");
+    }
+
+    #[test]
+    fn gt_gt_appends() {
+        let d = tdir();
+        std::fs::write(d.path().join("out.txt"), "line1\n").unwrap();
+        assert_parity_in(d.path(), "echo line2 >> out.txt; cat out.txt");
+    }
+
+    #[test]
+    fn explicit_1_gt() {
+        let d = tdir();
+        assert_parity_in(d.path(), "echo hi 1> out.txt; cat out.txt");
+    }
+}
+
+mod stderr_redirect {
+    use super::*;
+
+    #[test]
+    fn stderr_to_file() {
+        let d = tdir();
+        // Generate stderr via a parse error or `echo` of nothing useful;
+        // use a command that reliably writes to stderr.
+        assert_parity_in(d.path(), r#"sh -c 'echo err >&2' 2> err.txt; cat err.txt"#);
+    }
+
+    #[test]
+    fn stderr_to_file_only_stdout_remains() {
+        let d = tdir();
+        // Both stdout and stderr; redirect stderr only, stdout passes through.
+        assert_parity_in(
+            d.path(),
+            r#"sh -c 'echo OUT; echo ERR >&2' 2> err.txt; cat err.txt"#,
+        );
+    }
+
+    #[test]
+    fn stderr_append() {
+        let d = tdir();
+        std::fs::write(d.path().join("err.txt"), "first\n").unwrap();
+        assert_parity_in(
+            d.path(),
+            r#"sh -c 'echo more >&2' 2>> err.txt; cat err.txt"#,
+        );
+    }
+}
+
+mod stdin_redirect {
+    use super::*;
+
+    #[test]
+    fn lt_reads_from_file() {
+        let d = tdir();
+        std::fs::write(d.path().join("in.txt"), "content\n").unwrap();
+        assert_parity_in(d.path(), "cat < in.txt");
+    }
+
+    #[test]
+    fn lt_then_pipe() {
+        let d = tdir();
+        std::fs::write(d.path().join("in.txt"), "a\nb\nc\n").unwrap();
+        assert_parity_in(d.path(), "cat < in.txt | grep b");
+    }
+}
+
+mod fd_dup {
+    use super::*;
+
+    /// `2>&1` redirects stderr to wherever stdout currently goes.
+    #[test]
+    fn two_to_one_merges_stderr_into_stdout() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"sh -c 'echo OUT; echo ERR >&2' 2>&1"#);
+    }
+
+    /// `>file 2>&1` — both stdout and stderr go to file.
+    #[test]
+    fn gt_file_then_two_to_one_captures_both() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            r#"sh -c 'echo OUT; echo ERR >&2' > both.txt 2>&1; cat both.txt"#,
+        );
+    }
+
+    /// `1>&2` redirects stdout to stderr.
+    #[test]
+    fn one_to_two_swaps_stdout_to_stderr() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"echo hi 1>&2 2> err.txt; cat err.txt"#);
+    }
+}
+
+mod amp_redirect {
+    use super::*;
+
+    /// `&>` redirects both stdout AND stderr (zsh + bash).
+    #[test]
+    fn amp_gt_redirects_both_streams() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            r#"sh -c 'echo OUT; echo ERR >&2' &> all.txt; cat all.txt"#,
+        );
+    }
+
+    /// `&>>` appends both streams.
+    #[test]
+    fn amp_gt_gt_appends_both() {
+        let d = tdir();
+        std::fs::write(d.path().join("all.txt"), "first\n").unwrap();
+        assert_parity_in(
+            d.path(),
+            r#"sh -c 'echo OUT; echo ERR >&2' &>> all.txt; cat all.txt"#,
+        );
+    }
+}
+
+mod here_in_redirect {
+    use super::*;
+
+    /// Heredoc as redirect input.
+    #[test]
+    fn heredoc_as_stdin() {
+        let d = tdir();
+        assert_parity_in(d.path(), "cat <<EOF\nhi\nEOF");
+    }
+
+    /// Here-string `<<<` as redirect input.
+    #[test]
+    fn here_string_as_stdin() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"cat <<< "hi""#);
+    }
+}
+
+mod multiple_redirects {
+    use super::*;
+
+    /// Multiple `>` on same command — only last takes effect for fd 1.
+    #[test]
+    fn second_gt_wins_for_stdout() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "echo hi > first.txt > second.txt; cat first.txt second.txt 2>/dev/null; echo done",
+        );
+    }
+
+    /// Separate fds — each redirect goes to its own file.
+    #[test]
+    fn out_to_one_file_err_to_another() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            r#"sh -c 'echo OUT; echo ERR >&2' > out.txt 2> err.txt; cat out.txt err.txt"#,
+        );
+    }
+
+    /// A redirect target that brace-expands to multiple words MULTIOS-
+    /// creates each (c:Src/glob.c:2161 xpandredir), including paths with
+    /// `/`. `: >dir/{a,b,c}` — the canonical ztst-prep idiom — must write
+    /// each file separately, not one space-joined filename.
+    #[test]
+    fn brace_target_multios_with_slash() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "mkdir p; : >p/{a,b,c}; print -l p/*(.N); echo done",
+        );
+    }
+
+    #[test]
+    fn brace_target_multios_simple() {
+        let d = tdir();
+        assert_parity_in(d.path(), ": >{a,b}; print -l *(.N); echo done");
+    }
+
+    #[test]
+    fn brace_target_prefix() {
+        let d = tdir();
+        assert_parity_in(d.path(), ": >x{a,b,c}; print -l x*(.N); echo done");
+    }
+}
+
+mod pipeline_redirect {
+    use super::*;
+
+    #[test]
+    fn pipe_then_gt_file() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "echo hello world | tr ' ' '_' > out.txt; cat out.txt",
+        );
+    }
+
+    #[test]
+    fn pipe_amp_merges_stderr_into_pipe() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"sh -c 'echo OUT; echo ERR >&2' |& cat"#);
+    }
+}
+
+mod close_fd {
+    use super::*;
+
+    /// `2>&-` closes stderr.
+    #[test]
+    fn close_stderr_with_dash() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"sh -c 'echo OUT; echo ERR >&2' 2>&-"#);
+    }
+}
+
+mod redirect_from_var {
+    use super::*;
+
+    /// Filename comes from variable expansion.
+    #[test]
+    fn redirect_target_is_variable() {
+        let d = tdir();
+        assert_parity_in(d.path(), "F=out.txt; echo hi > $F; cat $F");
+    }
+}
+
+/// MULTIOS semantics (Bug #36) — c:Src/exec.c:2391-2480 addfd +
+/// closemn tee/cat, c:Src/glob.c:2150-2207 xpandredir.
+mod multios {
+    use super::*;
+
+    /// `> a > b` tees stdout to both files.
+    #[test]
+    fn tee_two_files() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print x > a > b; cat a b");
+    }
+
+    /// Mixed modes: `> a >> b` truncates a, appends b.
+    #[test]
+    fn tee_mixed_write_append() {
+        let d = tdir();
+        std::fs::write(d.path().join("b"), "pre\n").unwrap();
+        assert_parity_in(d.path(), "print x > a >> b; cat a; cat b");
+    }
+
+    /// `< a < b` concatenates inputs in redirect order.
+    #[test]
+    fn input_concat_order() {
+        let d = tdir();
+        std::fs::write(d.path().join("a"), "first\n").unwrap();
+        std::fs::write(d.path().join("b"), "second\n").unwrap();
+        assert_parity_in(d.path(), "cat < a < b");
+    }
+
+    /// NO_MULTIOS output: last redirect wins; earlier files are
+    /// still created/truncated (c:2418 `unset(MULTIOS)` replace arm).
+    #[test]
+    fn nomultios_last_write_wins() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            r#"unsetopt multios; print x > a > b; ls; echo "a:[$(cat a)] b:[$(cat b)]""#,
+        );
+    }
+
+    /// NO_MULTIOS input: only the last source is read.
+    #[test]
+    fn nomultios_last_read_wins() {
+        let d = tdir();
+        std::fs::write(d.path().join("a"), "one\n").unwrap();
+        std::fs::write(d.path().join("b"), "two\n").unwrap();
+        assert_parity_in(d.path(), "unsetopt multios; cat < a < b");
+    }
+
+    /// `>&1 > f` — the dup of the ORIGINAL stdout joins the multio
+    /// (c:Src/exec.c:3895-3917 REDIR_MERGEOUT + addfd).
+    #[test]
+    fn dup_then_file_tees_original_stdout() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"print x >&1 > f; echo "f:[$(cat f)]""#);
+    }
+
+    /// `> f >&1` — the dup resolves AFTER fd1 was replaced by f, so
+    /// f receives the stream twice.
+    #[test]
+    fn file_then_dup_doubles_into_file() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"print x > f >&1; echo "f:[$(cat f)]""#);
+    }
+
+    /// `>&1 > f | cat` — the pipeline pipe seeds the multio
+    /// (c:Src/exec.c:3722-3724), so the pipe receives the stream
+    /// twice (seed + dup) and f once.
+    #[test]
+    fn dup_and_file_inside_pipeline() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"print x >&1 > f | cat; echo "f:[$(cat f)]""#);
+    }
+
+    /// `>&1 >&1` — two self-dups double the stream.
+    #[test]
+    fn double_self_dup() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print x >&1 >&1");
+    }
+
+    /// fd-2 multio with a dup member: `2>&1 2>f` sends stderr to
+    /// stdout AND the file.
+    #[test]
+    fn stderr_dup_plus_file() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"print -u2 e 2>&1 2>f; echo "f:[$(cat f)]""#);
+    }
+
+    /// Multio on an fd that was CLOSED before the redirection
+    /// (c:Src/exec.c:2426-2437 saves -1, restored by closing it; every
+    /// split member is `movefd`'d, c:2463-2481). The first file opened AS
+    /// fd 3, so the splitter's pipe replaced it (the file stayed empty and
+    /// the splitter fed itself), and with no restore slot the scope-end
+    /// join waited forever on the still-open write end.
+    #[test]
+    fn closed_fd_three_tee_two_files() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            r#"print -u3 w 3>x 3>y; echo "x:[$(cat x)] y:[$(cat y)]"; { print -u3 g } 3>x 3>y; echo "x:[$(cat x)] y:[$(cat y)]"; print -u3 after 2>&1"#,
+        );
+        assert_parity_in(d.path(), r#"{ print -u 3 words } 3>&1 3>&1; echo rc=$?"#);
+    }
+
+    /// fd-2 multio, two files: `2> e1 2> e2`.
+    #[test]
+    fn stderr_tee_two_files() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            r#"print -u2 err 2> e1 2> e2; echo "e1:[$(cat e1)] e2:[$(cat e2)]""#,
+        );
+    }
+
+    /// Glob redirect target with two matches writes both files
+    /// (c:Src/glob.c:2195-2203 — one redirect per match, one multio).
+    #[test]
+    fn glob_write_two_matches() {
+        let d = tdir();
+        std::fs::write(d.path().join("g1.txt"), "").unwrap();
+        std::fs::write(d.path().join("g2.txt"), "").unwrap();
+        assert_parity_in(d.path(), "echo hi > *.txt; cat g1.txt g2.txt");
+    }
+
+    /// Glob input source with two matches concatenates both.
+    #[test]
+    fn glob_read_two_matches() {
+        let d = tdir();
+        std::fs::write(d.path().join("g1.txt"), "aa").unwrap();
+        std::fs::write(d.path().join("g2.txt"), "bbb").unwrap();
+        assert_parity_in(d.path(), "wc -c < *.txt");
+    }
+
+    /// NO_MULTIOS suppresses redirect-target globbing entirely
+    /// (c:Src/glob.c:2161-2167 PREFORK_SINGLE): `> *.txt` creates
+    /// the literal file `*.txt`.
+    #[test]
+    fn nomultios_glob_stays_literal() {
+        let d = tdir();
+        std::fs::write(d.path().join("g1.txt"), "").unwrap();
+        std::fs::write(d.path().join("g2.txt"), "").unwrap();
+        assert_parity_in(d.path(), "unsetopt multios; echo hi > *.txt; ls");
+    }
+
+    /// noclobber failure on a multio member aborts the rest of the
+    /// redirect list — `b` is never created (c:Src/exec.c execerr).
+    #[test]
+    fn noclobber_aborts_multio() {
+        let d = tdir();
+        std::fs::write(d.path().join("a"), "").unwrap();
+        assert_parity_in(
+            d.path(),
+            "setopt noclobber; print x > a > b; echo st=$?; ls",
+        );
+    }
+
+    /// Three-way fan-out.
+    #[test]
+    fn tee_three_files() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print x > a > b > c; cat a b c");
+    }
+
+    /// Exit status is the command's own, not the splitter's.
+    #[test]
+    fn exit_status_after_tee() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print x > a > b; echo $?");
+    }
+}
+
+/// Redirections may be interleaved with pre-command assignments in any
+/// order (c:Src/parse.c:1843-1907 par_simple) — `a=b 2>/dev/null c=d`
+/// sets BOTH a and b. The old split parser stopped collecting
+/// assignments at the first redirection, dropping the trailing ones.
+mod redirect_interleaved_with_assignments {
+    use super::*;
+
+    #[test]
+    fn redir_between_two_assignments_no_command() {
+        let d = tdir();
+        assert_parity_in(d.path(), "a=b 2>/dev/null c=d; print $a; print $c");
+    }
+
+    #[test]
+    fn redir_between_assignments_with_command() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"a=b 2>/dev/null c=d echo hi; print "[$a][$c]""#);
+    }
+
+    #[test]
+    fn multiple_interleaved_redirs() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "x=1 2>/dev/null y=2 3>/dev/null z=3; print $x $y $z",
+        );
+    }
+
+    /// Redir AFTER all assignments still works (regression guard).
+    #[test]
+    fn redir_after_assignments() {
+        let d = tdir();
+        assert_parity_in(d.path(), "a=b c=d 2>/dev/null; print $a $c");
+    }
+
+    /// typeset multi-assign must NOT be reparsed as pre-command
+    /// assignments (regression guard).
+    #[test]
+    fn typeset_multi_assign_unaffected() {
+        let d = tdir();
+        assert_parity_in(d.path(), "typeset a=1 b=2; print $a $b");
+    }
+}
+
+/// CLOBBER_EMPTY: under `noclobber`, `>file` may still overwrite an
+/// EMPTY regular file (c:Src/exec.c:2313 clobber_open). The inline
+/// noclobber checks in the redirect bridge ignored this. Scripts
+/// self-clean with `rm -f` so both shells start from identical state.
+mod clobber_empty {
+    use super::*;
+
+    /// Canonical ztst A04 form: empty file is clobberable, non-empty is not.
+    #[test]
+    fn empty_clobbered_nonempty_protected() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "setopt noclobber clobberempty; rm -f foo; touch foo; \
+             print Works >foo; cat foo; print Works not >foo; cat foo",
+        );
+    }
+
+    /// Truncate-then-overwrite an empty file in one script.
+    #[test]
+    fn truncate_then_overwrite_empty() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "setopt noclobber clobberempty; rm -f f; : >f; echo hi >f; echo OK; cat f",
+        );
+    }
+
+    /// Without clobberempty, an empty existing file is still protected.
+    #[test]
+    fn noclobber_alone_protects_empty() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "setopt noclobber; rm -f f; : >f; echo hi >f; echo OK",
+        );
+    }
+
+    /// Multio fan-out honors clobberempty on each target.
+    #[test]
+    fn multio_clobberempty() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "setopt noclobber clobberempty; rm -f f g; : >f; : >g; \
+             print x >f >g; echo OK; cat f g",
+        );
+    }
+}
+
+/// Here-strings and here-documents must spool through a temp file whose
+/// permissions ignore the umask (c:Src/utils.c gettempfile → mkstemp,
+/// 0600). The previous port used `std::fs::write` which honors the
+/// umask, so under `umask 0777` the temp file landed mode 0000 and the
+/// read-back reopen failed → empty stdin.
+mod restrictive_umask_heredoc {
+    use super::*;
+
+    #[test]
+    fn here_string_under_umask_0777() {
+        let d = tdir();
+        assert_parity_in(d.path(), "(umask 0777; cat <<<miracle)");
+    }
+
+    #[test]
+    fn here_doc_under_umask_0777() {
+        let d = tdir();
+        assert_parity_in(d.path(), "(umask 0777; cat <<EOF\nhello there\nEOF\n)");
+    }
+
+    #[test]
+    fn read_from_here_string_under_umask() {
+        let d = tdir();
+        assert_parity_in(d.path(), r#"(umask 0777; read x <<<abc; echo "[$x]")"#);
+    }
+
+    /// Normal umask still works (regression guard).
+    #[test]
+    fn here_string_normal_umask() {
+        let d = tdir();
+        assert_parity_in(d.path(), "umask 022; cat <<<works");
+    }
+}
+
+/// Anonymous function `() { body } <in arg >out arg` collects trailing
+/// args and redirections interleaved in any order (c:Src/parse.c
+/// par_simple). The previous port collected only leading STRING args,
+/// so an arg AFTER a redirection raised "parse error near `<arg>'".
+mod anon_func_interleaved_redirs_args {
+    use super::*;
+
+    #[test]
+    fn redir_arg_redir_arg_mixed() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "print you cannot be serious >input1; \
+             () { local var; read var; print $1 $var $2 } <input1 Shirley >output1 dude; \
+             print Nothing; cat output1",
+        );
+    }
+
+    /// arg-then-redir order.
+    #[test]
+    fn arg_then_redir() {
+        let d = tdir();
+        assert_parity_in(d.path(), "() { print $1 } only <<<x");
+    }
+
+    /// args-only still works (regression guard).
+    #[test]
+    fn args_only() {
+        let d = tdir();
+        assert_parity_in(d.path(), "() { print A $1 $2 } one two");
+    }
+
+    /// redir-only still works (regression guard).
+    #[test]
+    fn redir_only() {
+        let d = tdir();
+        assert_parity_in(d.path(), "() { read v; print got $v } <<<hello");
+    }
+}
+
+/// A simple command consisting ONLY of redirections — `< file`, `> file`.
+///
+/// c:Src/exec.c:3386-3419 — `execcmd` does not "run NULLCMD" as a special
+/// case: it APPENDS the resolved word to the command's argument list
+/// (`addlinknode(args, dupstring(nullcmd))`, c:3418) and falls through to
+/// ordinary dispatch, so the word is resolved shell function (c:3485) →
+/// builtin (c:3489) → external, with the redirections already installed.
+/// A SINGLE input redirection picks READNULLCMD instead (c:3409-3414).
+///
+/// Regression pinned here: the runtime handler decided "is this a builtin"
+/// with `builtin_in_builtintab()`, which is a module *gate* and answers true
+/// for every unknown string, so every external word — including the default
+/// `READNULLCMD=more` — was dispatched as a nonexistent builtin. Plain
+/// `< file`, the daily-driver idiom, printed NOTHING and returned 1.
+mod nullcmd_redirect_only {
+    use super::*;
+
+    /// The bug as reported: `< file` with whatever NULLCMD/READNULLCMD the
+    /// environment supplies. Compared against real zsh in the SAME env, so
+    /// this holds whether the pager is `more`, `less`, or absent (127).
+    #[test]
+    fn input_only_default_settings() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\nbeta\n").unwrap();
+        assert_parity_in(d.path(), "< s.txt");
+    }
+
+    /// c:3409-3414 — a single REDIR_READ uses READNULLCMD. An ABSOLUTE path
+    /// can never be a builtin, so this pins the external-dispatch arm
+    /// independently of what the ambient pager does.
+    #[test]
+    fn input_only_external_readnullcmd() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\nbeta\n").unwrap();
+        assert_parity_in(d.path(), "READNULLCMD=/bin/cat; < s.txt");
+    }
+
+    /// c:3485 — a shell function of that name wins over builtin/external.
+    #[test]
+    fn readnullcmd_names_a_shell_function() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(
+            d.path(),
+            "f() { print FUNC; read v; print $v }\nREADNULLCMD=f; < s.txt",
+        );
+    }
+
+    /// c:3489 — a READNULLCMD naming a BUILTIN runs the builtin (`:` reads
+    /// nothing, so the file contents must NOT appear).
+    #[test]
+    fn readnullcmd_names_a_builtin() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(d.path(), "READNULLCMD=:; < s.txt; print rc=$?");
+    }
+
+    /// Neither function nor builtin nor on PATH → `command not found`, 127.
+    /// The broken predicate swallowed this into a silent exit 1.
+    #[test]
+    fn readnullcmd_not_found_is_127() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(d.path(), "READNULLCMD=zz_no_such_command_zz; < s.txt");
+    }
+
+    /// c:3409-3410 — READNULLCMD applies only to a LONE `<`. Two input
+    /// redirections fall back to NULLCMD (and, with MULTIOS, concatenate).
+    #[test]
+    fn two_input_redirs_use_nullcmd() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(d.path(), "NULLCMD=/bin/cat; < s.txt < s.txt");
+    }
+
+    /// c:3410 — `<>` is REDIR_READWRITE, not REDIR_READ, so NULLCMD applies.
+    #[test]
+    fn readwrite_redir_uses_nullcmd() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\nbeta\n").unwrap();
+        assert_parity_in(d.path(), "NULLCMD=/bin/cat; <> s.txt");
+    }
+
+    /// c:3418 — output-only redirection uses NULLCMD; `:` must still work
+    /// (it is the documented idiom for "create the file, run nothing") and
+    /// must still create the file.
+    #[test]
+    fn output_only_nullcmd_colon_creates_file() {
+        let d = tdir();
+        assert_parity_in(
+            d.path(),
+            "NULLCMD=:; > made.txt; print rc=$?; test -f made.txt && print made",
+        );
+    }
+
+    /// c:3395-3397 — CSH_NULL_CMD (and an empty/unset NULLCMD) turn the
+    /// whole form into `redirection with no command`, status 1.
+    #[test]
+    fn csh_null_cmd_is_an_error() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(d.path(), "setopt cshnullcmd; < s.txt");
+    }
+
+    /// c:3405-3408 — SH_NULL_CMD substitutes `:` regardless of NULLCMD.
+    #[test]
+    fn sh_null_cmd_substitutes_colon() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(
+            d.path(),
+            "setopt shnullcmd; NULLCMD=/bin/cat; < s.txt; print rc=$?",
+        );
+    }
+
+    /// c:3489 — `builtintab->getnode` filters DISABLED nodes, so a disabled
+    /// `:` falls through to PATH and reports `command not found` (127).
+    #[test]
+    fn disabled_builtin_nullcmd_falls_through_to_path() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\n").unwrap();
+        assert_parity_in(d.path(), "disable :; READNULLCMD=:; < s.txt; print rc=$?");
+    }
+
+    /// The idiom inside a function body and inside a subshell — both lost
+    /// their output under the regression.
+    #[test]
+    fn input_only_in_function_and_subshell() {
+        let d = tdir();
+        std::fs::write(d.path().join("s.txt"), "alpha\nbeta\n").unwrap();
+        assert_parity_in(
+            d.path(),
+            "READNULLCMD=/bin/cat; f() { < s.txt }; f; ( < s.txt )",
+        );
+    }
+}
+
+/// An empty `>&` / `>>&` / `&>` target. c:Src/glob.c:2191-2195 makes the
+/// MERGEOUT word a REDIR_ERRWRITE, and its open fails with ENOENT —
+/// c:Src/exec.c:3985-3999 `zwarn("%e: %s")` + execerr, status 1. zshrs
+/// ignored the failed open and the command wrote to stdout.
+mod empty_errwrite_target {
+    use super::*;
+
+    #[test]
+    fn empty_word_fails_the_command() {
+        let d = tdir();
+        assert_parity_in(d.path(), "{ print hi >&''; print rc=$? } 2>&1");
+        assert_parity_in(d.path(), "{ print hi >>&''; print rc=$? } 2>&1");
+        assert_parity_in(d.path(), "{ e=; print hi >&$e; print rc=$? } 2>&1");
+        assert_parity_in(d.path(), "{ print hi &>''; print rc=$? } 2>&1");
+    }
+}
+
+/// c:Src/exec.c:252-256 execerr — `redir_err = lastval = 1;` when a
+/// builtin's `<&` word is not a file number (c:Src/glob.c:2191-2192). The
+/// errflag ends the script with that 1; zshrs exited 0.
+mod mergein_non_number_builtin {
+    use super::*;
+
+    #[test]
+    fn builtin_exits_one() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print hi <&''");
+        assert_parity_in(d.path(), "true <&''; print never");
+        assert_parity_in(d.path(), "typeset x <&''");
+    }
+}
+
+/// c:Src/exec.c:3719 forks an external command before the redirection loop
+/// at c:3785, so a `<&''` error is raised in the child: the shell sees
+/// status 1 and runs the next command.
+mod mergein_non_number_external {
+    use super::*;
+
+    #[test]
+    fn external_command_continues_with_status_one() {
+        let d = tdir();
+        assert_parity_in(d.path(), "/bin/cat <&''; print after $?");
+        assert_parity_in(d.path(), "{ /bin/cat <&''; print in $?; }; print out $?");
+    }
+}
+
+/// zsh has no `cat` / `env` / `head` builtin, so the name reaches
+/// execcmd_fork (c:Src/exec.c:3719) before the redirection loop
+/// (c:3785): a bad `<&` word fails in the child and the shell continues
+/// with status 1. zshrs's in-process stand-ins must fail the same way,
+/// while a real zsh builtin or a function stays fatal.
+mod mergein_non_number_extension_builtin {
+    use super::*;
+
+    #[test]
+    fn external_stand_ins_continue_with_status_one() {
+        let d = tdir();
+        assert_parity_in(d.path(), "{ cat <&''; print after $?; } 2>&1");
+        assert_parity_in(d.path(), "{ env <&''; print after $?; } 2>&1");
+        assert_parity_in(d.path(), "{ head <&''; print after $?; } 2>&1");
+    }
+
+    #[test]
+    fn builtins_and_functions_stay_fatal() {
+        let d = tdir();
+        assert_parity_in(d.path(), "{ f(){ :; }; f <&''; print never; } 2>&1");
+        assert_parity_in(d.path(), "{ typeset x <&''; print never; } 2>&1");
+    }
+}
+
+/// c:Src/exec.c:3821-3835 — a here-string (a here-document becomes one at
+/// parse time) is `fil = getherestr(fn); addfd(forked, save, mfds, fn->fd1,
+/// fil, 0, fn->varid);`, the same addfd REDIR_READ uses, so it joins the fd's
+/// input multio. zshrs compiled each body as a plain replacement and only the
+/// last one reached the command.
+mod heredoc_members_of_an_input_multio {
+    use super::*;
+
+    #[test]
+    fn every_body_reaches_the_command() {
+        let d = tdir();
+        std::fs::write(d.path().join("o1"), "out1\n").unwrap();
+        assert_parity_in(d.path(), "cat <<x <<y\nfoo\nx\nbar\ny");
+        assert_parity_in(d.path(), "cat <o1 <<<x");
+        assert_parity_in(d.path(), "cat <<<x <<y\nbar\ny");
+        assert_parity_in(d.path(), "cat <<<a <<<b");
+        assert_parity_in(d.path(), "v=V; cat <<x <<'y'\n$v one\nx\n$v two\ny");
+        assert_parity_in(d.path(), "cat <<-x <<y\n\tfoo\n\tx\nbar\ny");
+        assert_parity_in(d.path(), "cat <<x <<y | tr a-z A-Z\nfoo\nx\nbar\ny");
+    }
+
+    #[test]
+    fn single_bodies_and_no_multios_are_unchanged() {
+        let d = tdir();
+        assert_parity_in(d.path(), "unsetopt multios; cat <<x <<y\nfoo\nx\nbar\ny");
+        assert_parity_in(d.path(), "cat <<x\nsingle\nx");
+        assert_parity_in(d.path(), "cat <<<single");
+        assert_parity_in(d.path(), "{ cat; cat <&3 } <<x 3<<<three\nfoo\nx");
+    }
+}
+
+/// c:Src/exec.c:2288 closemn — a multio's tee / cat helper is a forked
+/// process, so it outlives the execve of the `-c` string's last command,
+/// which zsh runs in place. zshrs's helpers are threads; exec'ing in place
+/// killed them, and the command wrote into a pipe nobody read (SIGPIPE,
+/// nothing printed) or read EOF before the concatenator ran.
+mod multio_on_the_last_command_of_dash_c {
+    use super::*;
+
+    #[test]
+    fn the_helper_survives_the_exec() {
+        let d = tdir();
+        std::fs::write(d.path().join("o1"), "out1\n").unwrap();
+        assert_parity_in(d.path(), "exec 3>&1; /bin/echo hi >a1 >&3");
+        assert_parity_in(d.path(), "exec 3>&1; /bin/echo hi >a1 >&3; print rc=$?");
+        assert_parity_in(d.path(), "/bin/cat <o1 <<<x");
+    }
+}
+
+/// c:Src/lex.c:649-668 + c:828-836 / c:868-870 — a digit before `<` or `>` is
+/// taken as a redirection fd, but when the operator turns out to open a
+/// process substitution (`2<(…)`, `2>(…)`) the `unpeekfd:` step pushes the
+/// digit back into the word. zshrs dropped the digit.
+mod digit_before_a_process_substitution {
+    use super::*;
+
+    #[test]
+    fn the_digit_stays_in_the_word() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print -r -- 2<(true) | cut -c1-3");
+        assert_parity_in(d.path(), "print -r -- a 2>(true) | cut -c1-3");
+        assert_parity_in(d.path(), "cat 2<(print z) 2>/dev/null; print rc=$?");
+    }
+
+    #[test]
+    fn a_real_fd_redirection_is_unchanged() {
+        let d = tdir();
+        assert_parity_in(d.path(), "print hi 2>/dev/null; print -r -- <(print y) | cut -c1-3");
+        assert_parity_in(d.path(), "{ print err >&2 } 2>&1 | cat");
+    }
+}
+
+/// c:Src/exec.c:3719 forks an external command before the redirect loop
+/// (c:3785-3796 `xpandredir(…); if (errflag) { …; execerr(); }`), so an
+/// expansion error in a redirect TARGET — a NULL_GLOB `nx(N)`, a NOMATCH
+/// `nx*`, `$((1/0))` — ends only the child: status 1, next command runs.
+/// For a builtin the same error stays in the shell and ends the list.
+mod redirect_target_expansion_error {
+    use super::*;
+
+    #[test]
+    fn external_command_continues() {
+        let d = tdir();
+        assert_parity_in(d.path(), "exec 2>&1; /bin/echo > nx(N); print after $?");
+        assert_parity_in(d.path(), "exec 2>&1; /bin/echo > nx*; print after $?");
+        assert_parity_in(d.path(), "exec 2>&1; /bin/echo a > f 2> $((1/0)); print after $?; cat f");
+        assert_parity_in(d.path(), "exec 2>&1; /bin/echo x | /bin/cat > nx(N); print after $?");
+        assert_parity_in(d.path(), "exec 2>&1; cat < nx(N); print after $?");
+    }
+
+    #[test]
+    fn builtin_and_group_still_abort() {
+        let d = tdir();
+        assert_parity_in(d.path(), "exec 2>&1; print > nx(N); print after $?");
+        assert_parity_in(d.path(), "exec 2>&1; { /bin/echo hi } 2> $((1/0)); print after $?");
+    }
+
+    /// c:3636-3637 — an ARGUMENT expansion error is raised before the fork:
+    /// `lastval = 1` and the list ends, redirections or not.
+    #[test]
+    fn argument_error_exits_with_status_1() {
+        let d = tdir();
+        assert_parity_in(d.path(), "exec 2>&1; true; /bin/echo $((1/0)) > f; print after $?");
+        assert_parity_in(d.path(), "exec 2>&1; true; /bin/echo $((1/0))");
+    }
+}

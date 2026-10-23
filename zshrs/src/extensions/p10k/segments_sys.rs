@@ -1,0 +1,1889 @@
+//! p10k SYSTEM segments — time / ram / load / disk_usage / swap /
+//! battery / wifi / command_execution_time / vi_mode / proxy / todo /
+//! timewarrior / taskwarrior / nix_shell / vim_shell /
+//! midnight_commander.
+//!
+//! `~/forkedRepos/powerlevel10k/internal/p10k.zsh` is THE SPEC; ported
+//! lines are cited as `// p10k:NNN`. Segment SEMANTICS (states, colors,
+//! content, hide rules) mirror the zsh theme; the async worker layer
+//! (`_p9k_worker_invoke` + `_p9k_print_params` round-trips) collapses
+//! into synchronous reads behind a small TTL cache for the segments
+//! that fork (vm_stat, pmset, todo.sh); taskwarrior keeps p10k's own
+//! file-signature cache, persisted across shells.
+//!
+//! Per-segment notes:
+//! - battery: macOS `pmset -g batt` (p10k:1381-1406) and the Linux
+//!   /sys/class/power_supply reader (p10k:1409-1459) are both ported.
+//! - wifi: the Linux arm (/proc/net/wireless + `iw dev <iface> link`,
+//!   p10k:5230-5286) runs behind a 10s TTL. On macOS the segment
+//!   reads the airport CLI while it exists (p10k:5213-5228) and
+//!   CoreWLAN through the Objective-C runtime otherwise.
+//! - vi_mode: zshrs has no `vivis`/`vivli` keymaps (zsh core doesn't
+//!   either); VISUAL is detected as vicmd + region_active, exactly the
+//!   `vicmd1` arm of p10k:4203-4204.
+//! - todo: the todo file is discovered by sourcing the todo.txt config
+//!   in bash (p10k:8996-9017); the count is re-read when the file's
+//!   mtime changes.
+//!
+//! Scheme colours, typed `POWERLEVEL9K_*` reads, icon resolution and the
+//! segment constructor come from shared.rs; the caches and probes below
+//! are specific to this module.
+
+use crate::extensions::p10k::config::{p9k_global, p9k_param};
+use crate::extensions::p10k::icons;
+use crate::extensions::p10k::render::Segment;
+use crate::extensions::p10k::shared::{ttl_cached_bg, ttl_cached_fixed as cached_ttl};
+use crate::extensions::p10k::shared::{color1, color2, env_or_param, global_bool, global_int, global_float, esc_pct, decode_g, seg_icon, apply_visual_identifier, apply_content_expansion, make_segment};
+use crate::ported::params::{getaparam, getsparam, setsparam};
+use crate::ported::utils::getkeystring;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------
+
+/// Segment dispatch per the p10k module contract. `None` = not handled
+/// by this module; `Some(vec![])` = handled but hidden this prompt.
+pub fn build_segment(name: &str) -> Option<Vec<Segment>> {
+    match name {
+        "time" => Some(time_segments()),             // p10k:3454
+        "ram" => Some(ram_segments()),               // p10k:2689
+        "load" => Some(load_segments()),             // p10k:2342
+        "disk_usage" => Some(disk_usage_segments()), // p10k:1250
+        "swap" => Some(swap_segments()),             // p10k:3360
+        "battery" => Some(battery_segments()),       // p10k:1340
+        "wifi" => Some(wifi_segments()),             // p10k:5186
+        "command_execution_time" => Some(command_execution_time_segments()), // p10k:1705
+        "vi_mode" => Some(vi_mode_segments()),       // p10k:4169
+        "proxy" => Some(proxy_segments()),           // p10k:4970
+        "todo" => Some(todo_segments()),             // p10k:3520
+        "timewarrior" => Some(timewarrior_segments()), // p10k:5011
+        "taskwarrior" => Some(taskwarrior_segments()), // p10k:5155
+        "nix_shell" => Some(nix_shell_segments()),   // p10k:4925
+        "vim_shell" => Some(vim_shell_segments()),   // p10k:4911
+        "midnight_commander" => Some(midnight_commander_segments()), // p10k:4871
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Module helpers
+// ---------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+/// `$commands[name]` — locate an executable on $PATH (uncached; every
+/// caller sits behind a TTL cache or a cheap-file short-circuit).
+/// Mirrors segments_env::have_cmd's scan.
+/// Cache for [`cmd_on_path`], keyed on the whole `$PATH` so a changed
+/// `$PATH` drops every entry at once (what `rehash` does to zsh's
+/// command hash).
+///
+/// p10k gates each of these segments on `$commands[<tool>]`, which in zsh
+/// is the ALREADY-POPULATED command hash — an O(1) lookup. This port
+/// re-walked `$PATH` with a `stat()` per directory on EVERY prompt for
+/// EVERY gating segment. Measured on the author's shell: 53 `$PATH`
+/// entries x ~10 gating segments = ~500 `stat()` calls per frame, and
+/// `taskwarrior` cost 76ms of a 256ms frame with its OWN 30s TTL cache
+/// already warm — because the gate runs BEFORE the cache.
+///
+/// Negative results are cached too: a tool that is absent must not cost a
+/// full 53-directory walk on every prompt. That matches `$commands`,
+/// which also will not see a newly installed binary until a rehash; the
+/// TTL is the safety valve so one does appear without a shell restart.
+static CMD_PATH_CACHE: OnceLock<Mutex<(String, Instant, HashMap<String, Option<PathBuf>>)>> =
+    OnceLock::new();
+
+/// How long a `$PATH` lookup stands before it is re-walked. Long enough
+/// that a burst of prompts costs one walk, short enough that installing a
+/// tool shows up without restarting the shell.
+const CMD_PATH_TTL: Duration = Duration::from_secs(15);
+
+/// Latency cap for the blocking system-tool probes (`vm_stat`, `pmset`,
+/// `airport`, `iw`, `task`, ...): past it the child is killed and the
+/// segment renders empty instead of holding the prompt.
+const TOOL_BUDGET: Duration = Duration::from_millis(500);
+
+pub(crate) fn cmd_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = env_or_param("PATH");
+    let m = CMD_PATH_CACHE.get_or_init(|| Mutex::new((String::new(), Instant::now(), HashMap::new())));
+    if let Ok(mut g) = m.lock() {
+        if g.0 != path_var || g.1.elapsed() >= CMD_PATH_TTL {
+            g.0 = path_var.clone();
+            g.1 = Instant::now();
+            g.2.clear();
+        } else if let Some(hit) = g.2.get(name) {
+            return hit.clone();
+        }
+    }
+    let mut found = None;
+    for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+        let cand = std::path::Path::new(dir).join(name);
+        let is_exec = std::fs::metadata(&cand)
+            .map(|md| {
+                use std::os::unix::fs::PermissionsExt;
+                md.is_file() && md.permissions().mode() & 0o111 != 0
+            })
+            .unwrap_or(false);
+        if is_exec {
+            found = Some(cand);
+            break;
+        }
+    }
+    if let Ok(mut g) = m.lock() {
+        // Only publish against the `$PATH` this walk actually used.
+        if g.0 == path_var {
+            g.2.insert(name.to_string(), found.clone());
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------
+// Subprocess runner (TTL cache: shared::ttl_cached*)
+// ---------------------------------------------------------------------
+
+/// Run an external command, stdout as a string (stderr dropped — the
+/// zsh originals all `2>/dev/null`). None on spawn failure or non-zero
+/// exit, or when the child outlives `TOOL_BUDGET` (killed and reaped).
+fn run_tool(bin: &std::path::Path, args: &[&str]) -> Option<String> {
+    crate::extensions::p10k::shared::run_tool_budget(bin, args, None, TOOL_BUDGET, true)
+}
+
+// ---------------------------------------------------------------------
+// Pure formatters (ported; unit-tested below)
+// ---------------------------------------------------------------------
+
+/// Port of `_p9k_human_readable_bytes` (p10k:327-343).
+fn human_readable_bytes(bytes: f64) -> String {
+    // p10k:322 — __p9k_byte_suffix=('B' 'K' 'M' 'G' 'T' 'P' 'E' 'Z' 'Y')
+    const SUFFIX: [&str; 9] = ["B", "K", "M", "G", "T", "P", "E", "Z", "Y"];
+    let mut n = bytes;
+    let mut suf = SUFFIX[0];
+    for s in SUFFIX {
+        suf = s;
+        // p10k:331 — (( n < 1024 )) && break
+        if n < 1024.0 {
+            break;
+        }
+        n /= 1024.0; // p10k:332
+    }
+    let mut ret = if n >= 100.0 {
+        format!("{n:.0}.") // p10k:335 — printf '%.0f.' (dot guards the zeros)
+    } else if n >= 10.0 {
+        format!("{n:.1}") // p10k:337
+    } else {
+        format!("{n:.2}") // p10k:339
+    };
+    // p10k:341 — ${${_p9k__ret%%0#}%.}: strip trailing zeros, then dot.
+    while ret.ends_with('0') {
+        ret.pop();
+    }
+    if ret.ends_with('.') {
+        ret.pop();
+    }
+    format!("{ret}{suf}")
+}
+
+/// The duration formatter inlined in `prompt_command_execution_time`
+/// (p10k:1709-1744). `precision` = COMMAND_EXECUTION_TIME_PRECISION,
+/// `format` = COMMAND_EXECUTION_TIME_FORMAT ("H:M:S" or "d h m s").
+fn human_readable_duration(seconds: f64, precision: usize, format: &str) -> String {
+    if seconds < 60.0 {
+        // p10k:1710-1715
+        if precision == 0 {
+            // p10k:1712 — local -i sec=$((P + 0.5)): add-then-truncate.
+            let sec = (seconds + 0.5) as i64;
+            format!("{sec}s")
+        } else {
+            // p10k:1714 — typeset -F $PRECISION sec prints fixed decimals.
+            format!("{seconds:.precision$}s")
+        }
+    } else {
+        // p10k:1718 — local -i d=$((P + 0.5))
+        let d = (seconds + 0.5) as i64;
+        if format == "H:M:S" {
+            // p10k:1719-1729
+            let mut text = format!("{:02}", d % 60); // p10k:1720 ${(l.2..0.)...}
+            if d >= 60 {
+                text = format!("{:02}:{text}", d / 60 % 60); // p10k:1722
+                if d >= 36000 {
+                    text = format!("{}:{text}", d / 3600); // p10k:1724
+                } else if d >= 3600 {
+                    text = format!("0{}:{text}", d / 3600); // p10k:1726
+                }
+            }
+            text
+        } else {
+            // p10k:1730-1741 — "d h m s"
+            let mut text = format!("{}s", d % 60); // p10k:1731
+            if d >= 60 {
+                text = format!("{}m {text}", d / 60 % 60); // p10k:1733
+                if d >= 3600 {
+                    text = format!("{}h {text}", d / 3600 % 24); // p10k:1735
+                    if d >= 86400 {
+                        text = format!("{}d {text}", d / 86400); // p10k:1737
+                    }
+                }
+            }
+            text
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// time (p10k:3451-3468)
+// ---------------------------------------------------------------------
+
+fn time_segments() -> Vec<Segment> {
+    // p10k:7556 — _p9k_declare -e POWERLEVEL9K_TIME_FORMAT "%D{%H:%M:%S}".
+    let fmt = decode_g(&p9k_global("TIME_FORMAT", "%D{%H:%M:%S}"));
+    // p10k:3498 — EXPERIMENTAL_TIME_REALTIME hands the raw format to the
+    // prompt expander, so every repaint shows the current time.
+    let content = if global_bool("EXPERIMENTAL_TIME_REALTIME", false) {
+        fmt
+    } else {
+        // p10k:3502-3508 — `_p9k__time` is snapshotted on precmd only
+        // (`${${(%)fmt}//\%/%%}`); other re-renders reuse it.
+        static SNAPSHOT: Mutex<String> = Mutex::new(String::new());
+        let mut snap = SNAPSHOT.lock().unwrap();
+        if crate::p10k::refresh_is_precmd() || snap.is_empty() {
+            let (expanded, _, _) = crate::ported::prompt::promptexpand(&fmt, 0, None);
+            *snap = expanded.replace('%', "%%");
+        }
+        // p10k:3509-3514 — TIME_UPDATE_ON_COMMAND (default 0, p10k:7560):
+        // once the line is finished the format itself is emitted so the
+        // finishing repaint shows the time the command was run.
+        if global_bool("TIME_UPDATE_ON_COMMAND", false) && crate::p10k::line_finished() {
+            fmt
+        } else {
+            snap.clone()
+        }
+    };
+    // p10k:3516 — `$0 "$_p9k_color2" "$_p9k_color1" "TIME_ICON" …`
+    vec![make_segment(
+        "time",
+        None,
+        color2(),
+        color1(),
+        "TIME_ICON",
+        content,
+    )]
+}
+
+// ---------------------------------------------------------------------
+// vi_mode (p10k:4169-4210)
+// ---------------------------------------------------------------------
+
+fn vi_mode_segments() -> Vec<Segment> {
+    // _p9k__keymap is captured from $KEYMAP in p10k's zle-line-init;
+    // here the live ZLE keymap name answers directly.
+    let keymap = crate::ported::zle::zle_keymap::curkeymapname().clone();
+    // p10k:7500-7505 — mode strings; INSERT/COMMAND have declared
+    // defaults, VISUAL/OVERWRITE exist only when the user sets them.
+    let insert_str = decode_g(
+        &getsparam("POWERLEVEL9K_VI_INSERT_MODE_STRING").unwrap_or_else(|| "INSERT".into()),
+    );
+    let command_str = decode_g(
+        &getsparam("POWERLEVEL9K_VI_COMMAND_MODE_STRING").unwrap_or_else(|| "NORMAL".into()),
+    );
+    let visual_str = getsparam("POWERLEVEL9K_VI_VISUAL_MODE_STRING");
+    let overwrite_str = getsparam("POWERLEVEL9K_VI_OVERWRITE_MODE_STRING");
+
+    if keymap == "vicmd" {
+        // p10k:4203-4204 — with VISUAL string set: vicmd + region==1 is
+        // VISUAL, vicmd + region==0 is NORMAL (the `vicmd1`/`vicmd0`
+        // patterns; no vivis/vivli keymaps in zshrs — module doc).
+        if let Some(v) = &visual_str {
+            if crate::ported::zle::zle_params::get_region_active() != 0 {
+                return vec![make_segment(
+                    "vi_mode",
+                    Some("VISUAL"),
+                    color1(),
+                    "white",
+                    "",
+                    decode_g(v),
+                )];
+            }
+        }
+        // p10k:4203/4206 — `$0_NORMAL "$_p9k_color1" white '' … COMMAND_MODE_STRING`
+        vec![make_segment(
+            "vi_mode",
+            Some("NORMAL"),
+            color1(),
+            "white",
+            "",
+            command_str,
+        )]
+    } else {
+        // p10k:4192-4195 — with OVERWRITE string set, an insert-family
+        // keymap in overwrite state shows OVERWRITE. _p9k__zle_state's
+        // insert/overwrite bit is zle_main::INSMODE (Src/Zle/zle_main.c
+        // insmode; 0 == overwrite).
+        if let Some(o) = &overwrite_str {
+            if crate::ported::zle::zle_main::INSMODE.load(Ordering::Relaxed) == 0 {
+                return vec![make_segment(
+                    "vi_mode",
+                    Some("OVERWRITE"),
+                    color1(),
+                    "blue",
+                    "",
+                    decode_g(o),
+                )];
+            }
+        }
+        // p10k:4197 — INSERT only when the string is non-empty.
+        if insert_str.is_empty() {
+            return vec![];
+        }
+        // p10k:4198 — `$0_INSERT "$_p9k_color1" blue '' … INSERT_MODE_STRING`
+        vec![make_segment(
+            "vi_mode",
+            Some("INSERT"),
+            color1(),
+            "blue",
+            "",
+            insert_str,
+        )]
+    }
+}
+
+// ---------------------------------------------------------------------
+// command_execution_time (p10k:1705-1747)
+// ---------------------------------------------------------------------
+
+fn command_execution_time_segments() -> Vec<Segment> {
+    // p10k:1706 — (( $+P9K_COMMAND_DURATION_SECONDS )) || return.
+    let Some(dur) = crate::p10k::last_exec_duration() else {
+        return vec![];
+    };
+    let secs = dur.as_secs_f64();
+    // p10k:1707 + 7307 — threshold, float, default 3.
+    if secs < global_float("COMMAND_EXECUTION_TIME_THRESHOLD", 3.0) {
+        return vec![];
+    }
+    // p10k:7308 — precision default 2; p10k:7310 — format default H:M:S.
+    let precision = global_int("COMMAND_EXECUTION_TIME_PRECISION", 2).max(0) as usize;
+    let fmt = p9k_global("COMMAND_EXECUTION_TIME_FORMAT", "H:M:S");
+    let text = human_readable_duration(secs, precision, &fmt);
+    // p10k:1746 — `$0 "red" "yellow1" 'EXECUTION_TIME_ICON' 0 '' $text`
+    vec![make_segment(
+        "command_execution_time",
+        None,
+        "red",
+        "yellow1",
+        "EXECUTION_TIME_ICON",
+        text,
+    )]
+}
+
+// ---------------------------------------------------------------------
+// load (p10k:2342-2364)
+// ---------------------------------------------------------------------
+
+/// `_p9k_num_cpus` (p10k:8436-8440): hw.logicalcpu on macOS, nproc on
+/// Linux — both logical-CPU counts, which is exactly what
+/// available_parallelism reports. Fork-free.
+fn num_cpus() -> f64 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as f64)
+        .unwrap_or(1.0) // p10k:8440 — (( _p9k_num_cpus )) || _p9k_num_cpus=1
+}
+
+fn load_segments() -> Vec<Segment> {
+    // getloadavg(3) replaces both data sources: `sysctl vm.loadavg`
+    // (p10k:2383) on macOS and /proc/loadavg (p10k:2352-2354) on Linux.
+    let mut avg = [0f64; 3];
+    if unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) } != 3 {
+        tracing::warn!(target: "p10k", "getloadavg failed — load segment hidden");
+        return vec![];
+    }
+    // p10k:7405-7410 — LOAD_WHICH (default 5): 1→1min, 15→15min,
+    // anything else→5min (the 1-based field-index remap).
+    let idx = match global_int("LOAD_WHICH", 5) {
+        1 => 0,
+        15 => 2,
+        _ => 1,
+    };
+    let load = avg[idx];
+    // p10k:2355/2390 — pct = 100. * load / _p9k_num_cpus.
+    let pct = 100.0 * load / num_cpus();
+    // p10k:2356-2361 + 7411-7412 — WARNING_PCT 50, CRITICAL_PCT 70.
+    let (state, bg) = if pct > global_float("LOAD_CRITICAL_PCT", 70.0) {
+        ("CRITICAL", "red") // p10k:2345/2357
+    } else if pct > global_float("LOAD_WARNING_PCT", 50.0) {
+        ("WARNING", "yellow") // p10k:2346/2359
+    } else {
+        ("NORMAL", "green") // p10k:2347/2361
+    };
+    // Two decimals matches both zsh data sources verbatim (sysctl
+    // vm.loadavg and /proc/loadavg print %.2f).
+    vec![make_segment(
+        "load",
+        Some(state),
+        bg,
+        color1(),
+        "LOAD_ICON",
+        format!("{load:.2}"),
+    )]
+}
+
+// ---------------------------------------------------------------------
+// ram (p10k:2689-2748)
+// ---------------------------------------------------------------------
+
+/// macOS available-RAM: `vm_stat` free+inactive pages × pagesize
+/// (p10k:2715-2727), 10s TTL replacing the worker refresh loop.
+#[cfg(target_os = "macos")]
+fn ram_free_bytes() -> Option<f64> {
+    // Binary resolved here: the refresh runs on a background thread
+    // and must not touch shell state.
+    let vm_stat = cmd_on_path("vm_stat");
+    let out = ttl_cached_bg("ram.vm_stat", move || {
+        (Duration::from_secs(10), vm_stat.and_then(|bin| run_tool(&bin, &[])))
+    })?;
+    fn pages(out: &str, key: &str) -> Option<f64> {
+        // vm_stat lines: "Pages free:               123456."
+        let rest = out.lines().find_map(|l| l.strip_prefix(key))?;
+        rest.trim().trim_end_matches('.').parse::<f64>().ok()
+    }
+    // p10k:2717-2720 — Pages free + Pages inactive.
+    let free = pages(&out, "Pages free:")? + pages(&out, "Pages inactive:")?;
+    // p10k:2721-2726 — pagesize via the `pagesize` tool, default 4096;
+    // sysconf(_SC_PAGESIZE) is the same value without the fork.
+    let pagesize = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as f64,
+        _ => 4096.0,
+    };
+    Some(free * pagesize)
+}
+
+/// Linux available-RAM: /proc/meminfo MemAvailable (MemFree fallback),
+/// kB → bytes (p10k:2734-2738).
+#[cfg(not(target_os = "macos"))]
+fn ram_free_bytes() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let avail = meminfo_kb(&stat, "MemAvailable:").or_else(|| meminfo_kb(&stat, "MemFree:"))?;
+    Some(avail * 1024.0) // p10k:2738 — match[2] * 1024
+}
+
+/// /proc/meminfo field in kB — "MemAvailable:    12345 kB".
+#[cfg(not(target_os = "macos"))]
+fn meminfo_kb(stat: &str, key: &str) -> Option<f64> {
+    let rest = stat.lines().find_map(|l| l.strip_prefix(key))?;
+    rest.trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse::<f64>()
+        .ok()
+}
+
+fn ram_segments() -> Vec<Segment> {
+    let Some(free) = ram_free_bytes() else {
+        return vec![]; // p10k:2691 cond '$_p9k__ram_free' — hidden on failure
+    };
+    // p10k:2691 — `$0 yellow "$_p9k_color1" RAM_ICON …`
+    vec![make_segment(
+        "ram",
+        None,
+        "yellow",
+        color1(),
+        "RAM_ICON",
+        human_readable_bytes(free),
+    )]
+}
+
+// ---------------------------------------------------------------------
+// swap (p10k:3360-3407)
+// ---------------------------------------------------------------------
+
+/// macOS swap-used: sysctlbyname("vm.swapusage") xsu_used — the same
+/// value p10k regex-parses out of `sysctl vm.swapusage` "used = …"
+/// (p10k:3384-3392), read as the struct instead of a fork.
+#[cfg(target_os = "macos")]
+fn swap_used_bytes() -> Option<f64> {
+    let name = std::ffi::CString::new("vm.swapusage").ok()?;
+    let mut xsw: libc::xsw_usage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::xsw_usage>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut xsw as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some(xsw.xsu_used as f64)
+}
+
+/// Linux swap-used: /proc/meminfo SwapTotal − SwapFree, kB → bytes
+/// (p10k:3394-3400).
+#[cfg(not(target_os = "macos"))]
+fn swap_used_bytes() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let total = meminfo_kb(&stat, "SwapTotal:")?;
+    let free = meminfo_kb(&stat, "SwapFree:")?;
+    Some((total - free) * 1024.0)
+}
+
+fn swap_segments() -> Vec<Segment> {
+    let Some(used) = swap_used_bytes() else {
+        return vec![]; // p10k:3362 cond '$_p9k__swap_used'
+    };
+    // p10k:3362 — `$0 yellow "$_p9k_color1" SWAP_ICON …`
+    vec![make_segment(
+        "swap",
+        None,
+        "yellow",
+        color1(),
+        "SWAP_ICON",
+        human_readable_bytes(used),
+    )]
+}
+
+// ---------------------------------------------------------------------
+// disk_usage (p10k:1250-1292)
+// ---------------------------------------------------------------------
+
+fn disk_usage_segments() -> Vec<Segment> {
+    // p10k:1274 — `df -P $cwd`, capacity column = ceil(100*used/(used+avail));
+    // statvfs(2) on the logical cwd is the fork-free equivalent.
+    let cwd = env_or_param("PWD");
+    let cwd = if cwd.is_empty() { ".".to_string() } else { cwd };
+    let Ok(c) = std::ffi::CString::new(cwd) else {
+        return vec![];
+    };
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
+        return vec![]; // p10k:1275 — a non-<0-100> parse hides the segment
+    }
+    let used = (vfs.f_blocks as u64).saturating_sub(vfs.f_bfree as u64);
+    let total = used + vfs.f_bavail as u64;
+    if total == 0 {
+        return vec![];
+    }
+    let pct = (used * 100).div_ceil(total) as i64; // df -P rounds up
+                                                   // p10k:1279-1285 + 7263-7265 — WARNING 90, CRITICAL 95, ONLY_WARNING.
+    let (state, bg, fg): (&str, &str, &str) = if pct >= global_int("DISK_USAGE_CRITICAL_LEVEL", 95)
+    {
+        ("CRITICAL", "red", "white") // p10k:1252
+    } else if pct >= global_int("DISK_USAGE_WARNING_LEVEL", 90) {
+        ("WARNING", "yellow", color1()) // p10k:1253
+    } else if !global_bool("DISK_USAGE_ONLY_WARNING", false) {
+        ("NORMAL", color1(), "yellow") // p10k:1255
+    } else {
+        return vec![]; // p10k:1254 — NORMAL suppressed under ONLY_WARNING
+    };
+    vec![make_segment(
+        "disk_usage",
+        Some(state),
+        bg,
+        fg,
+        "DISK_ICON",
+        format!("{pct}%%"), // p10k:1252 — '$_p9k__disk_usage_pct%%'
+    )]
+}
+
+// ---------------------------------------------------------------------
+// battery (p10k:1340-1497)
+// ---------------------------------------------------------------------
+
+/// Battery array param with the `<STATE>` → base fallback p10k builds
+/// at declare time (p10k:7269-7285). `split_scalar` mirrors the STAGES
+/// scalar form `("${(@s::)${(g::)...}}")` (p10k:7272) — a scalar
+/// splits to one glyph per character.
+fn battery_arr(state: &str, key: &str, split_scalar: bool) -> Vec<String> {
+    for name in [
+        format!("POWERLEVEL9K_BATTERY_{state}_{key}"),
+        format!("POWERLEVEL9K_BATTERY_{key}"),
+    ] {
+        if let Some(v) = getaparam(&name) {
+            return v.iter().map(|s| decode_g(s)).collect(); // p10k:7273 (@g::)
+        }
+        if let Some(s) = getsparam(&name) {
+            if split_scalar {
+                return decode_g(&s).chars().map(String::from).collect();
+            }
+            return vec![decode_g(&s)];
+        }
+    }
+    Vec::new()
+}
+
+/// p10k:1472-1474/1480-1482/1488-1490 — pick from a level array:
+/// idx = len when pct==100, else pct*len/100 + 1 (1-based).
+fn battery_level_pick(arr: &[String], pct: i64) -> Option<String> {
+    if arr.is_empty() {
+        return None;
+    }
+    let mut idx = arr.len() as i64;
+    if pct < 100 {
+        idx = pct * arr.len() as i64 / 100 + 1;
+    }
+    arr.get((idx - 1).max(0) as usize).cloned()
+}
+
+/// macOS battery probe — `pmset -g batt` second line (p10k:1381-1406),
+/// 30s TTL. Returns (state, percent, remain).
+#[cfg(target_os = "macos")]
+fn battery_status() -> Option<(&'static str, i64, String)> {
+    let pmset = cmd_on_path("pmset");
+    let raw = ttl_cached_bg("battery.pmset", move || {
+        let line = pmset.and_then(|bin| run_tool(&bin, &["-g", "batt"])).and_then(|out| {
+            // p10k:1383 — ${${(Af)"$(pmset -g batt)"}[2]}: the second line.
+            out.lines().nth(1).map(str::to_string)
+        });
+        (Duration::from_secs(30), line)
+    })?;
+    // p10k:1384 — [[ $raw_data == *InternalBattery* ]] || return
+    if !raw.contains("InternalBattery") {
+        return None; // no battery (desktop) — hidden
+    }
+    let fields: Vec<&str> = raw.split("; ").collect();
+    // p10k:1385-1386 — remain = first word of field 3; *no* → "...".
+    let mut remain = fields
+        .get(2)
+        .and_then(|f| f.split_whitespace().next())
+        .unwrap_or("")
+        .to_string();
+    if remain.contains("no") {
+        remain = "...".to_string();
+    }
+    // p10k:1387 — [[ $raw_data =~ '([0-9]+)%' ]]: the digit run
+    // ending at the first '%'.
+    let pos = raw.find('%')?;
+    let digits: &str = &raw[..pos];
+    let start = digits
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map(|i| i + digits[i..].chars().next().map_or(1, |c| c.len_utf8()))
+        .unwrap_or(0);
+    let bat_percent: i64 = digits[start..].parse().ok()?;
+    // p10k:1389-1405 — state ladder from field 2.
+    let state = match fields.get(1).copied().unwrap_or("") {
+        "charging" | "finishing charge" | "AC attached" => {
+            if bat_percent == 100 {
+                remain.clear(); // p10k:1392-1394
+                "CHARGED"
+            } else {
+                "CHARGING" // p10k:1396
+            }
+        }
+        "discharging" => {
+            // p10k:1400 + 7266 — LOW_THRESHOLD default 10.
+            if bat_percent < global_int("BATTERY_LOW_THRESHOLD", 10) {
+                "LOW"
+            } else {
+                "DISCONNECTED"
+            }
+        }
+        _ => {
+            remain.clear(); // p10k:1402-1404
+            "CHARGED"
+        }
+    };
+    Some((state, bat_percent, remain))
+}
+
+/// `_p9k_read_file` (p10k:1300-1304) over an alternation glob: zsh
+/// expands `(a|b|c)(N)` in name-sorted order and _p9k_read_file reads
+/// ONLY `$1` — the first existing file wins, with no fallthrough to
+/// the next name when the read fails or the first line is empty.
+/// Callers pass `names` pre-sorted to match glob order.
+#[cfg(not(target_os = "macos"))]
+fn read_file_first(dir: &std::path::Path, names: &[&str]) -> Option<String> {
+    let path = names.iter().map(|n| dir.join(n)).find(|p| p.exists())?;
+    // p10k:1302 — IFS='' read -r: the first line, newline stripped.
+    let content = std::fs::read_to_string(path).ok()?;
+    let line = content.lines().next().unwrap_or("").to_string();
+    // p10k:1303 — [[ -n $_p9k__ret ]]
+    (!line.is_empty()).then_some(line)
+}
+
+/// read_file_first + integer parse. zsh assigns the raw string to a
+/// `local -i`; non-numeric sysfs content (never observed) is treated
+/// as an absent file instead of a math error.
+#[cfg(not(target_os = "macos"))]
+fn read_file_int(dir: &std::path::Path, names: &[&str]) -> Option<i64> {
+    read_file_first(dir, names)?.trim().parse::<i64>().ok()
+}
+
+/// Linux battery: the /sys/class/power_supply reader, the
+/// `Linux|Android` arm of `_p9k_prompt_battery_set_args`
+/// (p10k:1408-1459). Pure sysfs reads — no fork, no cache needed.
+#[cfg(not(target_os = "macos"))]
+fn battery_status() -> Option<(&'static str, i64, String)> {
+    // p10k:1409 — See https://sourceforge.net/projects/acpiclient.
+    // p10k:1410 — bats=( /sys/class/power_supply/(CMB*|BAT*|battery)/(FN) ):
+    // the trailing `/` resolves the sysfs symlinks, (F) keeps non-empty
+    // directories (is_dir() follows the symlink; sysfs battery dirs are
+    // never empty), sorted in glob (name) order.
+    let rd = std::fs::read_dir("/sys/class/power_supply").ok()?;
+    let mut bats: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.starts_with("CMB") || n.starts_with("BAT") || n == "battery"
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    bats.sort();
+    // p10k:1411 — (( $#bats )) || return
+    if bats.is_empty() {
+        return None;
+    }
+
+    // p10k:1413-1414 — accumulators (`is_charching` sic, the spec's
+    // spelling).
+    let mut energy_now: i64 = 0;
+    let mut energy_full: i64 = 0;
+    let mut power_now: i64 = 0;
+    let mut is_full = true;
+    let mut is_calculating = false;
+    let mut is_charching = false;
+    for dir in &bats {
+        // p10k:1417 — local -i pow=0 full=0
+        let mut pow: i64 = 0;
+        let mut full: i64 = 0;
+        // p10k:1418-1420 — (energy_full|charge_full|charge_counter)(N)
+        // in glob order: charge_counter, charge_full, energy_full.
+        if let Some(v) = read_file_int(dir, &["charge_counter", "charge_full", "energy_full"]) {
+            full = v;
+            energy_full += v; // p10k:1419
+        }
+        // p10k:1421-1423 — (power|current)_now(N) (glob order:
+        // current_now, power_now), only when the RAW STRING is shorter
+        // than 9 chars: (( $#_p9k__ret < 9 )) filters bogus readings.
+        if let Some(s) = read_file_first(dir, &["current_now", "power_now"]) {
+            if s.len() < 9 {
+                if let Ok(v) = s.trim().parse::<i64>() {
+                    pow = v;
+                    power_now += v; // p10k:1422
+                }
+            }
+        }
+        if let Some(cap) = read_file_int(dir, &["capacity"]) {
+            // p10k:1424-1425 — (( energy_now += ret * full / 100. + 0.5 )):
+            // float math, truncated on store into the `local -i`.
+            energy_now = (energy_now as f64 + cap as f64 * full as f64 / 100.0 + 0.5) as i64;
+        } else if let Some(v) = read_file_int(dir, &["charge_now", "energy_now"]) {
+            energy_now += v; // p10k:1426-1427
+        }
+        // p10k:1429 — status unreadable → `|| continue` (skip the flag
+        // updates; the energy sums above are already accumulated).
+        let Some(bat_status) = read_file_first(dir, &["status"]) else {
+            continue;
+        };
+        if bat_status != "Full" {
+            is_full = false; // p10k:1430
+        }
+        if bat_status == "Charging" {
+            is_charching = true; // p10k:1431
+        }
+        if (bat_status == "Charging" || bat_status == "Discharging") && pow == 0 {
+            is_calculating = true; // p10k:1432
+        }
+    }
+
+    // p10k:1435 — (( energy_full )) || return
+    if energy_full == 0 {
+        return None;
+    }
+    // p10k:1437 — bat_percent=$(( 100. * energy_now / energy_full + 0.5 )):
+    // float, truncated into the `local -i`.
+    let mut bat_percent = (100.0 * energy_now as f64 / energy_full as f64 + 0.5) as i64;
+    // p10k:1438 — (( bat_percent > 100 )) && bat_percent=100
+    if bat_percent > 100 {
+        bat_percent = 100;
+    }
+
+    let mut remain = String::new();
+    let state: &'static str;
+    if is_full || (bat_percent == 100 && is_charching) {
+        state = "CHARGED"; // p10k:1440-1441
+    } else {
+        state = if is_charching {
+            "CHARGING" // p10k:1443-1444
+        } else if bat_percent < global_int("BATTERY_LOW_THRESHOLD", 10) {
+            "LOW" // p10k:1445 + 7266
+        } else {
+            "DISCONNECTED" // p10k:1448
+        };
+        if power_now > 0 {
+            // p10k:1451-1452 — remaining energy: to-full when charging,
+            // to-empty when discharging.
+            let e = if is_charching {
+                energy_full - energy_now
+            } else {
+                energy_now
+            };
+            let minutes = 60 * e / power_now; // p10k:1453
+            if minutes > 0 {
+                // p10k:1454 — $((minutes/60)):${(l#2##0#)$((minutes%60))}
+                remain = format!("{}:{:02}", minutes / 60, minutes % 60);
+            }
+        } else if is_calculating {
+            remain = "...".to_string(); // p10k:1455-1456
+        }
+    }
+    Some((state, bat_percent, remain))
+}
+
+fn battery_segments() -> Vec<Segment> {
+    let Some((state, bat_percent, remain)) = battery_status() else {
+        return vec![];
+    };
+    // p10k:1462 + 7267/7278 — per-state HIDE_ABOVE_THRESHOLD, default
+    // from the base param, default 999.
+    let base_hide = global_int("BATTERY_HIDE_ABOVE_THRESHOLD", 999);
+    if bat_percent >= global_int(&format!("BATTERY_{state}_HIDE_ABOVE_THRESHOLD"), base_hide) {
+        return vec![];
+    }
+    // p10k:1464-1465 — msg; VERBOSE (default 1, p10k:7268) appends
+    // " (remain)".
+    let mut msg = format!("{bat_percent}%%");
+    if global_bool("BATTERY_VERBOSE", true) && !remain.is_empty() {
+        msg.push_str(&format!(" ({remain})"));
+    }
+    // p10k:1470-1476 — a STAGES glyph beats BATTERY_ICON.
+    let stage = battery_level_pick(&battery_arr(state, "STAGES", true), bat_percent);
+    let icon_glyph = match &stage {
+        Some(g) => g.clone(),
+        None => seg_icon("battery", Some(state), "BATTERY_ICON"),
+    };
+    // p10k:1478-1483 — LEVEL_BACKGROUND array, else color1.
+    let default_bg =
+        battery_level_pick(&battery_arr(state, "LEVEL_BACKGROUND", false), bat_percent)
+            .unwrap_or_else(|| color1().to_string());
+    // p10k:1486-1491 + 8403-8408 — LEVEL_FOREGROUND array, else the
+    // _p9k_battery_states color.
+    let state_fg = match state {
+        "LOW" => "red",
+        "CHARGING" => "yellow",
+        "CHARGED" => "green",
+        _ => color2(), // DISCONNECTED — p10k:8407 "$_p9k_color2"
+    };
+    let default_fg =
+        battery_level_pick(&battery_arr(state, "LEVEL_FOREGROUND", false), bat_percent)
+            .unwrap_or_else(|| state_fg.to_string());
+    // p10k:1495 — `prompt_battery_$state "$bg" "$fg" $icon 0 '' $msg`.
+    // Built directly (not make_segment) because the icon is a resolved
+    // glyph, not a key.
+    let bg = p9k_param("battery", Some(state), "BACKGROUND", &default_bg);
+    let fg = p9k_param("battery", Some(state), "FOREGROUND", &default_fg);
+    let icon = apply_visual_identifier("battery", Some(state), icon_glyph);
+    let content = apply_content_expansion("battery", Some(state), msg);
+    vec![Segment {
+        name: "battery".to_string(),
+        state: Some(state.to_string()),
+        content,
+        icon,
+        fg,
+        bg,
+    }]
+}
+
+// ---------------------------------------------------------------------
+// wifi (p10k:5186-5240)
+// ---------------------------------------------------------------------
+
+/// p10k:5240-5244 — the single connected interface out of
+/// /proc/net/wireless: drop the two `|` header lines, require exactly
+/// one data line, validate `iface: state rssi noise` field shapes.
+/// Returns (iface, rssi, noise).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn parse_proc_wireless(content: &str) -> Option<(String, String, String)> {
+    // p10k:5237 — lines=(${${(f)...}:#*\|*}): filter out header lines.
+    let lines: Vec<&str> = content.lines().filter(|l| !l.contains('|')).collect();
+    // p10k:5238 — (( $#lines == 1 )) || return
+    if lines.len() != 1 {
+        return None;
+    }
+    // p10k:5239 — parts=(${=lines[1]}).
+    let parts: Vec<&str> = lines[0].split_whitespace().collect();
+    // p10k:5240-5243 — iface=${parts[1]%:}; state=$parts[2];
+    // rssi=${parts[4]%.*}; noise=${parts[5]%.*} (strip from the LAST dot).
+    let strip_dot = |s: &str| match s.rfind('.') {
+        Some(i) => s[..i].to_string(),
+        None => s.to_string(),
+    };
+    let raw_iface = parts.first()?;
+    let iface = raw_iface.strip_suffix(':').unwrap_or(raw_iface); // ${parts[1]%:}
+    let state = parts.get(1)?;
+    let rssi = strip_dot(parts.get(3)?);
+    let noise = strip_dot(parts.get(4)?);
+    // p10k:5244 — [[ -n $iface && $state == 0## && $rssi == (0|-<->) &&
+    // $noise == (0|-<->) ]] || return.
+    let zero_or_neg = |s: &str| {
+        s == "0"
+            || (s.len() > 1 && s.starts_with('-') && s[1..].bytes().all(|b| b.is_ascii_digit()))
+    };
+    if iface.is_empty()
+        || state.is_empty()
+        || !state.bytes().all(|b| b == b'0')
+        || !zero_or_neg(&rssi)
+        || !zero_or_neg(&noise)
+    {
+        return None;
+    }
+    Some((iface.to_string(), rssi, noise))
+}
+
+/// p10k:5259-5269 — SSID and tx bitrate out of `iw dev <iface> link`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn parse_iw_link(out: &str) -> Option<(String, String)> {
+    let mut ssid = String::new();
+    let mut last_tx_rate = String::new();
+    for line in out.lines() {
+        let t = line.trim_start();
+        // p10k:5262-5263 — [[:space:]]#SSID:[[:space:]]##(*)
+        if let Some(rest) = t.strip_prefix("SSID:") {
+            if rest.starts_with(char::is_whitespace) {
+                ssid = rest.trim_start().to_string();
+            }
+        // p10k:5264-5266 — 'tx bitrate:'[[:space:]]##([^[:space:]]##)' MBit/s'*
+        } else if let Some(rest) = t.strip_prefix("tx bitrate:") {
+            let rest = rest.trim_start();
+            if let Some(tok) = rest.split_whitespace().next() {
+                if rest[tok.len()..].starts_with(" MBit/s") {
+                    last_tx_rate = tok.to_string();
+                    // p10k:5266 — <->.<-> only: ${${rate%%0#}%.} (strip
+                    // trailing zeros, then the dot).
+                    if let Some((a, b)) = last_tx_rate.split_once('.') {
+                        let digits =
+                            |s: &str| !s.is_empty() && s.bytes().all(|c: u8| c.is_ascii_digit());
+                        if digits(a) && digits(b) {
+                            while last_tx_rate.ends_with('0') {
+                                last_tx_rate.pop();
+                            }
+                            if last_tx_rate.ends_with('.') {
+                                last_tx_rate.pop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // p10k:5269 — [[ -n $ssid && -n $last_tx_rate ]] || return
+    if ssid.is_empty() || last_tx_rate.is_empty() {
+        return None;
+    }
+    Some((ssid, last_tx_rate))
+}
+
+/// p10k:5275-5286 — signal bars from the SNR margin (rssi - noise).
+fn wifi_bars(snr_margin: i64) -> i64 {
+    // p10k:5273-5274 — speedguide.net / wireless-nets.com SNR ratings.
+    if snr_margin >= 40 {
+        4
+    } else if snr_margin >= 25 {
+        3
+    } else if snr_margin >= 15 {
+        2
+    } else if snr_margin >= 10 {
+        1
+    } else {
+        0
+    }
+}
+
+/// p10k:5213 — the private Apple80211 `airport` CLI (present through
+/// macOS 14.3; removed afterwards).
+#[cfg(target_os = "macos")]
+const AIRPORT: &str =
+    "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+
+/// p10k:5214-5227 — `airport -I` parse. Requires `state: running` and
+/// numeric rssi/noise (p10k:5228). Returns (ssid, last_tx_rate, rssi, noise).
+#[cfg(target_os = "macos")]
+fn parse_airport(out: &str) -> Option<(String, String, String, String)> {
+    let (mut ssid, mut rate, mut rssi, mut noise, mut state) =
+        (String::new(), String::new(), String::new(), String::new(), String::new());
+    for line in out.lines() {
+        // p10k:5216-5218 — `v=${line#*: }`; key = text before that `: `.
+        let Some((k, v)) = line.trim().split_once(": ") else {
+            continue;
+        };
+        match k {
+            "agrCtlRSSI" => rssi = v.to_string(),
+            "agrCtlNoise" => noise = v.to_string(),
+            "state" => state = v.to_string(),
+            "lastTxRate" => rate = v.to_string(),
+            "SSID" => ssid = v.to_string(),
+            _ => {}
+        }
+    }
+    let zero_or_neg = |s: &str| {
+        s == "0"
+            || (s.len() > 1 && s.starts_with('-') && s[1..].bytes().all(|b| b.is_ascii_digit()))
+    };
+    (state == "running" && zero_or_neg(&rssi) && zero_or_neg(&noise))
+        .then_some((ssid, rate, rssi, noise))
+}
+
+/// CoreWLAN reader for macOS releases without the airport CLI. Talks to
+/// the Objective-C runtime directly (no extra crates): the shared
+/// `CWWiFiClient`'s default `CWInterface` supplies rssiValue,
+/// noiseMeasurement and transmitRate synchronously. The SSID is
+/// returned only when the process is location-authorized; macOS
+/// withholds it otherwise, and p10k's airport path does not require
+/// it either (p10k:5228 gates on state/rssi/noise only).
+#[cfg(target_os = "macos")]
+mod corewlan {
+    use std::ffi::{c_char, c_void, CStr};
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    // Foundation and CoreWLAN are dlopen'd on the first probe, not linked: a
+    // link-time dependency makes dyld map and initialise both on EVERY shell
+    // start, wifi segment or not.
+    fn load_frameworks() {
+        static LOAD: std::sync::Once = std::sync::Once::new();
+        LOAD.call_once(|| unsafe {
+            for path in [
+                c"/System/Library/Frameworks/Foundation.framework/Foundation",
+                c"/System/Library/Frameworks/CoreWLAN.framework/CoreWLAN",
+            ] {
+                libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
+            }
+        });
+    }
+
+    type Obj = *mut c_void;
+    type MsgObj = unsafe extern "C" fn(Obj, Obj) -> Obj;
+    type MsgInt = unsafe extern "C" fn(Obj, Obj) -> isize;
+    type MsgDbl = unsafe extern "C" fn(Obj, Obj) -> f64;
+
+    unsafe fn sel(name: &CStr) -> Obj {
+        sel_registerName(name.as_ptr())
+    }
+    unsafe fn msg_obj(o: Obj, name: &CStr) -> Obj {
+        let f: MsgObj = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(o, sel(name))
+    }
+    unsafe fn msg_int(o: Obj, name: &CStr) -> isize {
+        let f: MsgInt = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(o, sel(name))
+    }
+    unsafe fn msg_dbl(o: Obj, name: &CStr) -> f64 {
+        let f: MsgDbl = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(o, sel(name))
+    }
+
+    /// (ssid, last_tx_rate Mbps, rssi, noise) of the associated default
+    /// Wi-Fi interface; None when there is no interface or no link.
+    pub fn status() -> Option<(String, String, String, String)> {
+        load_frameworks();
+        unsafe {
+            let pool = msg_obj(msg_obj(objc_getClass(c"NSAutoreleasePool".as_ptr()), c"alloc"), c"init");
+            let out = (|| {
+                let cls = objc_getClass(c"CWWiFiClient".as_ptr());
+                if cls.is_null() {
+                    return None;
+                }
+                let client = msg_obj(cls, c"sharedWiFiClient");
+                if client.is_null() {
+                    return None;
+                }
+                let iface = msg_obj(client, c"interface");
+                if iface.is_null() {
+                    return None;
+                }
+                let rate = msg_dbl(iface, c"transmitRate");
+                if rate <= 0.0 {
+                    return None; // not associated
+                }
+                let rssi = msg_int(iface, c"rssiValue");
+                let noise = msg_int(iface, c"noiseMeasurement");
+                let ssid_ns = msg_obj(iface, c"ssid");
+                let ssid = if ssid_ns.is_null() {
+                    String::new()
+                } else {
+                    let c = msg_obj(ssid_ns, c"UTF8String") as *const c_char;
+                    if c.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(c).to_string_lossy().into_owned()
+                    }
+                };
+                Some((ssid, format!("{}", rate as i64), rssi.to_string(), noise.to_string()))
+            })();
+            if !pool.is_null() {
+                msg_obj(pool, c"drain");
+            }
+            out
+        }
+    }
+}
+
+/// macOS wifi probe: the airport CLI when it still exists (p10k:5213),
+/// else CoreWLAN. Behind the same 10s TTL as the Linux arm.
+#[cfg(target_os = "macos")]
+fn wifi_status() -> Option<(String, String, String, String, String)> {
+    let joined = ttl_cached_bg("wifi.macos", move || {
+        let probe = || -> Option<String> {
+        let airport = std::path::Path::new(AIRPORT);
+        let (ssid, rate, rssi, noise) = if airport.exists() {
+            parse_airport(&run_tool(airport, &["-I"])?)?
+        } else {
+            corewlan::status()?
+        };
+        // p10k:5273-5286 — bars from the SNR margin.
+        let snr = rssi.parse::<i64>().ok()? - noise.parse::<i64>().ok()?;
+        let bars = wifi_bars(snr);
+            Some(format!("{ssid}\u{1f}{rate}\u{1f}{rssi}\u{1f}{noise}\u{1f}{bars}"))
+        };
+        (Duration::from_secs(10), probe())
+    })?;
+    let mut f = joined.split('\u{1f}').map(str::to_string);
+    Some((f.next()?, f.next()?, f.next()?, f.next()?, f.next()?))
+}
+
+/// Linux wifi probe (p10k:5230-5269): /proc/net/wireless names the
+/// connected interface + rssi/noise; `iw dev <iface> link` supplies
+/// SSID + tx bitrate. The iw fork sits behind a 10s TTL (the worker
+/// refresh loop collapses, as with vm_stat). Returns
+/// (ssid, last_tx_rate, rssi, noise, bars).
+#[cfg(not(target_os = "macos"))]
+fn wifi_status() -> Option<(String, String, String, String, String)> {
+    // p10k:5230 — [[ -r /proc/net/wireless && -n $commands[iw] ]]; the
+    // binary is resolved here, the refresh runs off the render thread.
+    let iw = cmd_on_path("iw");
+    let joined = ttl_cached_bg("wifi.iw", move || {
+        let probe = || -> Option<String> {
+            let iw = iw?;
+        let content = std::fs::read_to_string("/proc/net/wireless").ok()?;
+        let (iface, rssi, noise) = parse_proc_wireless(&content)?;
+        // p10k:5259 — lines=(${(f)"$(command iw dev $iface link)"})
+        let out = run_tool(&iw, &["dev", &iface, "link"])?;
+        let (ssid, last_tx_rate) = parse_iw_link(&out)?;
+        // p10k:5275 — local -i snr_margin='rssi - noise'
+        let snr = rssi.parse::<i64>().ok()? - noise.parse::<i64>().ok()?;
+        let bars = wifi_bars(snr);
+            Some(format!(
+                "{ssid}\u{1f}{last_tx_rate}\u{1f}{rssi}\u{1f}{noise}\u{1f}{bars}"
+            ))
+        };
+        (Duration::from_secs(10), probe())
+    })?;
+    let mut f = joined.split('\u{1f}').map(str::to_string);
+    Some((f.next()?, f.next()?, f.next()?, f.next()?, f.next()?))
+}
+
+fn wifi_segments() -> Vec<Segment> {
+    let Some((ssid, last_tx_rate, rssi, noise, bars)) = wifi_status() else {
+        return vec![]; // p10k:5188 cond '$_p9k__wifi_on' — hidden
+    };
+    // p10k:5304-5310 — the P9K_WIFI_* params users reference from
+    // CONTENT_EXPANSION. LINK_AUTH is airport-only (p10k:5225) — empty.
+    let _ = setsparam("P9K_WIFI_SSID", &ssid);
+    let _ = setsparam("P9K_WIFI_LAST_TX_RATE", &last_tx_rate);
+    let _ = setsparam("P9K_WIFI_LINK_AUTH", "");
+    let _ = setsparam("P9K_WIFI_RSSI", &rssi);
+    let _ = setsparam("P9K_WIFI_NOISE", &noise);
+    let _ = setsparam("P9K_WIFI_BARS", &bars);
+    // p10k:5188 — `$0 green $_p9k_color1 WIFI_ICON 1 '$_p9k__wifi_on'
+    // '$P9K_WIFI_LAST_TX_RATE Mbps'`.
+    vec![make_segment(
+        "wifi",
+        None,
+        "green",
+        color1(),
+        "WIFI_ICON",
+        format!("{last_tx_rate} Mbps"),
+    )]
+}
+
+// ---------------------------------------------------------------------
+// proxy (p10k:4970-4980)
+// ---------------------------------------------------------------------
+
+/// p10k:4974 — `${(@)${(@)${(@)p#*://}##*@}%%/*}`: strip scheme,
+/// credentials, path.
+fn proxy_strip(v: &str) -> String {
+    let v = v.split_once("://").map_or(v, |(_, r)| r); // ${p#*://}
+    let v = v.rsplit_once('@').map_or(v, |(_, r)| r); // ${p##*@}
+    v.split('/').next().unwrap_or(v).to_string() // ${p%%/*}
+}
+
+fn proxy_segments() -> Vec<Segment> {
+    // p10k:4971-4973 + 4981 — the exact 8-var list (the init cond is
+    // their concatenation: any set+non-empty var shows the segment).
+    const VARS: [&str; 8] = [
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "ftp_proxy",
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "FTP_PROXY",
+    ];
+    let mut hosts: Vec<String> = Vec::new(); // p10k:4971 `local -U p` — unique
+    for var in VARS {
+        let v = env_or_param(var);
+        if v.is_empty() {
+            continue;
+        }
+        let host = proxy_strip(&v);
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    if hosts.is_empty() {
+        return vec![]; // init cond empty — segment hidden
+    }
+    // p10k:4975 — (( $#p == 1 )) || p=(""): ambiguous → icon only.
+    let content = if hosts.len() == 1 {
+        esc_pct(&hosts[0])
+    } else {
+        String::new()
+    };
+    // p10k:4976 — `$0 $_p9k_color1 blue PROXY_ICON 0 '' "$p[1]"`
+    vec![make_segment(
+        "proxy",
+        None,
+        color1(),
+        "blue",
+        "PROXY_ICON",
+        content,
+    )]
+}
+
+// ---------------------------------------------------------------------
+// todo (p10k:3520-3543)
+// ---------------------------------------------------------------------
+
+/// p10k:8996-9017 — (todo command, todo file): `todo.sh` else
+/// `todo-txt`, and the `$TODO_FILE` its config defines, found by
+/// sourcing the first existing of the candidate config files in bash.
+/// Computed once, like the theme's init-time probe.
+fn todo_command_and_file() -> Option<&'static (PathBuf, PathBuf)> {
+    static TODO: OnceLock<Option<(PathBuf, PathBuf)>> = OnceLock::new();
+    TODO.get_or_init(|| {
+        let (cmd, global) = match cmd_on_path("todo.sh") {
+            Some(c) => (c, "/etc/todo/config"),
+            None => (cmd_on_path("todo-txt")?, "/etc/todo-txt/config"),
+        };
+        let dir = cmd.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        // p10k:9004-9015 — `exec -a $cmd bash -c '…'` with the file name
+        // printed on fd 3; stdout/stderr of the sourced config are
+        // discarded, so the name is printed on stdout here instead.
+        let script = format!(
+            "[ -e \"$TODOTXT_CFG_FILE\" ] || TODOTXT_CFG_FILE=$HOME/.todo/config\n\
+             [ -e \"$TODOTXT_CFG_FILE\" ] || TODOTXT_CFG_FILE=$HOME/todo.cfg\n\
+             [ -e \"$TODOTXT_CFG_FILE\" ] || TODOTXT_CFG_FILE=$HOME/.todo.cfg\n\
+             [ -e \"$TODOTXT_CFG_FILE\" ] || TODOTXT_CFG_FILE=${{XDG_CONFIG_HOME:-$HOME/.config}}/todo/config\n\
+             [ -e \"$TODOTXT_CFG_FILE\" ] || TODOTXT_CFG_FILE='{dir}/todo.cfg'\n\
+             [ -e \"$TODOTXT_CFG_FILE\" ] || TODOTXT_CFG_FILE=${{TODOTXT_GLOBAL_CFG_FILE:-'{global}'}}\n\
+             [ -r \"$TODOTXT_CFG_FILE\" ] || exit\n\
+             {{ source \"$TODOTXT_CFG_FILE\"; }} >/dev/null 2>&1\n\
+             printf '%s' \"$TODO_FILE\""
+        );
+        use std::os::unix::process::CommandExt;
+        let bash = cmd_on_path("bash")?;
+        let out = std::process::Command::new(&bash)
+            .arg0(&cmd)
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let file = String::from_utf8_lossy(&out.stdout).into_owned();
+        (!file.is_empty()).then(|| (cmd, PathBuf::from(file)))
+    })
+    .as_ref()
+}
+
+fn todo_segments() -> Vec<Segment> {
+    // p10k:3571 — `[[ -r $_p9k__todo_file && -x $_p9k__todo_command ]]`.
+    let Some((bin, file)) = todo_command_and_file() else {
+        return vec![]; // p10k:3595 cond '$_p9k__todo_file'
+    };
+    let Ok(mtime) = std::fs::metadata(file).and_then(|m| m.modified()) else {
+        return vec![];
+    };
+    // p10k:3572-3578 — `_p9k_cache_stat_get`: the count is recomputed
+    // only when the todo file's stat signature changes.
+    static COUNT: Mutex<Option<(PathBuf, std::time::SystemTime, Option<String>)>> = Mutex::new(None);
+    let last = {
+        let mut g = COUNT.lock().unwrap();
+        match &*g {
+            Some((f, t, v)) if f == file && *t == mtime => v.clone(),
+            _ => {
+                // p10k:3573 — `$todo_command -p ls | command tail -1`.
+                let v = run_tool(bin, &["-p", "ls"]).and_then(|o| o.lines().last().map(str::to_string));
+                *g = Some((file.clone(), mtime, v.clone()));
+                v
+            }
+        }
+    };
+    let Some(last) = last else {
+        return vec![];
+    };
+    // p10k:3525 — 'TODO: '<filtered>' of '<total>' '*.
+    let Some(rest) = last.strip_prefix("TODO: ") else {
+        return vec![];
+    };
+    let mut it = rest.split_whitespace();
+    let (Some(filtered), Some("of"), Some(total)) = (it.next(), it.next(), it.next()) else {
+        return vec![];
+    };
+    let (Ok(filtered), Ok(total)) = (filtered.parse::<i64>(), total.parse::<i64>()) else {
+        return vec![];
+    };
+    // p10k:3533-3535 + 7225-7226 — zero-hiding gates, both default off.
+    if (total == 0 && global_bool("TODO_HIDE_ZERO_TOTAL", false))
+        || (filtered == 0 && global_bool("TODO_HIDE_ZERO_FILTERED", false))
+    {
+        return vec![];
+    }
+    // p10k:3536-3540 — "N" when the counts agree, else "F/T".
+    let text = if total == filtered {
+        total.to_string()
+    } else {
+        format!("{filtered}/{total}")
+    };
+    // p10k:3541 — `$0 "grey50" "$_p9k_color1" 'TODO_ICON' 0 '' "$text"`
+    vec![make_segment(
+        "todo",
+        None,
+        "grey50",
+        color1(),
+        "TODO_ICON",
+        text,
+    )]
+}
+
+// ---------------------------------------------------------------------
+// timewarrior (p10k:5011-5059)
+// ---------------------------------------------------------------------
+
+fn timewarrior_segments() -> Vec<Segment> {
+    timewarrior_inner().unwrap_or_default()
+}
+
+fn timewarrior_inner() -> Option<Vec<Segment>> {
+    // p10k:5062 — init cond '$commands[timew]'.
+    cmd_on_path("timew")?;
+    // p10k:5013 — ${TIMEWARRIORDB:-~/.timewarrior}/data.
+    let db = env_or_param("TIMEWARRIORDB");
+    let dir = if db.is_empty() {
+        PathBuf::from(env_or_param("HOME")).join(".timewarrior")
+    } else {
+        PathBuf::from(db)
+    }
+    .join("data");
+    // p10k:5031-5044 — newest <->-<->.data file by name
+    // (${(AO)files}[1] = descending sort). The mtime memo layer
+    // (p10k:5015-5022) is dropped: one readdir + one small read per
+    // prompt.
+    let rd = std::fs::read_dir(&dir).ok()?; // p10k:5024-5027 — no dir, hidden
+    let is_data_name = |n: &str| {
+        n.strip_suffix(".data").is_some_and(|stem| {
+            stem.split_once('-').is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+            })
+        })
+    };
+    let newest = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            is_data_name(&name).then_some(name)
+        })
+        .max()?;
+    let content = std::fs::read_to_string(dir.join(&newest)).ok()?;
+    // p10k:5051 — last line; p10k:5052 — 'inc '[^\ ]##(|\ #\#(*)): an
+    // OPEN interval ("inc <ts>", optionally " # tags"); closed
+    // intervals ("inc <ts> - <ts> …") do not match → hidden.
+    let last = content.lines().rev().find(|l| !l.is_empty())?;
+    let rest = last.strip_prefix("inc ")?;
+    let (first, tail) = match rest.split_once(' ') {
+        Some((f, t)) => (f, Some(t)),
+        None => (rest, None),
+    };
+    if first.is_empty() {
+        return None;
+    }
+    let tags = match tail {
+        None => String::new(),
+        Some(t) => {
+            // p10k:5053 — ${${match[2]## #}%% #}: trim spaces around
+            // the '#'-prefixed tag list.
+            let t = t.trim_start_matches(' ');
+            t.strip_prefix('#')?.trim_matches(' ').to_string()
+        }
+    };
+    // p10k:5054 — `$0 grey 255 TIMEWARRIOR_ICON 0 '' "${tags//\%/%%}"`
+    Some(vec![make_segment(
+        "timewarrior",
+        None,
+        "grey",
+        "255",
+        "TIMEWARRIOR_ICON",
+        esc_pct(&tags),
+    )])
+}
+
+// ---------------------------------------------------------------------
+// taskwarrior (p10k:5155-5180)
+// ---------------------------------------------------------------------
+
+fn taskwarrior_segments() -> Vec<Segment> {
+    // p10k:5322 — init cond gates on $commands[task].
+    let Some(bin) = cmd_on_path("task") else {
+        return vec![];
+    };
+    // p10k:5296-5304 — reuse the counters while the data signature holds;
+    // otherwise re-check (or re-read) the config, then re-count.
+    let state = {
+        let mut g = TASKWARRIOR.lock().unwrap_or_else(|e| e.into_inner());
+        let st = g.get_or_insert_with(TaskwarriorState::load);
+        if !st.nonfunctional_sig.is_empty() && st.nonfunctional_sig == TaskwarriorState::meta_sig_now() {
+            return vec![];
+        }
+        if !st.check_data() {
+            if !st.check_meta() && !st.init_meta(&bin) {
+                *st = TaskwarriorState {
+                    nonfunctional_sig: TaskwarriorState::meta_sig_now(),
+                    ..TaskwarriorState::default()
+                };
+                st.save();
+                return vec![];
+            }
+            st.init_data(&bin);
+            st.save();
+        }
+        st.clone()
+    };
+    // p10k:5305-5316 — "!O" then "/" then "P".
+    let mut text = String::new();
+    if let Some(o) = state.overdue {
+        text.push_str(&format!("!{o}"));
+    }
+    if let Some(p) = state.pending {
+        if !text.is_empty() {
+            text.push('/');
+        }
+        text.push_str(&p.to_string());
+    }
+    // p10k:5317 — [[ -n $text ]] || return.
+    if text.is_empty() {
+        return vec![];
+    }
+    // p10k:5318 — `$0 6 $_p9k_color1 TASKWARRIOR_ICON 0 '' $text`
+    vec![make_segment(
+        "taskwarrior",
+        None,
+        "6",
+        color1(),
+        "TASKWARRIOR_ICON",
+        text,
+    )]
+}
+
+/// p10k's taskwarrior cache (p10k:5199-5292): the counts stand while the
+/// mtimes of the data files and `$TASKRC` (and `$TASKRC`/`$TASKDATA`
+/// themselves) are unchanged and the next due date has not passed.
+/// p10k carries it to the next shell in its state dump
+/// (`_p9k__state_dump_scheduled=1`); here it is
+/// `$ZSHRS_HOME/p10k-taskwarrior.json`. A new shell then reads the counts
+/// with a few `stat`s instead of running `task` — two to three
+/// invocations, most of a second — before its first prompt.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TaskwarriorState {
+    /// `_p9k_taskwarrior_meta_sig` — empty when the config is unread.
+    meta_sig: String,
+    /// `_p9k_taskwarrior_data_dir` — `task show data.location`.
+    data_dir: String,
+    /// `_p9k_taskwarrior_data_sig` — empty when the data is unread.
+    data_sig: String,
+    /// `_p9k_taskwarrior_counters[PENDING]`.
+    pending: Option<i64>,
+    /// `_p9k_taskwarrior_counters[OVERDUE]`.
+    overdue: Option<i64>,
+    /// `_p9k_taskwarrior_next_due` — epoch seconds, 0 for none.
+    next_due: i64,
+    /// The meta signature under which `task show data.location` failed —
+    /// p10k clears `_p9k__taskwarrior_functional` then (p10k:5237) and the
+    /// segment condition (p10k:5322) stays off. Persisted, so a `task` that
+    /// is not taskwarrior (go-task's `task` fails `task show`) costs one run
+    /// until `$TASKRC` changes, not one per shell.
+    #[serde(default)]
+    nonfunctional_sig: String,
+}
+
+static TASKWARRIOR: Mutex<Option<TaskwarriorState>> = Mutex::new(None);
+
+impl TaskwarriorState {
+    fn path() -> PathBuf {
+        crate::extensions::p10k::state_file("p10k-taskwarrior.json")
+    }
+
+    fn load() -> Self {
+        std::fs::read(Self::path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_vec(self) {
+            crate::extensions::p10k::write_state_file(&Self::path(), &json);
+        }
+    }
+
+    /// `${(pj:\0:)stat}` over `files` — each file's mtime in seconds,
+    /// `-` for one that does not exist (p10k keeps those in `*_non_files`
+    /// and fails the check when one appears).
+    fn mtimes(files: &[PathBuf]) -> String {
+        files
+            .iter()
+            .map(|f| {
+                std::fs::metadata(f)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or_else(|| "-".to_string(), |d| d.as_secs().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\0")
+    }
+
+    /// `files=(${TASKRC:-~/.taskrc})` (p10k:5219).
+    fn meta_files() -> Vec<PathBuf> {
+        let rc = env_or_param("TASKRC");
+        if rc.is_empty() {
+            dirs::home_dir().map(|h| vec![h.join(".taskrc")]).unwrap_or_default()
+        } else {
+            vec![PathBuf::from(rc)]
+        }
+    }
+
+    /// p10k:5225 — `${(pj:\0:)stat}$'\0'$TASKRC$'\0'$TASKDATA`.
+    fn meta_sig_now() -> String {
+        format!(
+            "{}\0{}\0{}",
+            Self::mtimes(&Self::meta_files()),
+            env_or_param("TASKRC"),
+            env_or_param("TASKDATA")
+        )
+    }
+
+    /// p10k:5253-5256 — the data files under `data.location`.
+    fn data_files(&self) -> Vec<PathBuf> {
+        let dir = PathBuf::from(&self.data_dir);
+        vec![dir.join("pending.data"), dir.join("completed.data"), dir.join("taskchampion.sqlite3")]
+    }
+
+    /// p10k:5260-5267 — the data mtimes, then the meta signature.
+    fn data_sig_now(&self) -> String {
+        format!("{}\0{}", Self::mtimes(&self.data_files()), Self::meta_sig_now())
+    }
+
+    /// `_p9k_taskwarrior_check_data` (p10k:5241-5250).
+    fn check_data(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        !self.data_sig.is_empty()
+            && self.data_sig == self.data_sig_now()
+            && (self.next_due == 0 || self.next_due > now)
+    }
+
+    /// `_p9k_taskwarrior_check_meta` (p10k:5199-5207).
+    fn check_meta(&self) -> bool {
+        !self.meta_sig.is_empty() && self.meta_sig == Self::meta_sig_now()
+    }
+
+    /// `_p9k_taskwarrior_init_meta` (p10k:5209-5239): `data.location`
+    /// from `task show`, `~` expanded.
+    fn init_meta(&mut self, bin: &std::path::Path) -> bool {
+        let Some(cfg) = run_tool(bin, &["show", "data.location", "rc.color=0", "rc._forcecolor=0"]) else {
+            return false;
+        };
+        let lines: Vec<&str> = cfg.lines().filter(|l| l.starts_with("data.location")).collect();
+        let [line] = lines.as_slice() else {
+            return false;
+        };
+        let Some(dir) = line.strip_prefix("data.location").map(str::trim).filter(|d| !d.is_empty()) else {
+            return false;
+        };
+        self.data_dir = match (dir.strip_prefix('~'), dirs::home_dir()) {
+            (Some(rest), Some(home)) => format!("{}{}", home.display(), rest),
+            _ => dir.to_string(),
+        };
+        self.meta_sig = Self::meta_sig_now();
+        true
+    }
+
+    /// `_p9k_taskwarrior_init_data` (p10k:5252-5292).
+    fn init_data(&mut self, bin: &std::path::Path) {
+        self.data_sig = self.data_sig_now();
+        let count = |tag: &str| -> Option<i64> {
+            let out = run_tool(bin, &[&format!("+{tag}"), "count", "rc.color=0", "rc._forcecolor=0"])?;
+            let n: i64 = out.trim().parse().ok()?;
+            (n >= 1).then_some(n) // p10k:5273 — [[ $val == <1-> ]]
+        };
+        self.pending = count("PENDING");
+        self.overdue = count("OVERDUE");
+        // p10k:5277-5290 — the earliest due date among pending tasks that
+        // are not yet overdue; the counts expire then.
+        self.next_due = 0;
+        if self.pending.unwrap_or(0) > self.overdue.unwrap_or(0) {
+            let args = [
+                "+PENDING",
+                "-OVERDUE",
+                "list",
+                "rc.verbose=nothing",
+                "rc.color=0",
+                "rc._forcecolor=0",
+                "rc.report.list.labels=",
+                "rc.report.list.columns=due.epoch",
+            ];
+            let words: Vec<String> = run_tool(bin, &args)
+                .map(|o| o.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default();
+            // p10k:5285 — every word an (optionally negative, fractional)
+            // number, or none are used (taskwarrior 3.0.1 workaround).
+            let nums: Option<Vec<f64>> = words.iter().map(|w| w.parse::<f64>().ok()).collect();
+            if let Some(mut nums) = nums.filter(|n| !n.is_empty()) {
+                nums.sort_by(|a, b| a.total_cmp(b));
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                let first = nums[0] as i64;
+                self.next_due = if first > now { first } else { now + 60 };
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// nix_shell / vim_shell / midnight_commander (p10k:4925/4911/4871)
+// ---------------------------------------------------------------------
+
+fn nix_shell_segments() -> Vec<Segment> {
+    // p10k:7832-7837 — cond '${IN_NIX_SHELL:#0}' plus, with
+    // NIX_SHELL_INFER_FROM_PATH (default 0), '${path[(r)/nix/store/*]}'.
+    let v = env_or_param("IN_NIX_SHELL");
+    let in_nix_shell = !v.is_empty() && v != "0";
+    let on_path = || {
+        env_or_param("PATH")
+            .split(':')
+            .any(|p| p.starts_with("/nix/store/"))
+    };
+    if !in_nix_shell && !(global_bool("NIX_SHELL_INFER_FROM_PATH", false) && on_path()) {
+        return vec![];
+    }
+    // p10k:4926 — content ${(M)IN_NIX_SHELL:#(pure|impure)}.
+    let content = if v == "pure" || v == "impure" {
+        v
+    } else {
+        String::new()
+    };
+    // p10k:4926 — `$0 4 $_p9k_color1 NIX_SHELL_ICON 0 '' …`
+    vec![make_segment(
+        "nix_shell",
+        None,
+        "4",
+        color1(),
+        "NIX_SHELL_ICON",
+        content,
+    )]
+}
+
+fn vim_shell_segments() -> Vec<Segment> {
+    // p10k:4918 — init cond '$VIMRUNTIME'.
+    if env_or_param("VIMRUNTIME").is_empty() {
+        return vec![];
+    }
+    // p10k:4913 — `$0 green $_p9k_color1 VIM_ICON 0 '' ''`
+    vec![make_segment(
+        "vim_shell",
+        None,
+        "green",
+        color1(),
+        "VIM_ICON",
+        String::new(),
+    )]
+}
+
+fn midnight_commander_segments() -> Vec<Segment> {
+    // p10k:4878 — init cond '$MC_TMPDIR'.
+    if env_or_param("MC_TMPDIR").is_empty() {
+        return vec![];
+    }
+    // p10k:4873 — `$0 $_p9k_color1 yellow MIDNIGHT_COMMANDER_ICON 0 '' ''`
+    vec![make_segment(
+        "midnight_commander",
+        None,
+        color1(),
+        "yellow",
+        "MIDNIGHT_COMMANDER_ICON",
+        String::new(),
+    )]
+}
+
+// ---------------------------------------------------------------------
+// Tests — pure formatters only (literal inputs)
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// p10k:327-343 anchors — `_p9k_human_readable_bytes` output for
+    /// exact byte counts (trailing-zero/dot stripping included).
+    #[test]
+    fn human_readable_bytes_literals() {
+        assert_eq!(human_readable_bytes(0.0), "0B");
+        assert_eq!(human_readable_bytes(512.0), "512B"); // %.0f. → "512." → "512B"
+        assert_eq!(human_readable_bytes(1023.0), "1023B"); // no division below 1024
+        assert_eq!(human_readable_bytes(1536.0), "1.5K"); // %.2f "1.50" → zeros stripped
+        assert_eq!(human_readable_bytes(10.0 * 1024.0), "10K"); // "10.0" → "10." → "10"
+        assert_eq!(human_readable_bytes(16000.0), "15.6K"); // 15.625 ≥ 10 → %.1f
+        assert_eq!(human_readable_bytes(2.0 * 1024.0 * 1024.0), "2M"); // "2.00" → "2"
+        assert_eq!(
+            human_readable_bytes(100.0 * 1024.0 * 1024.0 * 1024.0),
+            "100G" // "100." — the dot guards the zeros from stripping
+        );
+        assert_eq!(human_readable_bytes(1024f64.powi(4) * 1.25), "1.25T");
+    }
+
+    /// p10k:1709-1715 — sub-minute durations: precision 0 rounds via
+    /// add-0.5-truncate; precision N prints fixed decimals.
+    #[test]
+    fn human_readable_duration_sub_minute() {
+        assert_eq!(human_readable_duration(3.0, 0, "H:M:S"), "3s");
+        assert_eq!(human_readable_duration(3.6, 0, "H:M:S"), "4s"); // 3.6+0.5=4.1 → 4
+        assert_eq!(human_readable_duration(3.4, 0, "d h m s"), "3s"); // 3.4+0.5=3.9 → 3
+        assert_eq!(human_readable_duration(3.5, 2, "H:M:S"), "3.50s"); // typeset -F 2
+        assert_eq!(human_readable_duration(59.0, 1, "d h m s"), "59.0s");
+    }
+
+    /// p10k:1719-1729 — H:M:S: seconds/minutes zero-padded to 2,
+    /// hours zero-padded only below 10h (`0$((d/3600))` vs bare).
+    #[test]
+    fn human_readable_duration_hms() {
+        assert_eq!(human_readable_duration(95.4, 0, "H:M:S"), "01:35"); // d=95
+        assert_eq!(human_readable_duration(3661.0, 0, "H:M:S"), "01:01:01");
+        assert_eq!(human_readable_duration(36000.0, 0, "H:M:S"), "10:00:00"); // ≥36000 unpadded
+        assert_eq!(human_readable_duration(90061.0, 0, "H:M:S"), "25:01:01"); // no day wrap
+    }
+
+    /// p10k:1730-1741 — "d h m s": unit words, hours wrap at 24.
+    #[test]
+    fn human_readable_duration_dhms() {
+        assert_eq!(human_readable_duration(125.0, 0, "d h m s"), "2m 5s");
+        assert_eq!(human_readable_duration(4225.0, 0, "d h m s"), "1h 10m 25s");
+        assert_eq!(
+            human_readable_duration(90061.0, 0, "d h m s"),
+            "1d 1h 1m 1s"
+        );
+    }
+
+    /// p10k:5233-5244 — /proc/net/wireless parsing against the content
+    /// example embedded in the spec (PR #973 comment).
+    #[test]
+    fn proc_wireless_spec_example() {
+        let content =
+            "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n \
+face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n\
+wlp3s0: 0000   58.  -52.  -256        0      0      0      0     76        0\n";
+        // rssi=${parts[4]%.*}="-52", noise=${parts[5]%.*}="-256".
+        assert_eq!(
+            parse_proc_wireless(content),
+            Some(("wlp3s0".to_string(), "-52".to_string(), "-256".to_string()))
+        );
+        // Two data lines (two interfaces) → hidden (p10k:5238).
+        let two = format!("{content}wlan1: 0000   40.  -60.  -256 0 0 0 0 0 0\n");
+        assert_eq!(parse_proc_wireless(&two), None);
+        // Non-zero status word fails the `0##` validation (p10k:5244).
+        let bad = "wlp3s0: 0001   58.  -52.  -256        0      0      0      0     76        0\n";
+        assert_eq!(parse_proc_wireless(bad), None);
+    }
+
+    /// p10k:5247-5269 — `iw dev <iface> link` parsing against the
+    /// output example embedded in the spec: tx bitrate token with the
+    /// `<->.<->` trailing-zero strip (243.0 → 243).
+    #[test]
+    fn iw_link_spec_example() {
+        let out = "Connected to 74:83:c2:be:76:da (on wlp3s0)\n\
+\tSSID: DailyGrindGuest1\n\
+\tfreq: 5745\n\
+\tRX: 35192066 bytes (27041 packets)\n\
+\tTX: 4090471 bytes (24287 packets)\n\
+\tsignal: -52 dBm\n\
+\trx bitrate: 243.0 MBit/s VHT-MCS 6 40MHz VHT-NSS 2\n\
+\ttx bitrate: 240.0 MBit/s VHT-MCS 5 40MHz short GI VHT-NSS 2\n";
+        assert_eq!(
+            parse_iw_link(out),
+            Some(("DailyGrindGuest1".to_string(), "240".to_string()))
+        );
+        // Non-<->.<-> rates pass through unstripped (p10k:5266 guard).
+        let vht = "\tSSID: x\n\ttx bitrate: 240.5 MBit/s\n";
+        assert_eq!(
+            parse_iw_link(vht),
+            Some(("x".to_string(), "240.5".to_string()))
+        );
+        // Missing SSID → hidden (p10k:5269).
+        assert_eq!(parse_iw_link("\ttx bitrate: 240.0 MBit/s\n"), None);
+    }
+
+    /// p10k:5275-5286 — SNR-margin → bars ladder boundaries.
+    #[test]
+    fn wifi_bars_ladder() {
+        assert_eq!(wifi_bars(44), 4); // -52 - -96 from the spec comment
+        assert_eq!(wifi_bars(40), 4);
+        assert_eq!(wifi_bars(39), 3);
+        assert_eq!(wifi_bars(25), 3);
+        assert_eq!(wifi_bars(24), 2);
+        assert_eq!(wifi_bars(15), 2);
+        assert_eq!(wifi_bars(14), 1);
+        assert_eq!(wifi_bars(10), 1);
+        assert_eq!(wifi_bars(9), 0);
+    }
+
+    /// p10k:4974 — proxy value stripping: scheme, credentials, path.
+    #[test]
+    fn proxy_strip_forms() {
+        assert_eq!(
+            proxy_strip("http://proxy.example.com:8080/x"),
+            "proxy.example.com:8080"
+        );
+        assert_eq!(
+            proxy_strip("socks5://user:pw@10.0.0.1:1080"),
+            "10.0.0.1:1080"
+        );
+        assert_eq!(proxy_strip("proxy:3128"), "proxy:3128");
+    }
+}

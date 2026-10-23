@@ -1,0 +1,1000 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+# A push to main must not cancel the run already going: the long jobs take most of an
+# hour and commits land more often than that, so cancelling meant no run on main
+# ever finished and nothing was ever reported. Without cancellation GitHub keeps one
+# running and one pending run per group and replaces the pending one with the newest
+# commit, so main always gets a finished run and the latest commit is the next one.
+# A pull request still cancels its own superseded run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  # Cross-compile to aarch64-linux to catch portability regressions where
+  # c_char (= u8 on aarch64-linux, = i8 on x86_64-linux) drifts in libc
+  # callers. Compile-only — no test execution on aarch64 (no native
+  # runners). Catches the bug class fixed in c48cbf6 (params.rs /
+  # utils.rs / ext_builtins.rs hardcoded i8 where c_char was meant).
+  cross-aarch64-linux:
+    name: Cross-check aarch64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        run: cargo install cross --locked
+      - run: cross check --locked --target aarch64-unknown-linux-gnu
+
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RUST_BACKTRACE: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # zsh is required by tests/zsh_zshrs_demo_equivalence.rs which
+      # compares system-zsh stdout vs `zshrs --zsh` stdout for every
+      # demo under examples/demos/. macOS-runner ships zsh by default;
+      # ubuntu-runner needs an explicit install. Without zsh the
+      # equivalence tests silently skip — installing here makes the
+      # contract enforced in CI rather than aspirational.
+      - name: Install zsh (ubuntu runner)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      # The master oracle tests/parity/oracle.rs and builtin_output_parity
+      # resolve through $ZSHRS_ORACLE_ZSH (upstream 54181 / 54013 / 55061
+      # changed answers the released zsh still gives).
+      - uses: ./.github/actions/zsh-oracle
+      # The release zshrs reports as its own version. The master oracle above is the
+      # tree the port follows, but zshrs's $ZSH_VERSION / $ZSH_PATCHLEVEL, the .zwc
+      # header version and the zparseopts / zformat semantics are the release's, and a
+      # dump written by one version is refused by the other. The tests that pin those
+      # compare against this one through $ZSHRS_RELEASE_ZSH.
+      - uses: ./.github/actions/zsh-oracle
+        with:
+          commit: zsh-5.9.2
+          dir: zsh-5.9.2
+          env-var: ZSHRS_RELEASE_ZSH
+      # tests/port_purity.rs maps every src/ported/ file and fn onto the C it
+      # ports, read from src/zsh/Src (gitignored locally). Check out the C at
+      # the commit the oracle is built from, taken from the action's default
+      # so the two cannot drift.
+      - name: Upstream zsh C source for port_purity
+        run: |
+          sha=$(perl -ne 'print $1 if /default:\s*([0-9a-f]{40})/' .github/actions/zsh-oracle/action.yml)
+          git init -q src/zsh
+          git -C src/zsh fetch -q --depth 1 https://github.com/zsh-users/zsh.git "$sha"
+          git -C src/zsh checkout -q FETCH_HEAD
+      # tests/builtin_output_parity.rs and the emulation suites diff against the
+      # `bash` and `ksh` that `command -v` finds. The ones in /bin are 2007 and 2012
+      # builds (see the Emulation parity job), so put Homebrew's modern ones first.
+      - name: Install reference shells (macOS runner)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash ksh93
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      - name: Test (all targets)
+        if: runner.os == 'Linux'
+        run: cargo test --locked --no-fail-fast
+      # The 49k-test `parity` binary spawns a reference zsh and zshrs per
+      # case; the macOS runner got through ~7,200 of them in an hour (run
+      # 37766178879) while ubuntu runs all of them in ~35 min, so on macOS
+      # the job could never finish inside its timeout. macOS runs every other
+      # target; full parity runs on ubuntu.
+      - name: Test (all targets except parity)
+        if: runner.os == 'macOS'
+        run: |
+          targets=(--lib --bins)
+          for f in tests/*.rs; do
+            t=${f#tests/}; targets+=(--test "${t%.rs}")
+          done
+          cargo test --locked --no-fail-fast "${targets[@]}"
+
+  doc:
+    name: Doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked
+
+  corpus:
+    name: Corpus tests
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Run zshrs corpus tests
+        run: bash test_corpus/run_corpus.sh
+        env:
+          ZSHRS: ${{ github.workspace }}/target/release/zshrs
+      - name: Upload corpus failure log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: corpus-failures-${{ matrix.os }}
+          path: test_corpus/corpus_failures.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # `libzsh.a` lives in the `runtime/` workspace member, not on the main
+      # `zshrs` lib target, so that `cargo install zshrs` stops emitting (and
+      # then discarding) a 170 MB archive it never installs. Nothing else in
+      # CI builds that member, so guard it here — and guard it end-to-end
+      # rather than by existence, since a stale archive that links but has no
+      # `fusevm_aot_register_builtins` would still pass a `test -f`.
+      - name: AOT — build libzsh.a and link a native binary against it
+        shell: bash
+        run: |
+          set -e
+          cargo build --release --locked -p zshrs-runtime
+          # runtime_staticlib() (src/extensions/aot.rs) probes beside the
+          # executable; the shared workspace target dir puts both here.
+          test -f target/release/libzsh.a
+          printf 'print hello-from-aot\n' > aot_ci.zsh
+          ./target/release/zshrs --zsh -fc \
+            "zbuild --native --in $PWD/aot_ci.zsh --out $PWD/aot_ci"
+          got=$(./aot_ci)
+          echo "AOT binary printed: $got"
+          [ "$got" = "hello-from-aot" ]
+
+  emulation-parity:
+    # Emulation parity MATRIX (9 ways): `zshrs --{zsh,bash,ksh,sh,dash}` vs the
+    # real reference shells, PLUS the cross-emulation legs `zshrs --sh --zsh` /
+    # `--ksh --zsh` (zsh-style) vs real zsh doing `emulate sh` / `emulate ksh`,
+    # plus best-effort mksh/ash (tests/emulation_parity.rs) + the dash-strict
+    # rejection suite (tests/dash_mode.rs). The portable corpus runs for every
+    # way; an extended corpus (arrays, [[, (( )), brace expansion,
+    # substring/replace) runs for the extended ways (zsh/bash/ksh + ksh/zsh).
+    # ZSHRS_REQUIRE_REF_SHELLS=1 turns a missing reference shell into a
+    # failure so the contract is enforced, not silently skipped — hence every
+    # shell is installed below. PRESENCE is not enough: a reference shell also
+    # has to be RECENT enough to have the features the corpus exercises. Only
+    # `/bin/sh` and `/bin/dash` are taken as the platform ships them (they are
+    # resolved by absolute path); `bash`, `ksh` and `zsh` are resolved through
+    # `command -v` and are installed per-runner below — ubuntu needs zsh and
+    # ksh at all, macOS needs bash and ksh REPLACED because the ones in /bin
+    # are 13-18 years old (see the macOS step).
+    name: Emulation parity
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      RUST_BACKTRACE: 1
+      ZSHRS_REQUIRE_REF_SHELLS: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install reference shells (ubuntu runner)
+        if: runner.os == 'Linux'
+        # Core five (zsh/ksh/dash + bash & /bin/sh already present) are
+        # enforced; mksh is a real package (best-effort leg). `ash` is exposed
+        # as a symlink to dash — the Almquist family is the same shell, and
+        # `/bin/ash` is a dash symlink on real Debian/Ubuntu systems — so the
+        # ash leg verifies the `--ash` alias end-to-end against a real binary.
+        run: |
+          sudo apt-get update && sudo apt-get install -y zsh ksh dash mksh
+          sudo ln -sf "$(command -v dash)" /usr/local/bin/ash
+      - name: Install reference shells (macOS runner)
+        if: runner.os == 'macOS'
+        # macOS ships bash and ksh, but both are museum pieces: /bin/bash is
+        # 3.2.57 (2007 — the last GPLv2 bash) and /bin/ksh is AT&T 93u+
+        # 2012-08-01. They predate features the EXTENDED corpus uses, so they
+        # diverge from zshrs where a MODERN bash/ksh agrees with it exactly:
+        #   * bash 3.2 has no brace-expansion STEP (`{2..8..2}` is bash 4.0),
+        #     so it emits the braces literally instead of `2 4 6 8`.
+        #   * ksh 93u+ 2012 fails `${v:(-3):2}` / `${v:(-2)}` (parenthesised
+        #     negative substring offset) with an arithmetic syntax error, and
+        #     silently no-ops the anchored array replacements `${a[@]/#/x}`
+        #     and `${a[@]/%/y}`, leaving the array unchanged.
+        # Homebrew's bash 5.x and ksh93u+m 1.0.10 agree with zshrs on all of
+        # those, which is why the ubuntu leg — running against modern distro
+        # packages — is green on the same corpus. `find_shell`
+        # (tests/emulation_parity.rs:648) tries the bare names `bash` / `ksh`
+        # through `command -v` BEFORE the /bin/* absolute fallbacks, so
+        # prepending the Homebrew prefix to PATH is what selects them.
+        # `/bin/sh` and `/bin/dash` are absolute candidates and stay exactly
+        # as the platform ships them — this step cannot affect those ways.
+        run: |
+          brew install bash ksh93
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+      # zsh_style_legs_install_a_non_fully_emulation compares `setopt`
+      # against the master oracle (`restricted` removed, upstream 54181).
+      - uses: ./.github/actions/zsh-oracle
+      - name: Run emulation parity + dash-strict suites
+        run: cargo test --locked --test emulation_parity --test dash_mode -- --nocapture
+
+  # ztst job removed: the per-block fresh-spawn wrapper at tests/ztst_runner.rs
+  # was a fake-pass (counted failures, never asserted). The corpus exercises
+  # interactive ZLE/completion/job-control/signal-trap paths that need a real
+  # pty + per-file persistent shell to drive correctly. Replacement is the
+  # PTY harness designed in docs/ZTST_PTY_HARNESS.md; not CI-gated until that
+  # lands. Local manual runs only via `cargo run --bin ztst-runner` once built.
+
+  recorder-harness:
+    # Plugin-Framework-Agnostic State-Modification Recorder (PFA-SMR) ——
+    # see docs/RECORDER.md. The harness in tests/recorder_harness.rs runs
+    # `zshrs-recorder --no-daemon --file PATH` against tests/recorder_corpus/
+    # (synthetic per-kind scripts + verbatim zinit upstream `bin/*.zsh`) and
+    # asserts the per-kind event counts the recorder must produce. A
+    # regression that misses a dispatcher or double-fires one fails the
+    # relevant test with a kind-by-kind diff.
+    #
+    # Hermetic: --no-daemon skips the end-of-run IPC bundle, so the
+    # zshrs-daemon never starts and ~/.cache/zshrs/ is not written.
+    name: Recorder harness
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      RUST_BACKTRACE: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with --features recorder
+        run: cargo build --locked --features recorder --bin zshrs-recorder
+      - name: Verify Rule 1 — zero recorder code in default zshrs binary
+        # docs/RECORDER.md §"Zero-overhead default binary": the daily-driver
+        # `zshrs` must contain ZERO `zsh::recorder::*` module symbols.
+        #
+        # Match shape: Rust mangles module paths as <byte-length><name>, so
+        # the recorder module appears in symbols as `8recorder` (the 8 = byte
+        # length of "recorder"). This is precise — it matches the AOP
+        # runtime module specifically, not arbitrary functions whose names
+        # happen to contain the substring "recorder" (e.g. shell-side
+        # `latest_recorder_shard()` which only WALKS THE FILESYSTEM for
+        # `*-recorder.rkyv` shards the daemon's recorder produced — not
+        # recorder runtime code).
+        #
+        # Whitelist: the daemon-side `op_recorder_ingest` ingest endpoint
+        # always ships in the daemon (different concern; not the
+        # shell-runtime AOP layer); `sqlite3RecordError*` from rusqlite is
+        # not affected by the precise grep but kept in the whitelist for
+        # belt-and-suspenders robustness.
+        run: |
+          cargo build --locked --bin zshrs
+          set -e
+          hits=$(nm target/debug/zshrs 2>/dev/null \
+            | grep -E '\b8recorder[0-9a-zA-Z_]' \
+            | grep -v sqlite3RecordError \
+            | grep -v zshrs_daemon \
+            | wc -l \
+            | tr -d ' ')
+          echo "shell-runtime zsh::recorder module symbols in default zshrs: $hits"
+          if [ "$hits" -ne 0 ]; then
+            echo "FAIL: Rule 1 broken — zsh::recorder code leaked into default zshrs"
+            nm target/debug/zshrs 2>/dev/null | grep -E '\b8recorder[0-9a-zA-Z_]' \
+              | grep -v sqlite3RecordError | grep -v zshrs_daemon
+            exit 1
+          fi
+      - name: Run recorder harness
+        run: cargo test --locked --features recorder --test recorder_harness -- --nocapture
+
+  daemon-http:
+    # zshrs-daemon HTTP listener — see daemon/http.rs and
+    # docs/DAEMON_AS_SERVICE.md. Spawns the daemon with an isolated
+    # XDG_CACHE_HOME + XDG_CONFIG_HOME (so each test owns its own
+    # cache / socket / config), points it at a kernel-allocated free
+    # port (127.0.0.1:0 → real port via TcpListener probe), and drives
+    # `GET /health`, `GET /ops`, `POST /op/ping`, `POST /op/<unknown>`,
+    # plus the bearer-token auth path. Hermetic: every test owns a
+    # tempdir, no shared state across tests, no external network.
+    name: Daemon HTTP
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      RUST_BACKTRACE: 1
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The integration test spawns `target/debug/zshrs-daemon` (per
+      # tests/daemon_http.rs::zshrs_daemon_binary which falls back from
+      # CARGO_BIN_EXE_zshrs-daemon to manifest/target/debug). The daemon
+      # binary lives in the workspace's `daemon` crate (separate package
+      # from `zsh`), so `cargo test -p zsh` does NOT auto-build it. Build
+      # it explicitly here so each test's spawn isn't racing.
+      - name: Build zshrs-daemon binary the test will spawn
+        run: cargo build --locked -p zshrs-daemon --bin zshrs-daemon
+      - name: Run daemon HTTP integration tests
+        # --test-threads=1 because each test binds its own port + spawns
+        # its own daemon; sequential gives clearer per-test diagnostics
+        # and avoids the chance of two daemons racing the same XDG_CACHE
+        # tempdir cleanup on slow CI runners.
+        run: cargo test --locked --test daemon_http -- --test-threads=1 --nocapture
+
+  intellij-plugin:
+    name: IntelliJ plugin tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: editors/intellij
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up JDK 17
+        # Kotlin 2.0.21 pinned by IntelliJ Platform Gradle Plugin 2.16
+        # crashes parsing 3-part version strings of newer JDKs. JDK 17
+        # is the supported sweet spot — matches editors/intellij/README.md.
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '17'
+      - name: Cache Gradle + IntelliJ Platform SDK
+        # Caches ~/.gradle/caches AND ~/.gradle/wrapper AND the
+        # downloaded IntelliJ Platform JARs (~1 GB) so they don't
+        # re-download every CI run. Same shape as strykelang's
+        # equivalent job.
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            editors/intellij/.intellijPlatform
+          key: ${{ runner.os }}-gradle-${{ hashFiles('editors/intellij/build.gradle.kts', 'editors/intellij/gradle.properties', 'editors/intellij/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      - name: Run JUnit tests (lexer, commenter, registry, plugin manifest, settings)
+        # `--no-daemon` keeps the gradle process from sticking around
+        # for CI; `-x buildSearchableOptions` skips the heavy IDE
+        # indexing pass — we only need the test task.
+        run: ./gradlew test --no-daemon -x buildSearchableOptions
+      - name: Build plugin zip
+        # Verifies the full pipeline (compile, instrument, package,
+        # search-options indexer) works — catches discontinuous-token
+        # contract violations that unit tests miss.
+        run: ./gradlew buildPlugin --no-daemon
+      - name: Upload plugin zip
+        # Make the built `.zip` downloadable from the workflow run so
+        # contributors can grab it without rebuilding locally.
+        uses: actions/upload-artifact@v6
+        with:
+          name: zshrs-intellij-plugin
+          path: editors/intellij/build/distributions/*.zip
+          retention-days: 14
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: intellij-plugin-test-results
+          path: editors/intellij/build/test-results/test/
+          retention-days: 14
+
+  release-build:
+    name: Release Build
+    needs: [check, test, doc, corpus, recorder-harness, daemon-http, intellij-plugin]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zshrs-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/zshrs
+
+  docs-gates:
+    name: Docs gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash tests/docs-target-blank-rel-noopener.sh
+      - run: bash tests/docs-no-http-links.sh
+      - run: bash tests/docs-no-inline-handlers.sh
+
+  polish-gates:
+    name: Polish gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash tests/man-page-no-trailing-whitespace.sh
+      - run: bash tests/man-page-final-newline.sh
+      - run: bash tests/man-page-synopsis-section.sh
+      - run: bash tests/tests-shell-executable.sh
+      - run: bash tests/tests-shell-shebang.sh
+
+  semantic-gates:
+    name: Semantic gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash tests/docs-has-h1.sh
+      - run: bash tests/docs-no-deprecated-tags.sh
+      - run: bash tests/docs-no-placeholder-href.sh
+
+  newline-gates:
+    name: Newline + README gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash tests/readme-final-newline.sh
+      - run: bash tests/docs-final-newline.sh
+      - run: bash tests/workflow-final-newline.sh
+      - run: bash tests/cargo-final-newline.sh
+      - run: bash tests/readme-has-https-link.sh
+
+  structure-gates:
+    name: Structure gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash tests/readme-has-h2-section.sh
+      - run: bash tests/readme-has-badges.sh
+      - run: bash tests/docs-has-html-closing.sh
+      - run: bash tests/docs-has-body-tag.sh
+      - run: bash tests/workflow-no-tabs.sh
+
+  parity-fuzz:
+    name: Parity fuzz
+    runs-on: ubuntu-latest
+    # 70 modes: ~3 min build + ~30 min of fuzzing (run 37766178879 reached
+    # mode 67 at the 30-min mark with every mode at 0 new divergences).
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - id: oracle
+        uses: ./.github/actions/zsh-oracle
+      # The fuzzer's reference is the release zshrs reports as its own version, not the
+      # distro's zsh (Ubuntu ships 5.9, whose `break` error text differs from 5.9.2's).
+      - uses: ./.github/actions/zsh-oracle
+        with:
+          commit: zsh-5.9.2
+          dir: zsh-5.9.2
+          env-var: ZSHRS_FUZZ_ZSH
+      - name: Build zshrs + fuzzer
+        run: |
+          cargo build --locked
+          cargo build --locked --features parity-fuzz --bin parity-fuzz
+      # Generative differential fuzz: `zsh -fc` vs `zshrs --zsh -fc` across
+      # grammar-driven cases in each mode. `--verify 3` re-runs every candidate
+      # divergence and discards any that doesn't reproduce, rejecting
+      # load-contention flakiness. `--baseline` allowlists KNOWN gaps (normalized
+      # signatures) so only a NEW divergence fails the build. When a new gap is
+      # triaged, add its printed signature line to the matching baseline file.
+      # Blocking gates — glob and heredoc are fully clean (empty baseline: any
+      # divergence is a regression); stateful and expr allowlist their few
+      # known gaps. A NEW divergence in any of these fails the build.
+      - name: Fuzz — glob
+        run: ./target/debug/parity-fuzz --mode glob --count 5000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/glob.txt --out target/parity-fuzz/ci-glob.txt
+      - name: Fuzz — heredoc
+        run: ./target/debug/parity-fuzz --mode heredoc --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/heredoc.txt --out target/parity-fuzz/ci-heredoc.txt
+      - name: Fuzz — stateful
+        run: ./target/debug/parity-fuzz --mode stateful --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/stateful.txt --out target/parity-fuzz/ci-stateful.txt
+      - name: Fuzz — expr
+        run: ./target/debug/parity-fuzz --mode expr --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/expr.txt --out target/parity-fuzz/ci-expr.txt
+      # match / regex / builtin / cmdsub / loop exercise surface no other mode
+      # reaches: the (S)(I)(B)(E)(M)(N) substring-match flags, `[[ =~ ]]` and its
+      # $MATCH/$match/BASH_REMATCH side effects, the print/echo/read/getopts/eval
+      # builtins, command substitution's splitting and `$(<file)` path, and the
+      # loop/case-fallthrough forms. All five are clean (empty baseline: any
+      # divergence is a regression).
+      - name: Fuzz — match
+        run: ./target/debug/parity-fuzz --mode match --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/match.txt --out target/parity-fuzz/ci-match.txt
+      - name: Fuzz — regex
+        run: ./target/debug/parity-fuzz --mode regex --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/regex.txt --out target/parity-fuzz/ci-regex.txt
+      - name: Fuzz — builtin
+        run: ./target/debug/parity-fuzz --mode builtin --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/builtin.txt --out target/parity-fuzz/ci-builtin.txt
+      - name: Fuzz — cmdsub
+        run: ./target/debug/parity-fuzz --mode cmdsub --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/cmdsub.txt --out target/parity-fuzz/ci-cmdsub.txt
+      - name: Fuzz — loop
+        run: ./target/debug/parity-fuzz --mode loop --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/loop.txt --out target/parity-fuzz/ci-loop.txt
+      # expand: expansion semantics (field splitting under IFS variants, "$@"/"$*",
+      # the - = ? + operators, # ## % %% with variable patterns, arithmetic,
+      # command substitution, quoting, tilde) through every Bourne-family leg whose
+      # reference is the 5.9.2 zsh built above. The empty baseline makes any
+      # divergence a regression. The real-shell legs (bash, dash, ksh93, mksh) are
+      # run by hand: their references differ by version from runner to runner.
+      - name: Fuzz — expand (zsh)
+        run: ./target/debug/parity-fuzz --mode expand --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/expand.txt --out target/parity-fuzz/ci-expand-zsh.txt
+      - name: Fuzz — expand (sh/zsh-style)
+        run: ./target/debug/parity-fuzz --mode expand --shell sh/zsh-style --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/expand.txt --out target/parity-fuzz/ci-expand-sh-zsh.txt
+      - name: Fuzz — expand (ksh/zsh-style)
+        run: ./target/debug/parity-fuzz --mode expand --shell ksh/zsh-style --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/expand.txt --out target/parity-fuzz/ci-expand-ksh-zsh.txt
+      # datetime / alias / stat reach surface no other mode does — zsh/datetime's
+      # strftime format specifiers, lexer-level alias expansion (parse-time
+      # binding, global + suffix aliases), and zsh/stat's field/format matrix.
+      # All three are fully clean (empty baseline: any divergence is a regression).
+      - name: Fuzz — datetime
+        run: ./target/debug/parity-fuzz --mode datetime --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/datetime.txt --out target/parity-fuzz/ci-datetime.txt
+      - name: Fuzz — alias
+        run: ./target/debug/parity-fuzz --mode alias --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/alias.txt --out target/parity-fuzz/ci-alias.txt
+      - name: Fuzz — stat
+        run: ./target/debug/parity-fuzz --mode stat --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/stat.txt --out target/parity-fuzz/ci-stat.txt
+      # quote / procsub / autoload / errexit / paramod each carry a SMALL set of
+      # triaged, documented gaps (see the header of each baseline file). They are
+      # blocking gates against that allowlist: the known gaps are tolerated, any
+      # NEW divergence fails the build. Drive the allowlists to empty over time.
+      - name: Fuzz — quote
+        run: ./target/debug/parity-fuzz --mode quote --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/quote.txt --out target/parity-fuzz/ci-quote.txt
+      - name: Fuzz — procsub
+        run: ./target/debug/parity-fuzz --mode procsub --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/procsub.txt --out target/parity-fuzz/ci-procsub.txt
+      - name: Fuzz — autoload
+        run: ./target/debug/parity-fuzz --mode autoload --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/autoload.txt --out target/parity-fuzz/ci-autoload.txt
+      - name: Fuzz — errexit
+        run: ./target/debug/parity-fuzz --mode errexit --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/errexit.txt --out target/parity-fuzz/ci-errexit.txt
+      - name: Fuzz — paramod
+        run: ./target/debug/parity-fuzz --mode paramod --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/paramod.txt --out target/parity-fuzz/ci-paramod.txt
+      # posparam / numfmt / mapfile / pcre / zwc cover the positional-parameter
+      # list ($@ vs $* vs argv, shift, slices), numeric RE-RENDERING (typeset -i
+      # output base, -F/-E precision, -Z/-L/-R padding, float formatting),
+      # zsh/mapfile, the zsh/pcre engine and its `=~` REMATCH_PCRE dispatch, and
+      # the zcompile/.zwc digest path that every autoload goes through once a
+      # digest exists. All five are clean (empty baseline: any divergence is a
+      # regression).
+      - name: Fuzz — posparam
+        run: ./target/debug/parity-fuzz --mode posparam --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/posparam.txt --out target/parity-fuzz/ci-posparam.txt
+      - name: Fuzz — numfmt
+        run: ./target/debug/parity-fuzz --mode numfmt --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/numfmt.txt --out target/parity-fuzz/ci-numfmt.txt
+      - name: Fuzz — mapfile
+        run: ./target/debug/parity-fuzz --mode mapfile --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/mapfile.txt --out target/parity-fuzz/ci-mapfile.txt
+      - name: Fuzz — pcre
+        # pcre_match -a gives an unmatched optional capture an empty element
+        # upstream (52405, 52502); 5.9.2 drops it.
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode pcre --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/pcre.txt --out target/parity-fuzz/ci-pcre.txt
+      - name: Fuzz — zwc
+        run: ./target/debug/parity-fuzz --mode zwc --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/zwc.txt --out target/parity-fuzz/ci-zwc.txt
+      # readb / fd / special cover the `read` builtin's flag matrix, explicit
+      # file-descriptor manipulation (exec N>, {v}>, >&N, >&-) and the
+      # deterministic shell-maintained parameters (LINENO, ZSH_SUBSHELL, $?,
+      # funcstack, pipestatus). fd is the one that caught the shell parking its
+      # own log and sqlite handles on fds 3-7. All three are clean; tied carries
+      # one documented gap (see its baseline header).
+      - name: Fuzz — readb
+        run: ./target/debug/parity-fuzz --mode readb --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/readb.txt --out target/parity-fuzz/ci-readb.txt
+      - name: Fuzz — fd
+        run: ./target/debug/parity-fuzz --mode fd --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/fd.txt --out target/parity-fuzz/ci-fd.txt
+      - name: Fuzz — special
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode special --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/special.txt --out target/parity-fuzz/ci-special.txt
+      - name: Fuzz — tied
+        run: ./target/debug/parity-fuzz --mode tied --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/tied.txt --out target/parity-fuzz/ci-tied.txt
+      # typeset covers the attribute surface itself — -i base, -F/-E precision,
+      # -Z/-L/-R padding, -u/-l case, -U uniqueness and -T ties — including the
+      # ${(t)} type string each produces. It had a baseline file but no gate, so
+      # nothing ran it; `typeset -U path` was broken under a green build.
+      - name: Fuzz — typeset
+        run: ./target/debug/parity-fuzz --mode typeset --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/typeset.txt --out target/parity-fuzz/ci-typeset.txt
+      # cond covers the `test` / `[` builtin — unary flags, the 3-arg binary
+      # form, -a/-o connectives, !, parens — in both spellings, with stderr
+      # folded in so the diagnostics and the 1-vs-2 status distinction are both
+      # compared. Its baseline allows exactly one class (the literal `-a`/`-n`
+      # spelled as an operand, which needs the real condition grammar) and
+      # nothing else. It had NO mode at all before, which is how `test a -a b`
+      # stayed broken.
+      - name: Fuzz — cond
+        run: ./target/debug/parity-fuzz --mode cond --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/cond.txt --out target/parity-fuzz/ci-cond.txt
+      # funclist covers function LISTING (`functions`, `typeset -f`, `whence -f`,
+      # `which`) — how zsh prints a function back, not what it does. C renders
+      # the compiled wordcode via getpermtext (hashtable.c:954), so the output
+      # is canonical rather than the source as typed, and it is meant to be
+      # re-parseable. Nothing fuzzed the listing before, which is how a
+      # hand-rolled emulation of getpermtext drifted far enough to mangle
+      # `{ … } always { … }` into `print x } always { print y` unnoticed.
+      # Baseline is EMPTY: any divergence here is a regression.
+      - name: Fuzz — funclist
+        run: ./target/debug/parity-fuzz --mode funclist --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/funclist.txt --out target/parity-fuzz/ci-funclist.txt
+      # redir covers redirections, MULTIOS teeing, fd juggling, here-strings,
+      # append-vs-truncate, and function-level redirects (`f() { … } > file`,
+      # which zsh re-opens on every CALL, not at definition). The mode existed
+      # with a clean baseline but was never gated. Baseline is EMPTY: any
+      # divergence here is a regression.
+      - name: Fuzz — redir
+        run: ./target/debug/parity-fuzz --mode redir --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/redir.txt --out target/parity-fuzz/ci-redir.txt
+      # trap covers both trap spellings (`trap '…' SIG` and `TRAPSIG() { … }`,
+      # which have different semantics), EXIT/ERR/DEBUG, `always` blocks,
+      # TRY_BLOCK_ERROR, LOCAL_TRAPS, install-time parsing, listing, and
+      # subshell inheritance (entersubsh, exec.c:1088-1092). The mode existed
+      # but was never gated, which is how those gaps lived. Baseline carries
+      # ONE known gap (ERR firing from inside a trap body — see trap.txt);
+      # anything else is a regression.
+      - name: Fuzz — trap
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode trap --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/trap.txt --out target/parity-fuzz/ci-trap.txt
+      # shinstdin is the only mode fed on STDIN rather than via `-c`. That is
+      # not a stylistic choice: `-c` leaves C's SHINSTDIN OFF (c:Src/init.c),
+      # so everything gated on it — PRINT_EXIT_VALUE at c:Src/exec.c:4253/5442
+      # — was unreachable by every other mode no matter what the program said.
+      # Baseline carries the PRINT_EXIT_VALUE gap (see shinstdin.txt).
+      - name: Fuzz — shinstdin
+        run: ./target/debug/parity-fuzz --mode shinstdin --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/shinstdin.txt --out target/parity-fuzz/ci-shinstdin.txt
+      # The ten modes below all EXISTED and ran clean, but none was gated, so
+      # nothing stopped a regression in any of them. `trap` and `redir` sat in
+      # exactly that state and each turned out to be hiding real bugs the moment
+      # their vocabulary was widened — a clean ungated mode is an untested mode,
+      # not a correct one. All baselines are EMPTY: any divergence is a
+      # regression. See each mode's baseline file for what it covers.
+      #
+      # func / pattern / subscript / zutil: function scoping and `local`,
+      # pattern matching, array+assoc subscripting and flags, and zsh/zutil
+      # (zstyle/zparseopts/zregexparse).
+      - name: Fuzz — func
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode func --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/func.txt --out target/parity-fuzz/ci-func.txt
+      - name: Fuzz — pattern
+        run: ./target/debug/parity-fuzz --mode pattern --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/pattern.txt --out target/parity-fuzz/ci-pattern.txt
+      - name: Fuzz — subscript
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode subscript --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/subscript.txt --out target/parity-fuzz/ci-subscript.txt
+      - name: Fuzz — zutil
+        run: ./target/debug/parity-fuzz --mode zutil --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/zutil.txt --out target/parity-fuzz/ci-zutil.txt
+      # dirstack / emulate / mathfunc / modifier / pipeline / split: the
+      # directory stack, `emulate sh|ksh|zsh` option blocks, user-defined math
+      # functions, history/parameter modifiers, exit-status plumbing
+      # ($pipestatus/PIPE_FAIL), and IFS word splitting.
+      - name: Fuzz — dirstack
+        run: ./target/debug/parity-fuzz --mode dirstack --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/dirstack.txt --out target/parity-fuzz/ci-dirstack.txt
+      - name: Fuzz — emulate
+        run: ./target/debug/parity-fuzz --mode emulate --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/emulate.txt --out target/parity-fuzz/ci-emulate.txt
+      - name: Fuzz — mathfunc
+        run: ./target/debug/parity-fuzz --mode mathfunc --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/mathfunc.txt --out target/parity-fuzz/ci-mathfunc.txt
+      - name: Fuzz — modifier
+        run: ./target/debug/parity-fuzz --mode modifier --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/modifier.txt --out target/parity-fuzz/ci-modifier.txt
+      - name: Fuzz — pipeline
+        run: ./target/debug/parity-fuzz --mode pipeline --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/pipeline.txt --out target/parity-fuzz/ci-pipeline.txt
+      - name: Fuzz — split
+        run: ./target/debug/parity-fuzz --mode split --count 4000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/split.txt --out target/parity-fuzz/ci-split.txt
+      # brace / getopts / assoc / casesel cover brace expansion (ranges, padding,
+      # products), the getopts parse loop (OPTIND/OPTARG, clustering, silent
+      # mode), associative-array flags/subscripts, and case pattern selection
+      # incl. `;&`/`;|` fallthrough and the GLOB_SUBST rule for `$p` vs `$~p`.
+      # All clean (empty baseline: any divergence is a regression).
+      - name: Fuzz — brace
+        run: ./target/debug/parity-fuzz --mode brace --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/brace.txt --out target/parity-fuzz/ci-brace.txt
+      - name: Fuzz — getopts
+        run: ./target/debug/parity-fuzz --mode getopts --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/getopts.txt --out target/parity-fuzz/ci-getopts.txt
+      - name: Fuzz — assoc
+        run: ./target/debug/parity-fuzz --mode assoc --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/assoc.txt --out target/parity-fuzz/ci-assoc.txt
+      - name: Fuzz — casesel
+        run: ./target/debug/parity-fuzz --mode casesel --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/casesel.txt --out target/parity-fuzz/ci-casesel.txt
+      # default / anonfn cover the ${x:-w}/${x:=w}/${x:+w}/${x:?m} default-value
+      # family across the unset/empty/set states, and anonymous functions
+      # (`() { … } args` — positionals, $0, locals, redirs). Both clean.
+      - name: Fuzz — default
+        run: ./target/debug/parity-fuzz --mode default --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/default.txt --out target/parity-fuzz/ci-default.txt
+      - name: Fuzz — anonfn
+        run: ./target/debug/parity-fuzz --mode anonfn --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/anonfn.txt --out target/parity-fuzz/ci-anonfn.txt
+      # printv / globanchor cover the print builtin's output-shaping flags
+      # (-v/-f/-l/-c/-C/-o/-O/-N and their combinations) and the extended-glob
+      # pattern anchors the `pattern` mode doesn't reach ((#s)/(#e)/(#cN,M)/
+      # (#i), exclusion `x~y`, negation `^x`). Both clean.
+      - name: Fuzz — printv
+        run: ./target/debug/parity-fuzz --mode printv --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/printv.txt --out target/parity-fuzz/ci-printv.txt
+      - name: Fuzz — globanchor
+        run: ./target/debug/parity-fuzz --mode globanchor --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/globanchor.txt --out target/parity-fuzz/ci-globanchor.txt
+      # whence / zstyle cover command resolution (whence/type/where/command -v/-V,
+      # the -w/-v/-a/-m flag matrix over functions/aliases/builtins/reserved
+      # words) and the zstyle database (-g/-a/-b/-t/-s/-m/-e/-L/-d, most-specific
+      # context matching). Both clean.
+      - name: Fuzz — whence
+        run: ./target/debug/parity-fuzz --mode whence --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/whence.txt --out target/parity-fuzz/ci-whence.txt
+      - name: Fuzz — zstyle
+        run: ./target/debug/parity-fuzz --mode zstyle --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/zstyle.txt --out target/parity-fuzz/ci-zstyle.txt
+      # atflag covers the `(@)` word-flag (nojoin=2) and `(A)` array-force
+      # (arrasg) composed with subscripts, outer length/join/sort operators,
+      # and nested expansions across scalar / array / assoc value sources —
+      # the array-vs-scalar SHAPE rules (isarr / LF_ARRAY, c:subst.c:2915,
+      # 3881, 4235). One known-gap class baselined (empty-array slice length).
+      - name: Fuzz — atflag
+        run: ./target/debug/parity-fuzz --mode atflag --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/atflag.txt --out target/parity-fuzz/ci-atflag.txt
+      # subexp covers UNQUOTED nested `${${...}[...]}` value semantics: the
+      # `(P)` named-ref (Src/subst.c aspar) with a following subscript across
+      # scalar / array / assoc referents, and subscript-under-length. Fixed
+      # this round: `${${(P)assoc}[key]}` key lookup and `${#${subexp}[N]}`.
+      # The baseline file holds ZERO signatures — nested bare-assoc value-splat
+      # shape and empty-array slice length are both FIXED, so any divergence
+      # here is a regression. (The empty-array slice was still live until
+      # LF_ARRAY was stamped before the c:Src/subst.c:3885 collapse; the
+      # baseline file's prose had already been written as if it were done.)
+      - name: Fuzz — subexp
+        run: ./target/debug/parity-fuzz --mode subexp --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/subexp.txt --out target/parity-fuzz/ci-subexp.txt
+      # replace pins the `${name/pat/repl}` / `${name//pat/repl}` substitution
+      # engine under extendedglob (anchors, x#/x## zero-or-more, alternation,
+      # (#b)/(#m) backreferences). Fixed to a strict gate: the `(#e)` end-anchor
+      # zero-width match and top-level alternation first-branch across all
+      # replace paths (c:Src/glob.c getmatch + Src/pattern.c patmatch).
+      - name: Fuzz — replace
+        run: ./target/debug/parity-fuzz --mode replace --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/replace.txt --out target/parity-fuzz/ci-replace.txt
+      # nest — deeply nested `${…${…}…}` expansions combining flags, subscripts,
+      # modifiers and set/zip operators. Fixed the DQ scalar-collapse of a nested
+      # `:^`/`:^^` zip (c:Src/subst.c:3032 via SUBEXP_SCALAR_CTX); one narrow
+      # empty-field-split edge remains baselined.
+      - name: Fuzz — nest
+        run: ./target/debug/parity-fuzz --mode nest --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/nest.txt --out target/parity-fuzz/ci-nest.txt
+      # assign — assignment inside a parameter expansion (${n=w}/${n:=w}/${n::=w})
+      # with (A)/(AA) array/assoc flags and the `=`/`(s:X:)` split flags. Strict
+      # gate: the RHS splits only under spsep/spbreak (c:Src/subst.c:3272), the
+      # empty/scalar element shapes match (c:3282-3293), and (AA) odd counts error.
+      - name: Fuzz — assign
+        run: ./target/debug/parity-fuzz --mode assign --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/assign.txt --out target/parity-fuzz/ci-assign.txt
+      # gflag — `${(g:opts:)}`, i.e. getkeystring (c:Src/utils.c:6915), the escape
+      # decoder shared with print/echo/$'…'/printf/bindkey. Covers every opts
+      # subset (e/o/c → GETKEY_EMACS/OCTAL_ESC/CTRL, c:Src/subst.c:2411-2425)
+      # against every escape shape, and the array-vs-scalar decode ordering.
+      # Strict gate: C's numeric branch is ONE arm whose bits are coupled —
+      # `\1` without `o` is a literal backslash, the parse runs through zstrtol
+      # (blank-skip + sign), `\0x41` is hex, and a quoted non-`(@)` array is
+      # decoded AFTER the c:3032 join. Empty baseline: any divergence is a
+      # regression.
+      - name: Fuzz — gflag
+        run: ./target/debug/parity-fuzz --mode gflag --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/gflag.txt --out target/parity-fuzz/ci-gflag.txt
+      # select — the `select` loop (c:Src/loop.c:217 execselect) and its menu
+      # (c:347 selectlist): word lists of varying width/count, every reply shape
+      # (valid / out-of-range / 0 / negative / non-numeric / EMPTY), the
+      # positional-parameter form, and multi-pick runs that drain stdin. Scripts
+      # pin COLUMNS/LINES/PS3 because the menu is stderr + terminal-width driven.
+      # Strict gate: the menu prints once per select plus once per blank line
+      # (never per body iteration), the reply parses with atoi(3) semantics, and
+      # the pparam form keeps empty positionals. Empty baseline: any divergence
+      # is a regression.
+      - name: Fuzz — select
+        run: ./target/debug/parity-fuzz --mode select --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/select.txt --out target/parity-fuzz/ci-select.txt
+      # bindkey — the key-spec decoder (c:Src/Zle/zle_keymap.c:1022 et al call
+      # getkeystring with GETKEYS_BINDKEY = OCTAL_ESC|EMACS|CTRL, a combination
+      # no other caller uses) plus the display path. Binds through one spelling
+      # and reads back through an EQUIVALENT one (`^X` vs `\C-x`, `\M-^A` vs
+      # `\M-\C-a`, `\101` vs `A`), so a self-consistently wrong decoder still
+      # fails. Strict gate: `\M` sets the meta BIT, one `-` per modifier,
+      # `^`/`\M`/`\C` chain in either order, and `meta = 1 + control` ordering
+      # (`\M-\C-?` is 0xff, `\C-\M-?` is 0x9f). Empty baseline: any divergence
+      # is a regression.
+      - name: Fuzz — bindkey
+        run: ./target/debug/parity-fuzz --mode bindkey --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/bindkey.txt --out target/parity-fuzz/ci-bindkey.txt
+      # zmv — an autoload FUNCTION in zsh (Functions/Misc/zmv, which IS the
+      # spec) that zshrs intercepts with a native Rust impl, so this pins the
+      # impl against the real thing: capture groups, `$f` / full ${(Xe)}
+      # replacement expansion, -w/-W wildcard rewriting, (a|b) alternation,
+      # nobareglobqual, (q-)-quoted -n/-v output, and the -ef "file exists"
+      # exemption. Every probe passes -n, so the fixture stays READ-ONLY and no
+      # worker (or minimized probe) can rename a file. One known-gap class
+      # baselined: the -Q no-match tag/status — see the baseline header.
+      - name: Fuzz — zmv
+        run: ./target/debug/parity-fuzz --mode zmv --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/zmv.txt --out target/parity-fuzz/ci-zmv.txt
+      # zcalc — the other autoload FUNCTION zshrs intercepts natively (with zmv/
+      # zcp/zln). Pins the impl against Functions/Misc/zcalc: the zsh/mathfunc
+      # load that makes sqrt/atan resolve at all (zcalc:133), and
+      # zcalc_show_value's reformatting (zcalc:99-112) — %g to 6 significant
+      # digits, bare-trailing-dot printed raw, and no-dot via printf %d (so Inf
+      # is ZLONG_MAX, NaN is 0). Empty baseline: any divergence is a regression.
+      - name: Fuzz — zcalc
+        run: ./target/debug/parity-fuzz --mode zcalc --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/zcalc.txt --out target/parity-fuzz/ci-zcalc.txt
+      # rcexpand — RC_EXPAND_PARAM (the `^` flag / plan9, c:Src/subst.c:2550)
+      # and its sibling unbraced flag `=` (spbreak, c:2558), each paired with
+      # its braced form. C runs ONE flag loop for braced and unbraced alike
+      # (c:1890-1891), so `$^a` and `${^a}` must agree exactly — this port
+      # reaches them through different code, which is how the unbraced forms
+      # came to compile to LITERAL text (`$^fpath/prompt_*_setup(N)` found ZERO
+      # themes; 29 of zsh's own functions use the form). Eight bugs, most from
+      # ONE cause: the flags are known only at COMPILE time while every concat
+      # builtin dispatched on the RUNTIME option, so a flag could not override
+      # its own option. Also pins prefork's empty-word delete running AFTER the
+      # word is assembled (c:184-188) — `${=s}.x` is `a b .x`, not `'' a b .x`.
+      # Empty baseline: any divergence is a regression.
+      - name: Fuzz — rcexpand
+        run: ./target/debug/parity-fuzz --mode rcexpand --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/rcexpand.txt --out target/parity-fuzz/ci-rcexpand.txt
+      # mbident — multibyte (non-ASCII) parameter names in braced read forms
+      # (${日}, ${#café}, ${(U)π}). Empty baseline: any divergence is a
+      # regression. Guards the Bug #1021 braced-read fix in paramsubst.
+      - name: Fuzz — mbident
+        run: ./target/debug/parity-fuzz --mode mbident --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/mbident.txt --out target/parity-fuzz/ci-mbident.txt
+      # printf — PROMOTED from informational to a blocking gate: the format
+      # classes that made it gap-rich were getkeystring bugs, and 10,000 cases
+      # now run clean. printf drives the decoder through two flag sets nothing
+      # else uses (c:zsh.h:3181-3183): GETKEYS_PRINTF_FMT (OCTAL_ESC|
+      # BACKSLASH_C|PRINTF_PERCENT) for the format and GETKEYS_PRINTF_ARG
+      # (BACKSLASH_C only) for a %b argument — so `\777` is a 0xff byte in the
+      # format but a LITERAL backslash in a %b arg, and `\E` stays literal in
+      # both. See the baseline header. Empty baseline: any divergence is a
+      # regression.
+      - name: Fuzz — printf
+        run: ./target/debug/parity-fuzz --mode printf --count 5000 --verify 3 --max-report 400 --baseline .github/fuzz-baseline/printf.txt --out target/parity-fuzz/ci-printf.txt
+      # arith — PROMOTED from informational to a blocking gate. The class that
+      # kept it informational was a PARENTHESISED bound in a RANGE subscript
+      # (`${arr[(x), 4]}` sliced the whole array where zsh gives `b c d`). The
+      # old note blamed mathevalarg's missing `**ss` out-param and a
+      # comma-split-at-any-depth; both were wrong — the bug was one branch in
+      # the slice-bound evaluator that stripped ANY leading `(…)` as a flag
+      # group. C only reads `(…)` as flags while the chars ARE flags
+      # (c:Src/params.c:1392-1476) and its `flagerr` arm (c:1477-1482) REWINDS
+      # to before the `(` otherwise, so the group is re-read as math — hence
+      # `${arr[(zz)1]}` saying `bad math expression`. The generator only ever
+      # emitted SINGLE-index subscripts, which is why the mode ran clean while
+      # the bug was live; it now emits range bounds too, and reverting the fix
+      # makes this gate fail. Empty baseline: any divergence is a regression.
+      - name: Fuzz — arith
+        run: ./target/debug/parity-fuzz --mode arith --count 4000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/arith.txt --out target/parity-fuzz/ci-arith.txt
+      # prompt covers the `print -P` / ${(%)…} expander: %-escapes, %(x.t.f)
+      # ternaries, %N<s< / %N>s> truncation (both signs), colours and %{raw%}.
+      # Fully clean (empty baseline: any divergence is a regression). Count is
+      # lower than its siblings on purpose: ~12% of generated cases hang ZSH —
+      # an upstream infinite loop in countprompt (`w -= zterm_columns` with
+      # zterm_columns == 0) — and each one costs a full timeout before the
+      # harness discards it. See the baseline file for the exact trigger and why
+      # the harness must NOT export COLUMNS to dodge it.
+      - name: Fuzz — prompt
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode prompt --count 2000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/prompt.txt --out target/parity-fuzz/ci-prompt.txt
+      # Informational. Every divergence this mode still reports is under
+      # `unsetopt multibyte` -- measured, not assumed: 30/30 at --count 400
+      # carry the `unsetopt multibyte` line, 0 occur with the option on.
+      #
+      # The byte-mode rule is that with MULTIBYTE off the length / index /
+      # slice / pad / split / char-class sites must count BYTES. C does that
+      # by short-circuiting INSIDE two shared helpers -- Src/utils.c:5613
+      # mb_metacharlenconv and :5662 mb_metastrlenend.
+      #
+      # The port had copied that guard to ONE call site (the `${#v}` arm) and
+      # left it out of the helpers, so `${#v}` counted bytes while every other
+      # caller kept counting characters. The guard now lives in
+      # mb_metastrlenend where C keeps it, and dopadding iterates C's
+      # MB_METACHARLENCONV units instead of Rust `char`s. That closed the
+      # padding class (18 -> 2 of 400) and fixed two DEFAULT-mode (multibyte
+      # ON) bugs this mode never generated:
+      #   ${(l:5::x:)$'\xe6\x97\xa5'} emitted `c3 86 97 a5` (corrupt) where
+      #     zsh gives `xxxx` + `e6 97 a5` -- a metafied pair counted as 2
+      #     units by chars(), so the value was truncated instead of padded;
+      #   ${#$'\xe6'} returned 4 where zsh gives 1 under `unsetopt multibyte`
+      #     (the metafied String's UTF-8 length, not C's demetafied ztrlen).
+      #
+      # Same shape closed four more groups (49 -> 30 of 400, no new seeds).
+      # c:5613's guard now lives in mb_metacharlenconv, which also returns the
+      # unit in the port's String form so a byte-mode cut can be represented at
+      # all, and the scalar-subscript, `${(s::)}` split, `##` char-literal,
+      # `${(#)}` and casemodify walks step THAT unit instead of a Rust `char`:
+      #   subscript/slice 13 -> 0   split 6 -> 0   $(( ##c )) 4 -> 0
+      #   ${(#)N} 3 -> 0            case 5 -> 4
+      # casemodify had no byte arm at all (C forks the whole function at
+      # c:Src/hist.c:2203); `${(#)}` had lost BOTH halves of c:Src/subst.c:1508
+      # `isset(MULTIBYTE) && ires > 127`, so it UTF-8-encoded every value and
+      # `${(#)206}` emitted `c3 8e` where zsh emits the single byte `ce`.
+      #
+      # Remaining at --count 400 (30 total), by measured root cause:
+      #   11  ${v/[[:alpha:]]/X}   (first-match substitution)
+      #    7  ${v//[[:alpha:]]/X}  (global substitution)
+      #    6  quoting ${(q)} / ${(qq)}
+      #    4  case ${(U)} / ${(L)} / ${(C)}
+      #    2  ${(ml:8::.:)j}       -- NOT a port gap; see below
+      #
+      # The 18 substitution cases are an INTERFACE boundary, not a missing
+      # guard. pattern.rs already degrades correctly (`charinc` and
+      # `anyof_membership` gate on GF_MULTIBYTE, `charsub` on the option), but
+      # `patmatch` takes `&str` and the scan feeds it `&val[q_byte..]`. Byte
+      # mode has to probe offsets that fall INSIDE a character, and Rust cannot
+      # take that slice -- so closing these means making the pattern entry
+      # point byte-native, a core-subsystem change rather than a local one.
+      # Flagged rather than papered over.
+      #
+      # The 6 quoting cases need per-BYTE printability. C's WC_ISPRINT is
+      # `iswprint(cc)` (Src/ztype.h:79) and byte mode hands it the raw byte as
+      # a wide char, so 0xd0 (U+00D0) passes through while 0x9f (U+009F, a C1
+      # control) becomes `$'\237'`. quotestring builds a String and would have
+      # to build BYTES to mix the two. Note the oracle dependence: Apple's
+      # /bin/zsh 5.9 escapes EVERY byte of the same input, Homebrew 5.9.2
+      # escapes only the unprintable ones. The fuzz oracle is whatever
+      # `zsh_path()` picks (Homebrew first), so verify against THAT binary.
+      #
+      # The 4 case cases are an upstream artifact, not a fold error -- the fold
+      # itself now matches byte-for-byte. C writes an UNMODIFIED imeta byte RAW
+      # into a metafied buffer (c:2315 re-metafies only when `mod`), so a value
+      # holding 0x9f loses it downstream: `${(L)cy}` returns 11 bytes for a
+      # 12-byte input, and 0x97 (`Quest`) untokenizes into a glob `?`, which is
+      # why `${(C)j}` reports "no matches found" in real zsh. Matching that
+      # means reproducing C's own metafication corruption.
+      #
+      # The 2 `(ml:` cases are an UPSTREAM zsh out-of-bounds read, not a port
+      # gap. Do not "fix" or baseline them. With MULTIBYTE off, c:5662 returns
+      # before the `width` argument is consulted, so `ls` is a BYTE COUNT
+      # while the c:Src/subst.c:1072 copy loop decrements by WCPADWIDTH
+      # (display CELLS); the two metrics disagree and the walk runs past the
+      # terminator. Proof it reads adjacent memory -- identical input, output
+      # changes with the process environment:
+      #   zsh -f -c 'unsetopt multibyte; j=<CJK>; print -r -- "[${(ml:8::.:)j}]"'
+      # prints `[=/Users/]` in one environment and `[?:(?:25[]` in another.
+      # Neither string occurs anywhere in the input, so matching it would mean
+      # reproducing zsh's heap layout.
+      - name: Fuzz — unicode (informational)
+        continue-on-error: true
+        run: ./target/debug/parity-fuzz --mode unicode --count 3000 --verify 3 --max-report 200 --out target/parity-fuzz/ci-unicode.txt
+      # Job-table visibility across the cmd-subst boundary. Deliberately a
+      # LOW count: every case backgrounds a `sleep 2` so the job is reliably
+      # still running when the probe reads the table, which caps throughput
+      # at ~1.5 cases/s. The generator space is only 3 setups x 20 probes,
+      # so 200 already covers it several times over. Bug #1048.
+      - name: Fuzz — jobs
+        env:
+          ZSHRS_FUZZ_ZSH: ${{ steps.oracle.outputs.zsh }}
+        run: ./target/debug/parity-fuzz --mode jobs --count 200 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/jobs.txt --out target/parity-fuzz/ci-jobs.txt
+      # EXTENDEDGLOB operators (`#`/`##`/`^`) next to a parameter expansion,
+      # with the option turned on by a `setopt` INSIDE the script. Passing
+      # `-o extendedglob` on the command line masks the whole bug class, so
+      # the generator never does. Bug #1049.
+      - name: Fuzz — extglob
+        run: ./target/debug/parity-fuzz --mode extglob --count 3000 --verify 3 --max-report 200 --baseline .github/fuzz-baseline/extglob.txt --out target/parity-fuzz/ci-extglob.txt
+      - name: Upload divergence corpora
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-fuzz-divergences
+          path: target/parity-fuzz/ci-*.txt

@@ -1,0 +1,245 @@
+//! `${(z)…}` word splitting — the shell lexer run over a string.
+//!
+//! Line-editor plugins parse the command line with `(z)` to find command
+//! position, the word under the cursor and the statement it belongs to
+//! (zsh-expand, zsh-autosuggestions strategies, fzf-tab, abbreviation
+//! plugins). Each token has to come back exactly as zsh's `bufferwords()`
+//! returns it: an operator that is split in two, or glued to the word
+//! before it, moves every later word into the wrong statement.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn zshrs_bin() -> PathBuf {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_zshrs") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("debug")
+        .join("zshrs")
+}
+
+fn zsh_path() -> &'static str {
+    crate::oracle::zsh_path()
+}
+
+fn zsh_available() -> bool {
+    Command::new(zsh_path())
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Print every `(z)` word of each input, quoted, one input per line, and
+/// compare the two shells' output.
+fn assert_same_words(inputs: &[&str]) {
+    if !zsh_available() {
+        eprintln!("skip: zsh not found");
+        return;
+    }
+    let mut script = String::from("for zqin in");
+    for i in inputs {
+        script.push_str(&format!(" '{}'", i.replace('\'', "'\\''")));
+    }
+    script.push_str("; do print -r -- ${(qqq)${(z)zqin}}; done");
+    let z = Command::new(zsh_path())
+        .args(["-fc", &script])
+        .output()
+        .expect("invoke zsh");
+    let r = Command::new(zshrs_bin())
+        .args(["--zsh", "-f", "-c", &script])
+        .env_remove("ZSHRS_CACHE")
+        .output()
+        .expect("invoke zshrs");
+    let z_out = String::from_utf8_lossy(&z.stdout).into_owned();
+    let r_out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert_eq!(
+        z_out, r_out,
+        "(z) divergence\n--- script ---\n{script}\n--- zsh ---\n{z_out}\n--- zshrs ---\n{r_out}"
+    );
+}
+
+/// Redirection operators are tokens of their own (c:Src/lex.c:826-913),
+/// printed as their `tokstrings[]` text, with a leading fd digit attached
+/// (c:Src/hist.c:3563-3566). zshrs had no redirection arm at all: `>|`
+/// came back as `>` + `|`, and a `|` is a pipeline separator, so every
+/// plugin reading the result saw the target file in command position.
+#[test]
+fn redirection_operators_are_single_tokens() {
+    assert_same_words(&[
+        "zstyle >| /tmp/out",
+        "zstyle>|/tmp/out",
+        "a >! b",
+        "a >>| b",
+        "a >& 2",
+        "a 2>&1",
+        "a &> b",
+        "a &>> b",
+        "a >&| b",
+        "a <> b",
+        "a <<< b",
+        "a <<- b",
+        "a <& 3",
+        "a 2<&3",
+        "a 10>x",
+        "a 2&>x",
+        "x>y",
+        "x<y",
+    ]);
+}
+
+/// A `(`, a numeric glob and a digit that turns out not to be an fd stay
+/// word text (c:Src/lex.c:828-836, c:858-861, c:1171-1211).
+#[test]
+fn process_substitution_and_numeric_glob_stay_in_the_word() {
+    assert_same_words(&[
+        "x>(y)",
+        "a >>(x)",
+        "a <<(x)",
+        "a 2>(x)",
+        "a <1-5>",
+        "b<1-5>x",
+        "a 2<1-3>",
+        "echo $(b > c) d",
+    ]);
+}
+
+/// Nothing ends a word while a `${…}` is open (c:Src/lex.c:960, 966, 991,
+/// 1001, 1172, 1209): not a blank, `;`, `|`, `)`, `<` or `>`. zshrs split
+/// `${a:-x y}` into two words.
+#[test]
+fn an_open_brace_parameter_keeps_its_body_in_one_word() {
+    assert_same_words(&[
+        "print ${a:-x y} z",
+        "a ${b:-${c:-d e}} f",
+        "print ${x//>/y}",
+        "print ${x//</y}",
+        "print ${a:-p|q}",
+        "print ${a;b}",
+        "a{b>c}d",
+    ]);
+}
+
+/// c:Src/lex.c:2236-2243 — a `$( … )` body that does not parse ends the
+/// lexer: from a string, skipcomm reads the rest raw, so bufferwords
+/// (c:Src/hist.c:3588-3601) keeps everything from `$(` on as one word.
+#[test]
+fn an_unparsable_command_substitution_keeps_the_rest_as_one_word() {
+    assert_same_words(&["echo $(|||) bar", "echo $(a;;b) x y", "x $(echo a) y", "x $(echo a"]);
+}
+
+/// `|&` is one token, BARAMP (c:Src/lex.c:777).
+#[test]
+fn bar_amp_is_one_token() {
+    assert_same_words(&["a |& b", "a || b | c"]);
+}
+
+/// c:Src/subst.c:4185-4199 → c:Src/hist.c:3385 bufferwords — `(z)` runs the
+/// real lexer. zshrs's hand-rolled splitter got these token shapes wrong:
+/// `for ((…;…;…))` pieces (c:3483-3515), a non-arithmetic `((…) …)` as nested
+/// parens, `repeat N (x)`, `$(…)` as one word, and `b=()` as ENVARRAY then
+/// OUTPAR (c:3479-3482).
+mod real_lexer_token_shapes {
+    use super::*;
+
+    #[test]
+    fn arithmetic_grouping_and_array_assignment_shapes() {
+        assert_same_words(&[
+            "for (( i = 1 ; i < 10 ; i++ ))",
+            "((0.25542 * 60) - 15)*60",
+            "repeat $( : foo bar; echo 4) (x)",
+            "a=(foo) b=() c=() d=(bar)",
+            "a 2>(x)",
+            "echo \"a b\" 'c d' $x ${y:-1 2} `cmd` $(( 1 + 2 )) <<< in 2>&1 >> out",
+        ]);
+    }
+
+    /// c:Src/lex.c:717-718 — with COMMENTS_STRIP a stripped comment ending a
+    /// line still yields the newline separator, but one running to the end of
+    /// input yields ENDINPUT.
+    #[test]
+    fn stripped_comments_and_separators() {
+        if !zsh_available() {
+            return;
+        }
+        let script = "line=$'A line with # someone\\'s comment\\nanother line # (1 more\\nanother one'; print -l ${(Z+C+)line}; foo='a # comment'; print -l \"${(Z+C+)foo}\"; print MID; print -l \"${(Z+c+)foo}\"";
+        let z = Command::new(zsh_path()).args(["-fc", script]).output().expect("zsh");
+        let r = Command::new(zshrs_bin())
+            .args(["--zsh", "-f", "-c", script])
+            .env_remove("ZSHRS_CACHE")
+            .output()
+            .expect("zshrs");
+        assert_eq!(String::from_utf8_lossy(&z.stdout), String::from_utf8_lossy(&r.stdout));
+    }
+
+    /// c:Src/lex.c:1339 `c = dquote_parse('"', sub)` + c:1444 `hungetc(c)` —
+    /// under CSH_JUNKIE_QUOTES a newline ends a `"…` word and is the character
+    /// pushed back (Test/D04parameter.ztst "(z) flag with CSH_JUNKIE_QUOTES").
+    /// zshrs pushed back the opening `"`, so every later word gained a stray
+    /// leading `"`: `"# \` backtick`, `"word`.
+    #[test]
+    fn csh_junkie_quotes_newline_ends_a_double_quoted_word() {
+        if !zsh_available() {
+            return;
+        }
+        let script = "local b=$'# \\' single\\n# \\\" double\\n# ` backtick\\nword'; (setopt CSH_JUNKIE_QUOTES; printf ': %s\\n' \"${(@Z+n+)b}\")";
+        let z = Command::new(zsh_path()).args(["-fc", script]).output().expect("zsh");
+        let r = Command::new(zshrs_bin())
+            .args(["--zsh", "-f", "-c", script])
+            .env_remove("ZSHRS_CACHE")
+            .output()
+            .expect("zshrs");
+        assert_eq!(String::from_utf8_lossy(&z.stdout), String::from_utf8_lossy(&r.stdout));
+        assert!(String::from_utf8_lossy(&z.stdout).contains(": word\n"));
+    }
+
+    /// c:Src/lex.c:1365-1366, 1380-1386 — under CSH_JUNKIE_QUOTES a newline
+    /// inside `` `…` `` or `"…"` is "unmatched", reported on the line that
+    /// opened it (the newline is pushed back, c:1444). zshrs ran the backquote
+    /// on to EOF as if closed, and reported the `"` one line late.
+    #[test]
+    fn csh_junkie_quotes_newline_in_a_script_is_unmatched() {
+        if !zsh_available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("zshrs-cjq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for (name, body) in [
+            ("bq.zsh", "setopt cshjunkiequotes\nprint `echo a\necho b`\necho rc=$?\n"),
+            ("dq.zsh", "setopt cshjunkiequotes\nprint \"a\nb\"\necho rc=$?\n"),
+        ] {
+            std::fs::write(dir.join(name), body).expect("write");
+            let run = |bin: &Path, pre: &[&str]| {
+                let o = Command::new(bin)
+                    .args(pre)
+                    .args(["-f", name])
+                    .current_dir(&dir)
+                    .env_remove("ZSHRS_CACHE")
+                    .output()
+                    .expect("run");
+                (
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                    o.status.code(),
+                )
+            };
+            let z = run(Path::new(zsh_path()), &[]);
+            let r = run(&zshrs_bin(), &["--zsh"]);
+            assert_eq!(z, r, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// c:Src/hist.c:3544-3558 — bufferwords strips the space it appended to
+/// the buffer only when the lexer READ PAST it (`ingetptr() ==
+/// addedspaceptr + 1`). A word ending in an escaped space is terminated by
+/// that added space, which the lexer gives back, so it is still unread and
+/// the word keeps its `\ `. zshrs's pushback lives outside `inbuf`, so the
+/// test saw an exhausted buffer and dropped the escaped space.
+#[test]
+fn a_word_ending_in_an_escaped_space_keeps_it() {
+    assert_same_words(&["a\\ ", "echo a\\ ", "x\\  y\\ ", "a\\\t"]);
+}

@@ -1,0 +1,35 @@
+#compdef zls
+
+# List the shells registered with the zshrs daemon (ID, PID, TTY, uptime,
+# tags, cwd), optionally only those carrying one tag, or with each shell's
+# queued zask request count (--ask-pending).
+#
+# zshrs builtin. Registered in ZSHRS_BUILTIN_NAMES
+# (daemon/builtins.rs); flags mirror zls() in daemon/builtins.rs.
+# Bundled into ~/.zshrs/functions by build.rs.
+
+_arguments -C \
+    '--ask-pending[add an ASK column with the queued zask request count per shell]' \
+    '--tag[list only shells carrying this tag]:tag:->tags' && return 0
+
+case $state in
+    tags)
+        # Live shells: parse the `zls` table (ID PID TTY UPTIME TAGS CWD,
+        # format_shells_table in daemon/builtins.rs). Silent when the
+        # daemon is down.
+        local zhome=${ZSHRS_HOME:-$HOME/.zshrs} row expl
+        local -a cols shells tags
+        if [[ -S $zhome/daemon.sock ]]; then
+            for row in ${${(f)"$(zls 2>/dev/null)"}[2,-1]}; do
+                cols=( ${=row} )
+                [[ $cols[1] == <-> ]] || continue
+                shells+=( "$cols[1]:pid $cols[2], tty $cols[3], $cols[6,-1]" )
+                [[ $cols[5] == - ]] || tags+=( ${(s:,:)cols[5]} )
+            done
+            tags=( ${(u)tags} )
+        fi
+        _wanted tags expl 'tag' compadd -a tags && return 0
+        ;;
+esac
+
+return 1
